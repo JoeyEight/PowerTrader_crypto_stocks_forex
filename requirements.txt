@@ -1,7 +1,0 @@
-requests
-psutil
-matplotlib
-colorama
-cryptography
-PyNaCl
-kucoin-python
