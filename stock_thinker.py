@@ -3,17 +3,19 @@ from __future__ import annotations
 import json
 import os
 import time
-from datetime import datetime, timedelta, timezone
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List
 
+from broker_alpaca import AlpacaBrokerClient
 from path_utils import resolve_runtime_paths
 
 BASE_DIR, _SETTINGS_PATH, HUB_DATA_DIR, _BOOT_SETTINGS = resolve_runtime_paths(__file__, "stock_thinker")
 
 DEFAULT_STOCK_UNIVERSE = ["AAPL", "MSFT", "NVDA", "AMZN", "META", "TSLA", "SPY", "QQQ"]
+ROLLOUT_ORDER = {"legacy": 0, "scan_expanded": 1, "risk_caps": 2, "execution_v2": 3}
 
 
 def _float(v: Any, default: float = 0.0) -> float:
@@ -27,6 +29,89 @@ def _request_json(url: str, headers: Dict[str, str], timeout: float = 10.0) -> A
     req = urllib.request.Request(url, headers=headers)
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode("utf-8"))
+
+
+def _rollout_at_least(settings: Dict[str, Any], stage: str) -> bool:
+    cur = str(settings.get("market_rollout_stage", "legacy") or "legacy").strip().lower()
+    return int(ROLLOUT_ORDER.get(cur, 0)) >= int(ROLLOUT_ORDER.get(stage, 0))
+
+
+def _parse_watchlist(settings: Dict[str, Any]) -> List[str]:
+    raw = str(settings.get("stock_universe_symbols", "") or "")
+    out: List[str] = []
+    for tok in raw.replace("\n", ",").split(","):
+        s = tok.strip().upper()
+        if s and s not in out:
+            out.append(s)
+    return out
+
+
+def _cache_path(hub_dir: str) -> str:
+    return os.path.join(hub_dir, "stocks", "stock_universe_cache.json")
+
+
+def _load_universe_cache(hub_dir: str, ttl_s: int = 3600) -> List[str]:
+    path = _cache_path(hub_dir)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        if not isinstance(payload, dict):
+            return []
+        ts = int(payload.get("ts", 0) or 0)
+        if (int(time.time()) - ts) > int(ttl_s):
+            return []
+        symbols = payload.get("symbols", []) or []
+        if not isinstance(symbols, list):
+            return []
+        out = [str(x).strip().upper() for x in symbols if str(x).strip()]
+        return out
+    except Exception:
+        return []
+
+
+def _save_universe_cache(hub_dir: str, symbols: List[str]) -> None:
+    path = _cache_path(hub_dir)
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = f"{path}.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"ts": int(time.time()), "symbols": symbols}, f, indent=2)
+        os.replace(tmp, path)
+    except Exception:
+        pass
+
+
+def _fetch_bars_for_symbols(
+    base_url: str,
+    headers: Dict[str, str],
+    symbols: List[str],
+    start_iso: str,
+    end_iso: str,
+    feed: str,
+) -> Dict[str, List[Dict[str, Any]]]:
+    out: Dict[str, List[Dict[str, Any]]] = {}
+    chunk = 50
+    for i in range(0, len(symbols), chunk):
+        part = symbols[i:i + chunk]
+        params = {
+            "symbols": ",".join(part),
+            "timeframe": "1Hour",
+            "limit": "96",
+            "adjustment": "raw",
+            "feed": feed,
+            "start": start_iso,
+            "end": end_iso,
+        }
+        url = f"{base_url}/v2/stocks/bars?{urllib.parse.urlencode(params)}"
+        payload = _request_json(url, headers=headers, timeout=15.0)
+        bars = payload.get("bars", {}) or {}
+        if isinstance(bars, dict):
+            for sym, rows in bars.items():
+                key = str(sym).strip().upper()
+                if not key:
+                    continue
+                out[key] = list(rows or [])
+    return out
 
 
 def _score_bars(symbol: str, bars: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -88,6 +173,46 @@ def _score_bars(symbol: str, bars: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
+def _select_universe(settings: Dict[str, Any], hub_dir: str, api_key: str, secret: str) -> List[str]:
+    mode = str(settings.get("stock_universe_mode", "core") or "core").strip().lower()
+    if mode == "watchlist":
+        watch = _parse_watchlist(settings)
+        return watch if watch else list(DEFAULT_STOCK_UNIVERSE)
+    if mode != "all_tradable_filtered":
+        return list(DEFAULT_STOCK_UNIVERSE)
+    if not _rollout_at_least(settings, "scan_expanded"):
+        return list(DEFAULT_STOCK_UNIVERSE)
+
+    cached = _load_universe_cache(hub_dir, ttl_s=3600)
+    if cached:
+        return cached
+
+    client = AlpacaBrokerClient(
+        api_key_id=api_key,
+        secret_key=secret,
+        base_url=str(settings.get("alpaca_base_url", "https://paper-api.alpaca.markets") or ""),
+        data_url=str(settings.get("alpaca_data_url", "https://data.alpaca.markets") or ""),
+    )
+    assets = client.list_tradable_assets()
+    symbols: List[str] = []
+    for row in assets:
+        if not isinstance(row, dict):
+            continue
+        if not bool(row.get("tradable", False)):
+            continue
+        if str(row.get("status", "")).lower() != "active":
+            continue
+        if str(row.get("class", "")).lower() not in ("us_equity", "us_equities", ""):
+            continue
+        sym = str(row.get("symbol", "") or "").strip().upper()
+        if sym and sym not in symbols:
+            symbols.append(sym)
+    if not symbols:
+        return list(DEFAULT_STOCK_UNIVERSE)
+    _save_universe_cache(hub_dir, symbols)
+    return symbols
+
+
 def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
     api_key = str(settings.get("alpaca_api_key_id", "") or "").strip()
     secret = str(settings.get("alpaca_secret_key", "") or "").strip()
@@ -113,28 +238,48 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
     start_iso = start_utc.replace(microsecond=0).isoformat().replace("+00:00", "Z")
     end_iso = now_utc.replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
+    universe = _select_universe(settings, hub_dir, api_key, secret)
+    max_scan = max(8, int(float(settings.get("stock_scan_max_symbols", 60) or 60)))
+    if len(universe) > max_scan and _rollout_at_least(settings, "scan_expanded"):
+        # Pre-filter by snapshot price/liquidity before bars request.
+        try:
+            client = AlpacaBrokerClient(
+                api_key_id=api_key,
+                secret_key=secret,
+                base_url=str(settings.get("alpaca_base_url", "https://paper-api.alpaca.markets") or ""),
+                data_url=base_url,
+            )
+            chunk = 100
+            min_price = max(0.0, float(settings.get("stock_min_price", 5.0) or 5.0))
+            max_price = max(min_price, float(settings.get("stock_max_price", 500.0) or 500.0))
+            min_dollar_vol = max(0.0, float(settings.get("stock_min_dollar_volume", 5_000_000.0) or 5_000_000.0))
+            ranked: List[tuple[float, str]] = []
+            for i in range(0, len(universe), chunk):
+                part = universe[i:i + chunk]
+                snaps = client.get_mid_prices(part)
+                for sym in part:
+                    px = float(snaps.get(sym, 0.0) or 0.0)
+                    if px <= 0.0 or px < min_price or px > max_price:
+                        continue
+                    ranked.append((px, sym))
+            ranked.sort(key=lambda x: x[0], reverse=True)
+            universe = [sym for _, sym in ranked[:max_scan]] or universe[:max_scan]
+            _ = min_dollar_vol  # reserved for stricter filters later; kept for config compatibility
+        except Exception:
+            universe = universe[:max_scan]
+    else:
+        universe = universe[:max_scan]
+
     scored: List[Dict[str, Any]] = []
     last_exc: Exception | None = None
+    universe_used = list(universe)
 
     # Try IEX first (paper-friendly), then SIP fallback if account supports it.
     for feed in ("iex", "sip"):
         try:
-            params = {
-                "symbols": ",".join(DEFAULT_STOCK_UNIVERSE),
-                "timeframe": "1Hour",
-                "limit": "96",
-                "adjustment": "raw",
-                "feed": feed,
-                "start": start_iso,
-                "end": end_iso,
-            }
-            url = f"{base_url}/v2/stocks/bars?{urllib.parse.urlencode(params)}"
-            payload = _request_json(url, headers=headers, timeout=12.0)
-            bars_by_symbol = payload.get("bars", {}) or {}
-            if not isinstance(bars_by_symbol, dict):
-                bars_by_symbol = {}
+            bars_by_symbol = _fetch_bars_for_symbols(base_url, headers, universe_used, start_iso, end_iso, feed)
             scored = []
-            for symbol in DEFAULT_STOCK_UNIVERSE:
+            for symbol in universe_used:
                 scored.append(_score_bars(symbol, list(bars_by_symbol.get(symbol, []) or [])))
             if any(float(row.get("score", -9999.0)) > -9999.0 for row in scored):
                 break
@@ -148,7 +293,7 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
                 "state": "ERROR",
                 "ai_state": "HTTP error",
                 "msg": f"HTTP {last_exc.code}: {last_exc.reason}",
-                "universe": list(DEFAULT_STOCK_UNIVERSE),
+                "universe": universe_used,
                 "leaders": [],
                 "updated_at": int(time.time()),
             }
@@ -157,7 +302,7 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
                 "state": "ERROR",
                 "ai_state": "Network error",
                 "msg": f"Network error: {last_exc.reason}",
-                "universe": list(DEFAULT_STOCK_UNIVERSE),
+                "universe": universe_used,
                 "leaders": [],
                 "updated_at": int(time.time()),
             }
@@ -165,7 +310,7 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
             "state": "ERROR",
             "ai_state": "Scan failed",
             "msg": (f"{type(last_exc).__name__}: {last_exc}" if last_exc else "No bar data returned"),
-            "universe": list(DEFAULT_STOCK_UNIVERSE),
+            "universe": universe_used,
             "leaders": [],
             "updated_at": int(time.time()),
         }
@@ -180,9 +325,9 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
         "state": "READY",
         "ai_state": "Scan ready",
         "msg": msg,
-        "universe": list(DEFAULT_STOCK_UNIVERSE),
+        "universe": universe_used,
         "leaders": leaders,
-        "all_scores": scored[:8],
+        "all_scores": scored[:12],
         "top_pick": top_pick,
         "updated_at": int(time.time()),
         "pdt_note": "Paper mode can still simulate PDT protections; live day-trading may be limited under $25k.",

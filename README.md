@@ -105,6 +105,65 @@ This is the only thing you need to run day-to-day.
 
 ---
 
+## March 2026 Update: Stocks + Forex Tabs
+
+PowerTrader Hub now includes **Crypto**, **Stocks**, and **Forex** tabs.
+
+- Crypto remains the original live trading engine.
+- Stocks uses Alpaca (paper-first).
+- Forex uses OANDA (practice-first).
+
+### Important
+
+Stocks/Forex are now wired with a staged rollout model so you can ship once and enable gradually without changing code.
+
+`market_rollout_stage` values:
+
+1. `legacy`  
+   Keeps legacy behavior and avoids expanded execution changes.
+2. `scan_expanded`  
+   Enables expanded symbol/pair scanning (no additional risk/execution features yet).
+3. `risk_caps`  
+   Enables new optional risk-cap gates.
+4. `execution_v2`  
+   Enables full staged execution path for Stocks/Forex trader steps.
+
+You can change this in **Settings -> Advanced -> Market rollout stage**.
+
+---
+
+## New Settings (Stocks/Forex)
+
+Added in Settings -> Advanced:
+
+- Stocks universe controls:
+  - `stock_universe_mode`: `core`, `watchlist`, `all_tradable_filtered`
+  - `stock_universe_symbols` (comma list, used by watchlist mode)
+  - `stock_scan_max_symbols`, `stock_min_price`, `stock_max_price`, `stock_min_dollar_volume`
+- Stocks trader controls:
+  - `stock_auto_trade_enabled`
+  - `stock_trade_notional_usd`
+  - `stock_max_open_positions`
+  - `stock_score_threshold`
+  - `stock_profit_target_pct`
+  - `stock_trailing_gap_pct`
+  - `stock_max_day_trades`
+  - `stock_max_position_usd_per_symbol` (active from `risk_caps`)
+  - `stock_max_total_exposure_pct` (active from `risk_caps`)
+- Forex universe controls:
+  - `forex_universe_pairs` (comma list)
+  - `forex_scan_max_pairs`
+- Forex trader controls:
+  - `forex_auto_trade_enabled`
+  - `forex_trade_units`
+  - `forex_max_open_positions`
+  - `forex_score_threshold`
+  - `forex_profit_target_pct`
+  - `forex_trailing_gap_pct`
+  - `forex_max_total_exposure_pct` (active from `risk_caps`, proxy guard)
+
+---
+
 ## Step 5 — Set your folder, coins, and Robinhood keys (inside the Hub)
 
 ### Open Settings

@@ -12,6 +12,7 @@ from path_utils import resolve_runtime_paths
 BASE_DIR, _SETTINGS_PATH, HUB_DATA_DIR, _BOOT_SETTINGS = resolve_runtime_paths(__file__, "forex_thinker")
 
 DEFAULT_FX_UNIVERSE = ["EUR_USD", "GBP_USD", "USD_JPY", "AUD_USD", "USD_CAD", "EUR_JPY"]
+ROLLOUT_ORDER = {"legacy": 0, "scan_expanded": 1, "risk_caps": 2, "execution_v2": 3}
 
 
 def _float(v: Any, default: float = 0.0) -> float:
@@ -25,6 +26,21 @@ def _request_json(url: str, headers: Dict[str, str], timeout: float = 10.0) -> A
     req = urllib.request.Request(url, headers=headers)
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode("utf-8"))
+
+
+def _rollout_at_least(settings: Dict[str, Any], stage: str) -> bool:
+    cur = str(settings.get("market_rollout_stage", "legacy") or "legacy").strip().lower()
+    return int(ROLLOUT_ORDER.get(cur, 0)) >= int(ROLLOUT_ORDER.get(stage, 0))
+
+
+def _parse_pairs(settings: Dict[str, Any]) -> List[str]:
+    raw = str(settings.get("forex_universe_pairs", "") or "")
+    out: List[str] = []
+    for tok in raw.replace("\n", ",").split(","):
+        p = tok.strip().upper()
+        if p and p not in out:
+            out.append(p)
+    return out
 
 
 def _score_candles(pair: str, candles: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -103,10 +119,18 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
             "updated_at": int(time.time()),
         }
 
+    universe = list(DEFAULT_FX_UNIVERSE)
+    if _rollout_at_least(settings, "scan_expanded"):
+        parsed = _parse_pairs(settings)
+        if parsed:
+            universe = parsed
+    max_scan = max(4, int(float(settings.get("forex_scan_max_pairs", 16) or 16)))
+    universe = universe[:max_scan]
+
     headers = {"Authorization": f"Bearer {token}"}
     scored = []
     try:
-        for pair in DEFAULT_FX_UNIVERSE:
+        for pair in universe:
             params = urllib.parse.urlencode(
                 {
                     "price": "M",
@@ -130,7 +154,7 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
             "state": "READY",
             "ai_state": "Scan ready",
             "msg": msg,
-            "universe": list(DEFAULT_FX_UNIVERSE),
+            "universe": list(universe),
             "leaders": leaders,
             "top_pick": top_pick,
             "updated_at": int(time.time()),
@@ -140,7 +164,7 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
             "state": "ERROR",
             "ai_state": "HTTP error",
             "msg": f"HTTP {exc.code}: {exc.reason}",
-            "universe": list(DEFAULT_FX_UNIVERSE),
+            "universe": list(universe),
             "leaders": [],
             "updated_at": int(time.time()),
         }
@@ -149,7 +173,7 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
             "state": "ERROR",
             "ai_state": "Network error",
             "msg": f"Network error: {exc.reason}",
-            "universe": list(DEFAULT_FX_UNIVERSE),
+            "universe": list(universe),
             "leaders": [],
             "updated_at": int(time.time()),
         }
@@ -158,7 +182,7 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
             "state": "ERROR",
             "ai_state": "Scan failed",
             "msg": f"{type(exc).__name__}: {exc}",
-            "universe": list(DEFAULT_FX_UNIVERSE),
+            "universe": list(universe),
             "leaders": [],
             "updated_at": int(time.time()),
         }

@@ -9,6 +9,7 @@ from broker_alpaca import AlpacaBrokerClient
 from path_utils import resolve_runtime_paths
 
 BASE_DIR, _SETTINGS_PATH, HUB_DATA_DIR, _BOOT_SETTINGS = resolve_runtime_paths(__file__, "stock_trader")
+ROLLOUT_ORDER = {"legacy": 0, "scan_expanded": 1, "risk_caps": 2, "execution_v2": 3}
 
 
 def _safe_read_json(path: str) -> Dict[str, Any]:
@@ -30,6 +31,11 @@ def _safe_write_json(path: str, data: Dict[str, Any]) -> None:
         pass
 
 
+def _rollout_at_least(settings: Dict[str, Any], stage: str) -> bool:
+    cur = str(settings.get("market_rollout_stage", "legacy") or "legacy").strip().lower()
+    return int(ROLLOUT_ORDER.get(cur, 0)) >= int(ROLLOUT_ORDER.get(stage, 0))
+
+
 def _parse_positions(rows: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
     out: Dict[str, Dict[str, Any]] = {}
     for row in rows or []:
@@ -46,7 +52,11 @@ def _parse_positions(rows: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
             avg = float(row.get("avg_entry_price", 0.0) or 0.0)
         except Exception:
             avg = 0.0
-        out[symbol] = {"symbol": symbol, "qty": qty, "avg_entry_price": avg}
+        try:
+            mv = float(row.get("market_value", 0.0) or 0.0)
+        except Exception:
+            mv = 0.0
+        out[symbol] = {"symbol": symbol, "qty": qty, "avg_entry_price": avg, "market_value": mv}
     return out
 
 
@@ -63,6 +73,10 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
     profit_target_pct = max(0.0, float(settings.get("stock_profit_target_pct", 0.35) or 0.35))
     trailing_gap_pct = max(0.0, float(settings.get("stock_trailing_gap_pct", 0.2) or 0.2))
     max_day_trades = max(0, int(float(settings.get("stock_max_day_trades", 3) or 3)))
+    enable_exec_v2 = _rollout_at_least(settings, "execution_v2")
+    enable_risk_caps = _rollout_at_least(settings, "risk_caps")
+    max_pos_usd = max(0.0, float(settings.get("stock_max_position_usd_per_symbol", 0.0) or 0.0))
+    max_total_exposure_pct = max(0.0, float(settings.get("stock_max_total_exposure_pct", 0.0) or 0.0))
 
     client = AlpacaBrokerClient(
         api_key_id=str(settings.get("alpaca_api_key_id", "") or ""),
@@ -109,6 +123,11 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
     if top_symbol:
         all_symbols.add(top_symbol)
     prices = client.get_mid_prices(sorted(all_symbols))
+    acct = client.get_account_summary()
+    equity = float(acct.get("equity", 0.0) or 0.0) if isinstance(acct, dict) else 0.0
+    total_positions_value = 0.0
+    for pos in positions.values():
+        total_positions_value += max(0.0, float(pos.get("market_value", 0.0) or 0.0))
 
     actions: List[str] = []
     for symbol, pos in positions.items():
@@ -156,6 +175,12 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
             entry_msg = f"Already in position: {top_symbol}"
         elif max_day_trades > 0 and day_trades_today >= max_day_trades:
             entry_msg = f"PDT guard: day-trade cap reached ({day_trades_today}/{max_day_trades})"
+        elif enable_risk_caps and max_pos_usd > 0.0 and (float(positions.get(top_symbol, {}).get("market_value", 0.0) or 0.0) + trade_notional) > max_pos_usd:
+            entry_msg = f"Risk cap: {top_symbol} projected position exceeds ${max_pos_usd:.2f}"
+        elif enable_risk_caps and max_total_exposure_pct > 0.0 and equity > 0.0 and (((total_positions_value + trade_notional) / equity) * 100.0) > max_total_exposure_pct:
+            entry_msg = f"Risk cap: projected exposure exceeds {max_total_exposure_pct:.2f}%"
+        elif not enable_exec_v2:
+            entry_msg = "Execution gated by rollout stage (set execution_v2)"
         else:
             ok, msg, _ = client.place_market_order(top_symbol, side="buy", notional=trade_notional)
             actions.append(f"ENTRY {top_symbol} BUY ${trade_notional:.2f} | {'OK' if ok else 'FAIL'} | {msg}")
@@ -185,6 +210,8 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
         "open_positions": len(positions),
         "auto_enabled": auto_enabled,
         "day_trades_today": day_trades_today,
+        "rollout_stage": str(settings.get("market_rollout_stage", "legacy") or "legacy"),
+        "execution_enabled": enable_exec_v2,
         "updated_at": now_ts,
     }
 

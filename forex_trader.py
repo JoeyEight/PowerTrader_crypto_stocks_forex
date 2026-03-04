@@ -9,6 +9,7 @@ from broker_oanda import OandaBrokerClient
 from path_utils import resolve_runtime_paths
 
 BASE_DIR, _SETTINGS_PATH, HUB_DATA_DIR, _BOOT_SETTINGS = resolve_runtime_paths(__file__, "forex_trader")
+ROLLOUT_ORDER = {"legacy": 0, "scan_expanded": 1, "risk_caps": 2, "execution_v2": 3}
 
 
 def _safe_read_json(path: str) -> Dict[str, Any]:
@@ -28,6 +29,11 @@ def _safe_write_json(path: str, data: Dict[str, Any]) -> None:
         os.replace(tmp, path)
     except Exception:
         pass
+
+
+def _rollout_at_least(settings: Dict[str, Any], stage: str) -> bool:
+    cur = str(settings.get("market_rollout_stage", "legacy") or "legacy").strip().lower()
+    return int(ROLLOUT_ORDER.get(cur, 0)) >= int(ROLLOUT_ORDER.get(stage, 0))
 
 
 def _parse_positions(raw_positions: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
@@ -94,6 +100,9 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
     score_threshold = float(settings.get("forex_score_threshold", 0.2) or 0.2)
     profit_target_pct = float(settings.get("forex_profit_target_pct", 0.25) or 0.25)
     trailing_gap_pct = float(settings.get("forex_trailing_gap_pct", 0.15) or 0.15)
+    enable_exec_v2 = _rollout_at_least(settings, "execution_v2")
+    enable_risk_caps = _rollout_at_least(settings, "risk_caps")
+    max_total_exposure_pct = max(0.0, float(settings.get("forex_max_total_exposure_pct", 0.0) or 0.0))
 
     client = OandaBrokerClient(
         account_id=str(settings.get("oanda_account_id", "") or ""),
@@ -170,6 +179,21 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
             entry_msg = f"Max open positions reached ({len(positions)}/{max_open_positions})"
         elif top_inst in positions:
             entry_msg = f"Already in position: {top_inst}"
+        elif enable_risk_caps and max_total_exposure_pct > 0.0:
+            nav_txt = str((broker_snap or {}).get("msg", "") or "")
+            nav = 0.0
+            try:
+                if "NAV" in nav_txt:
+                    nav = float(nav_txt.split("NAV", 1)[1].strip().split(" ", 1)[0])
+            except Exception:
+                nav = 0.0
+            if nav > 0.0:
+                held_pct = (float(len(positions)) / float(max_open_positions or 1)) * 100.0
+                if held_pct >= max_total_exposure_pct and top_inst not in positions:
+                    entry_msg = f"Risk cap: exposure proxy {held_pct:.2f}% exceeds {max_total_exposure_pct:.2f}%"
+                    top_inst = ""
+        elif not enable_exec_v2:
+            entry_msg = "Execution gated by rollout stage (set execution_v2)"
         else:
             units = abs(trade_units)
             if side == "short":
@@ -198,6 +222,8 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
         "actions": actions[-8:],
         "open_positions": len(positions),
         "auto_enabled": auto_enabled,
+        "rollout_stage": str(settings.get("market_rollout_stage", "legacy") or "legacy"),
+        "execution_enabled": enable_exec_v2,
         "updated_at": now_ts,
     }
 

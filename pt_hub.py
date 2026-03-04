@@ -346,6 +346,13 @@ DEFAULT_SETTINGS = {
     "alpaca_base_url": "https://paper-api.alpaca.markets",
     "alpaca_data_url": "https://data.alpaca.markets",
     "alpaca_paper_mode": True,
+    "market_rollout_stage": "legacy",  # legacy | scan_expanded | risk_caps | execution_v2
+    "stock_universe_mode": "core",  # core | watchlist | all_tradable_filtered
+    "stock_universe_symbols": "AAPL,MSFT,NVDA,AMZN,META,TSLA,SPY,QQQ",
+    "stock_scan_max_symbols": 60,
+    "stock_min_price": 5.0,
+    "stock_max_price": 500.0,
+    "stock_min_dollar_volume": 5000000.0,
     "stock_auto_trade_enabled": False,
     "stock_trade_notional_usd": 100.0,
     "stock_max_open_positions": 1,
@@ -353,17 +360,22 @@ DEFAULT_SETTINGS = {
     "stock_profit_target_pct": 0.35,
     "stock_trailing_gap_pct": 0.2,
     "stock_max_day_trades": 3,
+    "stock_max_position_usd_per_symbol": 0.0,
+    "stock_max_total_exposure_pct": 0.0,
     "oanda_account_id": "",
     "oanda_api_token": "",
     "oanda_rest_url": "https://api-fxpractice.oanda.com",
     "oanda_stream_url": "https://stream-fxpractice.oanda.com",
     "oanda_practice_mode": True,
     "forex_auto_trade_enabled": False,
+    "forex_universe_pairs": "EUR_USD,GBP_USD,USD_JPY,AUD_USD,USD_CAD,EUR_JPY",
+    "forex_scan_max_pairs": 16,
     "forex_trade_units": 1000,
     "forex_max_open_positions": 1,
     "forex_score_threshold": 0.2,
     "forex_profit_target_pct": 0.25,
     "forex_trailing_gap_pct": 0.15,
+    "forex_max_total_exposure_pct": 0.0,
     "auto_start_scripts": False,
 }
 
@@ -6619,18 +6631,33 @@ class PowerTraderHub(tk.Tk):
         settings_canvas.bind("<Configure>", _on_settings_canvas_configure, add="+")
         frm.bind("<Configure>", _update_settings_scrollbars, add="+")
 
-        # Mousewheel scrolling when the mouse is over the settings window.
-        def _wheel(e):
+        # Mousewheel scrolling for the whole settings dialog (including entry widgets).
+        def _scroll_settings_units(units: int) -> None:
             try:
                 if settings_scroll.winfo_ismapped():
-                    settings_canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
+                    settings_canvas.yview_scroll(int(units), "units")
+            except Exception:
+                pass
+
+        def _wheel(e):
+            try:
+                delta = int(getattr(e, "delta", 0) or 0)
+                if delta == 0:
+                    return
+                units = int(-delta / 120)
+                if units == 0:
+                    units = -1 if delta > 0 else 1
+                _scroll_settings_units(units)
             except Exception:
                 pass
 
         settings_canvas.bind("<Enter>", lambda _e: settings_canvas.focus_set(), add="+")
         settings_canvas.bind("<MouseWheel>", _wheel, add="+")  # Windows / Mac
-        settings_canvas.bind("<Button-4>", lambda _e: settings_canvas.yview_scroll(-3, "units"), add="+")  # Linux
-        settings_canvas.bind("<Button-5>", lambda _e: settings_canvas.yview_scroll(3, "units"), add="+")   # Linux
+        settings_canvas.bind("<Button-4>", lambda _e: _scroll_settings_units(-3), add="+")  # Linux
+        settings_canvas.bind("<Button-5>", lambda _e: _scroll_settings_units(3), add="+")   # Linux
+        win.bind("<MouseWheel>", _wheel, add="+")  # Capture wheel anywhere in settings dialog
+        win.bind("<Button-4>", lambda _e: _scroll_settings_units(-3), add="+")
+        win.bind("<Button-5>", lambda _e: _scroll_settings_units(3), add="+")
 
 
 
@@ -6688,6 +6715,13 @@ class PowerTraderHub(tk.Tk):
         alpaca_base_url_var = tk.StringVar(value=str(self.settings.get("alpaca_base_url", DEFAULT_SETTINGS.get("alpaca_base_url", "")) or ""))
         alpaca_data_url_var = tk.StringVar(value=str(self.settings.get("alpaca_data_url", DEFAULT_SETTINGS.get("alpaca_data_url", "")) or ""))
         alpaca_paper_var = tk.BooleanVar(value=bool(self.settings.get("alpaca_paper_mode", DEFAULT_SETTINGS.get("alpaca_paper_mode", True))))
+        rollout_stage_var = tk.StringVar(value=str(self.settings.get("market_rollout_stage", DEFAULT_SETTINGS.get("market_rollout_stage", "legacy")) or "legacy"))
+        stock_universe_mode_var = tk.StringVar(value=str(self.settings.get("stock_universe_mode", DEFAULT_SETTINGS.get("stock_universe_mode", "core")) or "core"))
+        stock_universe_symbols_var = tk.StringVar(value=str(self.settings.get("stock_universe_symbols", DEFAULT_SETTINGS.get("stock_universe_symbols", "")) or ""))
+        stock_scan_max_symbols_var = tk.StringVar(value=str(self.settings.get("stock_scan_max_symbols", DEFAULT_SETTINGS.get("stock_scan_max_symbols", 60))))
+        stock_min_price_var = tk.StringVar(value=str(self.settings.get("stock_min_price", DEFAULT_SETTINGS.get("stock_min_price", 5.0))))
+        stock_max_price_var = tk.StringVar(value=str(self.settings.get("stock_max_price", DEFAULT_SETTINGS.get("stock_max_price", 500.0))))
+        stock_min_dollar_volume_var = tk.StringVar(value=str(self.settings.get("stock_min_dollar_volume", DEFAULT_SETTINGS.get("stock_min_dollar_volume", 5000000.0))))
         stock_auto_trade_var = tk.BooleanVar(value=bool(self.settings.get("stock_auto_trade_enabled", DEFAULT_SETTINGS.get("stock_auto_trade_enabled", False))))
         stock_notional_var = tk.StringVar(value=str(self.settings.get("stock_trade_notional_usd", DEFAULT_SETTINGS.get("stock_trade_notional_usd", 100.0))))
         stock_max_pos_var = tk.StringVar(value=str(self.settings.get("stock_max_open_positions", DEFAULT_SETTINGS.get("stock_max_open_positions", 1))))
@@ -6695,17 +6729,22 @@ class PowerTraderHub(tk.Tk):
         stock_profit_target_var = tk.StringVar(value=str(self.settings.get("stock_profit_target_pct", DEFAULT_SETTINGS.get("stock_profit_target_pct", 0.35))))
         stock_trailing_gap_var = tk.StringVar(value=str(self.settings.get("stock_trailing_gap_pct", DEFAULT_SETTINGS.get("stock_trailing_gap_pct", 0.2))))
         stock_day_trades_var = tk.StringVar(value=str(self.settings.get("stock_max_day_trades", DEFAULT_SETTINGS.get("stock_max_day_trades", 3))))
+        stock_max_position_usd_var = tk.StringVar(value=str(self.settings.get("stock_max_position_usd_per_symbol", DEFAULT_SETTINGS.get("stock_max_position_usd_per_symbol", 0.0))))
+        stock_max_exposure_var = tk.StringVar(value=str(self.settings.get("stock_max_total_exposure_pct", DEFAULT_SETTINGS.get("stock_max_total_exposure_pct", 0.0))))
         oanda_account_var = tk.StringVar(value=str(self.settings.get("oanda_account_id", DEFAULT_SETTINGS.get("oanda_account_id", "")) or ""))
         oanda_token_var = tk.StringVar(value=str(self.settings.get("oanda_api_token", DEFAULT_SETTINGS.get("oanda_api_token", "")) or ""))
         oanda_rest_url_var = tk.StringVar(value=str(self.settings.get("oanda_rest_url", DEFAULT_SETTINGS.get("oanda_rest_url", "")) or ""))
         oanda_stream_url_var = tk.StringVar(value=str(self.settings.get("oanda_stream_url", DEFAULT_SETTINGS.get("oanda_stream_url", "")) or ""))
         oanda_practice_var = tk.BooleanVar(value=bool(self.settings.get("oanda_practice_mode", DEFAULT_SETTINGS.get("oanda_practice_mode", True))))
+        forex_pairs_var = tk.StringVar(value=str(self.settings.get("forex_universe_pairs", DEFAULT_SETTINGS.get("forex_universe_pairs", "")) or ""))
+        forex_scan_max_pairs_var = tk.StringVar(value=str(self.settings.get("forex_scan_max_pairs", DEFAULT_SETTINGS.get("forex_scan_max_pairs", 16))))
         fx_auto_trade_var = tk.BooleanVar(value=bool(self.settings.get("forex_auto_trade_enabled", DEFAULT_SETTINGS.get("forex_auto_trade_enabled", False))))
         fx_trade_units_var = tk.StringVar(value=str(self.settings.get("forex_trade_units", DEFAULT_SETTINGS.get("forex_trade_units", 1000))))
         fx_max_pos_var = tk.StringVar(value=str(self.settings.get("forex_max_open_positions", DEFAULT_SETTINGS.get("forex_max_open_positions", 1))))
         fx_score_threshold_var = tk.StringVar(value=str(self.settings.get("forex_score_threshold", DEFAULT_SETTINGS.get("forex_score_threshold", 0.2))))
         fx_profit_target_var = tk.StringVar(value=str(self.settings.get("forex_profit_target_pct", DEFAULT_SETTINGS.get("forex_profit_target_pct", 0.25))))
         fx_trailing_gap_var = tk.StringVar(value=str(self.settings.get("forex_trailing_gap_pct", DEFAULT_SETTINGS.get("forex_trailing_gap_pct", 0.15))))
+        fx_max_exposure_var = tk.StringVar(value=str(self.settings.get("forex_max_total_exposure_pct", DEFAULT_SETTINGS.get("forex_max_total_exposure_pct", 0.0))))
 
         hub_dir_var = tk.StringVar(value=self.settings.get("hub_data_dir", ""))
 
@@ -6819,6 +6858,8 @@ class PowerTraderHub(tk.Tk):
         add_row(ar, "pt_trader.py path:", trader_script_var, parent=advanced_frame); ar += 1
 
         ttk.Separator(advanced_frame, orient="horizontal").grid(row=ar, column=0, columnspan=3, sticky="ew", pady=10); ar += 1
+        add_row(ar, "Market rollout stage:", rollout_stage_var, parent=advanced_frame); ar += 1
+        ttk.Label(advanced_frame, text="Stages: legacy -> scan_expanded -> risk_caps -> execution_v2", foreground=DARK_MUTED).grid(row=ar, column=0, columnspan=3, sticky="w", pady=(0, 6)); ar += 1
 
         ttk.Label(advanced_frame, text="Alpaca API:").grid(row=ar, column=0, sticky="w", padx=(0, 10), pady=6)
         alpaca_mode_chk = ttk.Checkbutton(advanced_frame, text="Paper mode", variable=alpaca_paper_var)
@@ -6828,6 +6869,12 @@ class PowerTraderHub(tk.Tk):
         add_secret_row(ar, "Alpaca secret key:", alpaca_secret_var, parent=advanced_frame); ar += 1
         add_row(ar, "Alpaca base URL:", alpaca_base_url_var, parent=advanced_frame); ar += 1
         add_row(ar, "Alpaca data URL:", alpaca_data_url_var, parent=advanced_frame); ar += 1
+        add_row(ar, "Stock universe mode:", stock_universe_mode_var, parent=advanced_frame); ar += 1
+        add_row(ar, "Stock universe symbols (watchlist):", stock_universe_symbols_var, parent=advanced_frame); ar += 1
+        add_row(ar, "Stock scan max symbols:", stock_scan_max_symbols_var, parent=advanced_frame); ar += 1
+        add_row(ar, "Stock min price:", stock_min_price_var, parent=advanced_frame); ar += 1
+        add_row(ar, "Stock max price:", stock_max_price_var, parent=advanced_frame); ar += 1
+        add_row(ar, "Stock min dollar volume:", stock_min_dollar_volume_var, parent=advanced_frame); ar += 1
         ttk.Label(advanced_frame, text="Stocks AI trader:").grid(row=ar, column=0, sticky="w", padx=(0, 10), pady=6)
         ttk.Checkbutton(advanced_frame, text="Enable auto-trade (paper-safe)", variable=stock_auto_trade_var).grid(row=ar, column=1, sticky="w", pady=6)
         ttk.Label(advanced_frame, text="").grid(row=ar, column=2, sticky="e", padx=(10, 0), pady=6); ar += 1
@@ -6837,6 +6884,8 @@ class PowerTraderHub(tk.Tk):
         add_row(ar, "Stock profit target %:", stock_profit_target_var, parent=advanced_frame); ar += 1
         add_row(ar, "Stock trailing gap %:", stock_trailing_gap_var, parent=advanced_frame); ar += 1
         add_row(ar, "Stock max day trades / day:", stock_day_trades_var, parent=advanced_frame); ar += 1
+        add_row(ar, "Stock max position USD/symbol (risk_caps):", stock_max_position_usd_var, parent=advanced_frame); ar += 1
+        add_row(ar, "Stock max total exposure % (risk_caps):", stock_max_exposure_var, parent=advanced_frame); ar += 1
 
         ttk.Separator(advanced_frame, orient="horizontal").grid(row=ar, column=0, columnspan=3, sticky="ew", pady=10); ar += 1
 
@@ -6848,6 +6897,8 @@ class PowerTraderHub(tk.Tk):
         add_secret_row(ar, "OANDA API token:", oanda_token_var, parent=advanced_frame); ar += 1
         add_row(ar, "OANDA REST URL:", oanda_rest_url_var, parent=advanced_frame); ar += 1
         add_row(ar, "OANDA stream URL:", oanda_stream_url_var, parent=advanced_frame); ar += 1
+        add_row(ar, "Forex universe pairs:", forex_pairs_var, parent=advanced_frame); ar += 1
+        add_row(ar, "Forex scan max pairs:", forex_scan_max_pairs_var, parent=advanced_frame); ar += 1
         ttk.Label(advanced_frame, text="Forex AI trader:").grid(row=ar, column=0, sticky="w", padx=(0, 10), pady=6)
         ttk.Checkbutton(advanced_frame, text="Enable auto-trade (practice only)", variable=fx_auto_trade_var).grid(row=ar, column=1, sticky="w", pady=6)
         ttk.Label(advanced_frame, text="").grid(row=ar, column=2, sticky="e", padx=(10, 0), pady=6); ar += 1
@@ -6856,6 +6907,7 @@ class PowerTraderHub(tk.Tk):
         add_row(ar, "Forex score threshold:", fx_score_threshold_var, parent=advanced_frame); ar += 1
         add_row(ar, "Forex profit target %:", fx_profit_target_var, parent=advanced_frame); ar += 1
         add_row(ar, "Forex trailing gap %:", fx_trailing_gap_var, parent=advanced_frame); ar += 1
+        add_row(ar, "Forex max exposure % (risk_caps proxy):", fx_max_exposure_var, parent=advanced_frame); ar += 1
 
         # --- Robinhood API setup (writes r_key.txt + r_secret.txt used by pt_trader.py) ---
         def _api_paths() -> Tuple[str, str]:
@@ -7555,6 +7607,31 @@ class PowerTraderHub(tk.Tk):
                 self.settings["alpaca_base_url"] = alpaca_base_url_var.get().strip() or str(DEFAULT_SETTINGS.get("alpaca_base_url", ""))
                 self.settings["alpaca_data_url"] = alpaca_data_url_var.get().strip() or str(DEFAULT_SETTINGS.get("alpaca_data_url", ""))
                 self.settings["alpaca_paper_mode"] = bool(alpaca_paper_var.get())
+                stage = str(rollout_stage_var.get() or "").strip().lower()
+                if stage not in {"legacy", "scan_expanded", "risk_caps", "execution_v2"}:
+                    stage = str(DEFAULT_SETTINGS.get("market_rollout_stage", "legacy"))
+                self.settings["market_rollout_stage"] = stage
+                mode = str(stock_universe_mode_var.get() or "").strip().lower()
+                if mode not in {"core", "watchlist", "all_tradable_filtered"}:
+                    mode = str(DEFAULT_SETTINGS.get("stock_universe_mode", "core"))
+                self.settings["stock_universe_mode"] = mode
+                self.settings["stock_universe_symbols"] = str(stock_universe_symbols_var.get() or "").strip()
+                try:
+                    self.settings["stock_scan_max_symbols"] = max(8, int(float((stock_scan_max_symbols_var.get() or "").strip() or 60)))
+                except Exception:
+                    self.settings["stock_scan_max_symbols"] = int(DEFAULT_SETTINGS.get("stock_scan_max_symbols", 60))
+                try:
+                    self.settings["stock_min_price"] = max(0.0, float((stock_min_price_var.get() or "").strip() or 5.0))
+                except Exception:
+                    self.settings["stock_min_price"] = float(DEFAULT_SETTINGS.get("stock_min_price", 5.0))
+                try:
+                    self.settings["stock_max_price"] = max(self.settings["stock_min_price"], float((stock_max_price_var.get() or "").strip() or 500.0))
+                except Exception:
+                    self.settings["stock_max_price"] = float(DEFAULT_SETTINGS.get("stock_max_price", 500.0))
+                try:
+                    self.settings["stock_min_dollar_volume"] = max(0.0, float((stock_min_dollar_volume_var.get() or "").strip() or 5000000.0))
+                except Exception:
+                    self.settings["stock_min_dollar_volume"] = float(DEFAULT_SETTINGS.get("stock_min_dollar_volume", 5000000.0))
                 self.settings["stock_auto_trade_enabled"] = bool(stock_auto_trade_var.get())
                 try:
                     self.settings["stock_trade_notional_usd"] = max(1.0, float((stock_notional_var.get() or "").strip().replace("$", "") or 100.0))
@@ -7580,17 +7657,34 @@ class PowerTraderHub(tk.Tk):
                     self.settings["stock_max_day_trades"] = max(0, int(float((stock_day_trades_var.get() or "").strip() or 3)))
                 except Exception:
                     self.settings["stock_max_day_trades"] = int(DEFAULT_SETTINGS.get("stock_max_day_trades", 3))
+                try:
+                    self.settings["stock_max_position_usd_per_symbol"] = max(0.0, float((stock_max_position_usd_var.get() or "").strip().replace("$", "") or 0.0))
+                except Exception:
+                    self.settings["stock_max_position_usd_per_symbol"] = float(DEFAULT_SETTINGS.get("stock_max_position_usd_per_symbol", 0.0))
+                try:
+                    self.settings["stock_max_total_exposure_pct"] = max(0.0, float((stock_max_exposure_var.get() or "").strip().replace("%", "") or 0.0))
+                except Exception:
+                    self.settings["stock_max_total_exposure_pct"] = float(DEFAULT_SETTINGS.get("stock_max_total_exposure_pct", 0.0))
                 self.settings["oanda_account_id"] = oanda_account_var.get().strip()
                 self.settings["oanda_api_token"] = oanda_token_var.get().strip()
                 self.settings["oanda_rest_url"] = oanda_rest_url_var.get().strip() or str(DEFAULT_SETTINGS.get("oanda_rest_url", ""))
                 self.settings["oanda_stream_url"] = oanda_stream_url_var.get().strip() or str(DEFAULT_SETTINGS.get("oanda_stream_url", ""))
                 self.settings["oanda_practice_mode"] = bool(oanda_practice_var.get())
+                self.settings["forex_universe_pairs"] = str(forex_pairs_var.get() or "").strip()
+                try:
+                    self.settings["forex_scan_max_pairs"] = max(4, int(float((forex_scan_max_pairs_var.get() or "").strip() or 16)))
+                except Exception:
+                    self.settings["forex_scan_max_pairs"] = int(DEFAULT_SETTINGS.get("forex_scan_max_pairs", 16))
                 self.settings["forex_auto_trade_enabled"] = bool(fx_auto_trade_var.get())
                 self.settings["forex_trade_units"] = max(1, int(float((fx_trade_units_var.get() or "").strip() or 1000)))
                 self.settings["forex_max_open_positions"] = max(1, int(float((fx_max_pos_var.get() or "").strip() or 1)))
                 self.settings["forex_score_threshold"] = max(0.0, float((fx_score_threshold_var.get() or "").strip() or 0.2))
                 self.settings["forex_profit_target_pct"] = max(0.0, float((fx_profit_target_var.get() or "").strip().replace("%", "") or 0.25))
                 self.settings["forex_trailing_gap_pct"] = max(0.0, float((fx_trailing_gap_var.get() or "").strip().replace("%", "") or 0.15))
+                try:
+                    self.settings["forex_max_total_exposure_pct"] = max(0.0, float((fx_max_exposure_var.get() or "").strip().replace("%", "") or 0.0))
+                except Exception:
+                    self.settings["forex_max_total_exposure_pct"] = float(DEFAULT_SETTINGS.get("forex_max_total_exposure_pct", 0.0))
 
                 self.settings["script_neural_runner2"] = neural_script_var.get().strip()
                 self.settings["script_neural_trainer"] = trainer_script_var.get().strip()

@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import json
-import urllib.parse
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import Any, Dict, List, Tuple
 
@@ -17,24 +17,23 @@ class AlpacaBrokerClient:
     def configured(self) -> bool:
         return bool(self.api_key_id and self.secret_key and self.base_url)
 
-    def _request_json(self, path: str, timeout: float = 8.0) -> Dict[str, Any]:
-        req = urllib.request.Request(
-            f"{self.base_url}{path}",
-            headers={
-                "APCA-API-KEY-ID": self.api_key_id,
-                "APCA-API-SECRET-KEY": self.secret_key,
-            },
-        )
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            payload = json.loads(resp.read().decode("utf-8"))
-        return payload if isinstance(payload, dict) else {}
-
-    def _request(self, path: str, method: str = "GET", payload: Any = None, timeout: float = 8.0) -> Any:
-        body = None
-        headers = {
+    def _headers(self) -> Dict[str, str]:
+        return {
             "APCA-API-KEY-ID": self.api_key_id,
             "APCA-API-SECRET-KEY": self.secret_key,
         }
+
+    def _request_json(self, path: str, timeout: float = 8.0) -> Any:
+        req = urllib.request.Request(f"{self.base_url}{path}", headers=self._headers())
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8")
+        if not raw:
+            return {}
+        return json.loads(raw)
+
+    def _request(self, path: str, method: str = "GET", payload: Any = None, timeout: float = 8.0) -> Any:
+        body = None
+        headers = self._headers()
         if payload is not None:
             headers["Content-Type"] = "application/json"
             body = json.dumps(payload).encode("utf-8")
@@ -49,13 +48,7 @@ class AlpacaBrokerClient:
             return {}
 
     def _request_data_json(self, path: str, timeout: float = 8.0) -> Dict[str, Any]:
-        req = urllib.request.Request(
-            f"{self.data_url}{path}",
-            headers={
-                "APCA-API-KEY-ID": self.api_key_id,
-                "APCA-API-SECRET-KEY": self.secret_key,
-            },
-        )
+        req = urllib.request.Request(f"{self.data_url}{path}", headers=self._headers())
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             payload = json.loads(resp.read().decode("utf-8"))
         return payload if isinstance(payload, dict) else {}
@@ -64,7 +57,7 @@ class AlpacaBrokerClient:
         if not self.configured():
             return False, "Alpaca credentials missing"
         try:
-            acct = self._request_json("/v2/account")
+            acct = self.get_account_summary()
             status = str(acct.get("status", "ok") or "ok")
             buying_power = acct.get("buying_power", "N/A")
             return True, f"Connected | status={status} | buying_power={buying_power}"
@@ -74,6 +67,31 @@ class AlpacaBrokerClient:
             return False, f"Network error: {exc.reason}"
         except Exception as exc:
             return False, f"{type(exc).__name__}: {exc}"
+
+    def get_account_summary(self) -> Dict[str, Any]:
+        try:
+            payload = self._request_json("/v2/account")
+            return payload if isinstance(payload, dict) else {}
+        except Exception:
+            return {}
+
+    def list_positions(self) -> List[Dict[str, Any]]:
+        try:
+            rows = self._request("/v2/positions", method="GET")
+            if isinstance(rows, list):
+                return [row for row in rows if isinstance(row, dict)]
+        except Exception:
+            pass
+        return []
+
+    def list_tradable_assets(self) -> List[Dict[str, Any]]:
+        try:
+            rows = self._request("/v2/assets?status=active&asset_class=us_equity", method="GET", timeout=15.0)
+            if isinstance(rows, list):
+                return [row for row in rows if isinstance(row, dict)]
+        except Exception:
+            pass
+        return []
 
     def fetch_snapshot(self) -> Dict[str, Any]:
         if not self.configured():
@@ -86,17 +104,17 @@ class AlpacaBrokerClient:
                 "open_positions": "0",
                 "realized_pnl": "N/A",
                 "positions_preview": [],
+                "raw_positions": [],
+                "equity": "N/A",
                 "pdt_note": "Pattern Day Trader rules may restrict live same-day round trips under $25k.",
             }
 
         try:
-            acct = self._request_json("/v2/account")
+            acct = self.get_account_summary()
             raw_positions = self.list_positions()
 
             preview: List[str] = []
             for pos in raw_positions[:8]:
-                if not isinstance(pos, dict):
-                    continue
                 sym = str(pos.get("symbol", "") or "").strip()
                 qty = str(pos.get("qty", "") or "").strip()
                 market_val = str(pos.get("market_value", "") or "").strip()
@@ -113,6 +131,7 @@ class AlpacaBrokerClient:
                 "realized_pnl": str(acct.get("equity", "N/A") or "N/A"),
                 "positions_preview": preview,
                 "raw_positions": raw_positions,
+                "equity": str(acct.get("equity", "N/A") or "N/A"),
                 "pdt_note": "Paper mode can still simulate PDT protections; keep live stock day-trading rules in mind.",
             }
         except urllib.error.HTTPError as exc:
@@ -125,17 +144,38 @@ class AlpacaBrokerClient:
                 "open_positions": "0",
                 "realized_pnl": "N/A",
                 "positions_preview": [],
+                "raw_positions": [],
+                "equity": "N/A",
                 "pdt_note": "Pattern Day Trader protections still apply in live stock trading.",
             }
-
-    def list_positions(self) -> List[Dict[str, Any]]:
-        try:
-            rows = self._request("/v2/positions", method="GET")
-            if isinstance(rows, list):
-                return [row for row in rows if isinstance(row, dict)]
-        except Exception:
-            pass
-        return []
+        except urllib.error.URLError as exc:
+            return {
+                "state": "ERROR",
+                "ai_state": "Network error",
+                "trader_state": "Idle",
+                "msg": f"Network error: {exc.reason}",
+                "buying_power": "N/A",
+                "open_positions": "0",
+                "realized_pnl": "N/A",
+                "positions_preview": [],
+                "raw_positions": [],
+                "equity": "N/A",
+                "pdt_note": "Pattern Day Trader protections still apply in live stock trading.",
+            }
+        except Exception as exc:
+            return {
+                "state": "ERROR",
+                "ai_state": "Load failed",
+                "trader_state": "Idle",
+                "msg": f"{type(exc).__name__}: {exc}",
+                "buying_power": "N/A",
+                "open_positions": "0",
+                "realized_pnl": "N/A",
+                "positions_preview": [],
+                "raw_positions": [],
+                "equity": "N/A",
+                "pdt_note": "Pattern Day Trader protections still apply in live stock trading.",
+            }
 
     def get_mid_prices(self, symbols: List[str], feed: str = "iex") -> Dict[str, float]:
         out: Dict[str, float] = {}
@@ -203,6 +243,8 @@ class AlpacaBrokerClient:
             except Exception:
                 body = ""
             return False, f"HTTP {exc.code}: {exc.reason} {body}".strip(), {}
+        except urllib.error.URLError as exc:
+            return False, f"Network error: {exc.reason}", {}
         except Exception as exc:
             return False, f"{type(exc).__name__}: {exc}", {}
 
@@ -222,29 +264,7 @@ class AlpacaBrokerClient:
             except Exception:
                 body = ""
             return False, f"HTTP {exc.code}: {exc.reason} {body}".strip(), {}
+        except urllib.error.URLError as exc:
+            return False, f"Network error: {exc.reason}", {}
         except Exception as exc:
             return False, f"{type(exc).__name__}: {exc}", {}
-        except urllib.error.URLError as exc:
-            return {
-                "state": "ERROR",
-                "ai_state": "Network error",
-                "trader_state": "Idle",
-                "msg": f"Network error: {exc.reason}",
-                "buying_power": "N/A",
-                "open_positions": "0",
-                "realized_pnl": "N/A",
-                "positions_preview": [],
-                "pdt_note": "Pattern Day Trader protections still apply in live stock trading.",
-            }
-        except Exception as exc:
-            return {
-                "state": "ERROR",
-                "ai_state": "Load failed",
-                "trader_state": "Idle",
-                "msg": f"{type(exc).__name__}: {exc}",
-                "buying_power": "N/A",
-                "open_positions": "0",
-                "realized_pnl": "N/A",
-                "positions_preview": [],
-                "pdt_note": "Pattern Day Trader protections still apply in live stock trading.",
-            }
