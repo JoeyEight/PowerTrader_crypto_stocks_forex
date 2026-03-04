@@ -174,36 +174,133 @@ class OandaBrokerClient:
                 out[inst] = bid
         return out
 
-    def place_market_order(self, instrument: str, units: int) -> Tuple[bool, str, Dict[str, Any]]:
+    def get_pricing_details(self, instruments: List[str]) -> Dict[str, Dict[str, float]]:
+        if not self.configured():
+            return {}
+        items = [str(x).strip().upper() for x in (instruments or []) if str(x).strip()]
+        if not items:
+            return {}
+        qs = ",".join(items)
+        try:
+            payload = self._request_json(f"/v3/accounts/{self.account_id}/pricing?instruments={qs}", timeout=8.0)
+        except Exception:
+            return {}
+        prices = payload.get("prices", []) or []
+        out: Dict[str, Dict[str, float]] = {}
+        if not isinstance(prices, list):
+            return out
+        for row in prices:
+            if not isinstance(row, dict):
+                continue
+            inst = str(row.get("instrument", "") or "").strip().upper()
+            bids = row.get("bids", []) or []
+            asks = row.get("asks", []) or []
+            try:
+                bid = float((bids[0] or {}).get("price", 0.0)) if bids else 0.0
+                ask = float((asks[0] or {}).get("price", 0.0)) if asks else 0.0
+            except Exception:
+                bid = 0.0
+                ask = 0.0
+            mid = (bid + ask) * 0.5 if bid > 0 and ask > 0 else max(bid, ask, 0.0)
+            spread_bps = (((ask - bid) / mid) * 10000.0) if (mid > 0 and ask > 0 and bid > 0) else 0.0
+            out[inst] = {"bid": bid, "ask": ask, "mid": mid, "spread_bps": spread_bps}
+        return out
+
+    def list_tradeable_instruments(self) -> List[str]:
+        if not self.configured():
+            return []
+        try:
+            payload = self._request_json(f"/v3/accounts/{self.account_id}/instruments", timeout=10.0)
+        except Exception:
+            return []
+        rows = payload.get("instruments", []) or []
+        out: List[str] = []
+        if not isinstance(rows, list):
+            return out
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("type", "") or "").upper() != "CURRENCY":
+                continue
+            if str(row.get("tradeable", "true")).lower() in {"false", "0", "no"}:
+                continue
+            name = str(row.get("name", "") or "").strip().upper()
+            if name and name not in out:
+                out.append(name)
+        return out
+
+    def get_candles(self, instrument: str, granularity: str = "H1", count: int = 120) -> List[Dict[str, Any]]:
+        if not self.configured():
+            return []
+        inst = str(instrument or "").strip().upper()
+        if not inst:
+            return []
+        g = str(granularity or "H1").strip().upper()
+        cnt = max(10, min(5000, int(count or 120)))
+        try:
+            payload = self._request_json(
+                f"/v3/instruments/{inst}/candles?price=M&granularity={g}&count={cnt}",
+                timeout=10.0,
+            )
+            rows = payload.get("candles", []) or []
+            return [row for row in rows if isinstance(row, dict)]
+        except Exception:
+            return []
+
+    def place_market_order(
+        self,
+        instrument: str,
+        units: int,
+        client_order_id: str = "",
+        max_retries: int = 2,
+        retry_delay_s: float = 0.35,
+    ) -> Tuple[bool, str, Dict[str, Any]]:
         inst = str(instrument or "").strip().upper()
         if not self.configured():
             return False, "Not configured", {}
         if not inst:
             return False, "Missing instrument", {}
-        try:
-            payload = self._request(
-                "POST",
-                f"/v3/accounts/{self.account_id}/orders",
-                body={
-                    "order": {
-                        "type": "MARKET",
-                        "instrument": inst,
-                        "units": str(int(units)),
-                        "timeInForce": "FOK",
-                        "positionFill": "DEFAULT",
-                    }
-                },
-                timeout=10.0,
-            )
-            ok = bool(payload.get("orderFillTransaction") or payload.get("orderCreateTransaction"))
-            msg = "Order submitted" if ok else str(payload.get("errorMessage", "Order not accepted") or "Order not accepted")
-            return ok, msg, payload
-        except urllib.error.HTTPError as exc:
-            return False, f"HTTP {exc.code}: {exc.reason}", {}
-        except urllib.error.URLError as exc:
-            return False, f"Network error: {exc.reason}", {}
-        except Exception as exc:
-            return False, f"{type(exc).__name__}: {exc}", {}
+        body = {
+            "order": {
+                "type": "MARKET",
+                "instrument": inst,
+                "units": str(int(units)),
+                "timeInForce": "FOK",
+                "positionFill": "DEFAULT",
+            }
+        }
+        if str(client_order_id or "").strip():
+            body["order"]["clientExtensions"] = {"id": str(client_order_id).strip()[:48]}
+        attempts = max(1, int(max_retries))
+        last_msg = "Order not accepted"
+        for att in range(1, attempts + 1):
+            try:
+                payload = self._request(
+                    "POST",
+                    f"/v3/accounts/{self.account_id}/orders",
+                    body=body,
+                    timeout=10.0,
+                )
+                ok = bool(payload.get("orderFillTransaction") or payload.get("orderCreateTransaction"))
+                msg = "Order submitted" if ok else str(payload.get("errorMessage", "Order not accepted") or "Order not accepted")
+                if ok:
+                    return True, msg, payload
+                last_msg = msg
+            except urllib.error.HTTPError as exc:
+                last_msg = f"HTTP {exc.code}: {exc.reason}"
+                if int(exc.code) != 429:
+                    break
+            except urllib.error.URLError as exc:
+                last_msg = f"Network error: {exc.reason}"
+            except Exception as exc:
+                last_msg = f"{type(exc).__name__}: {exc}"
+            if att < attempts:
+                try:
+                    import time as _t
+                    _t.sleep(max(0.05, float(retry_delay_s)))
+                except Exception:
+                    pass
+        return False, last_msg, {}
 
     def close_position(self, instrument: str, side: str = "all") -> Tuple[bool, str, Dict[str, Any]]:
         inst = str(instrument or "").strip().upper()

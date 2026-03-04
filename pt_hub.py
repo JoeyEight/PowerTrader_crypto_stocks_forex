@@ -346,13 +346,19 @@ DEFAULT_SETTINGS = {
     "alpaca_base_url": "https://paper-api.alpaca.markets",
     "alpaca_data_url": "https://data.alpaca.markets",
     "alpaca_paper_mode": True,
-    "market_rollout_stage": "legacy",  # legacy | scan_expanded | risk_caps | execution_v2
-    "stock_universe_mode": "core",  # core | watchlist | all_tradable_filtered
+    "market_rollout_stage": "legacy",  # legacy | scan_expanded | risk_caps | execution_v2 | shadow_only | live_guarded
+    "stock_universe_mode": "all_tradable_filtered",  # core | watchlist | all_tradable_filtered
     "stock_universe_symbols": "AAPL,MSFT,NVDA,AMZN,META,TSLA,SPY,QQQ",
     "stock_scan_max_symbols": 60,
     "stock_min_price": 5.0,
     "stock_max_price": 500.0,
     "stock_min_dollar_volume": 5000000.0,
+    "stock_max_spread_bps": 40.0,
+    "stock_gate_market_hours_scan": True,
+    "stock_min_bars_required": 24,
+    "stock_min_valid_bars_ratio": 0.7,
+    "stock_max_stale_hours": 6.0,
+    "stock_show_rejected_rows": False,
     "stock_auto_trade_enabled": False,
     "stock_trade_notional_usd": 100.0,
     "stock_max_open_positions": 1,
@@ -362,6 +368,19 @@ DEFAULT_SETTINGS = {
     "stock_max_day_trades": 3,
     "stock_max_position_usd_per_symbol": 0.0,
     "stock_max_total_exposure_pct": 0.0,
+    "stock_block_new_entries_near_close": True,
+    "stock_no_new_entries_mins_to_close": 15,
+    "stock_live_guarded_score_mult": 1.2,
+    "stock_min_calib_prob_live_guarded": 0.58,
+    "stock_max_slippage_bps": 35.0,
+    "stock_order_retry_count": 2,
+    "stock_max_loss_streak": 3,
+    "stock_loss_cooldown_seconds": 1800,
+    "stock_max_daily_loss_usd": 0.0,
+    "stock_max_daily_loss_pct": 0.0,
+    "stock_min_samples_live_guarded": 5,
+    "stock_max_signal_age_seconds": 300,
+    "stock_reject_drift_warn_pct": 65.0,
     "oanda_account_id": "",
     "oanda_api_token": "",
     "oanda_rest_url": "https://api-fxpractice.oanda.com",
@@ -370,12 +389,32 @@ DEFAULT_SETTINGS = {
     "forex_auto_trade_enabled": False,
     "forex_universe_pairs": "EUR_USD,GBP_USD,USD_JPY,AUD_USD,USD_CAD,EUR_JPY",
     "forex_scan_max_pairs": 16,
+    "forex_max_spread_bps": 8.0,
+    "forex_min_volatility_pct": 0.01,
+    "forex_min_bars_required": 24,
+    "forex_min_valid_bars_ratio": 0.7,
+    "forex_max_stale_hours": 8.0,
+    "forex_show_rejected_rows": False,
     "forex_trade_units": 1000,
     "forex_max_open_positions": 1,
+    "forex_max_position_usd_per_pair": 0.0,
     "forex_score_threshold": 0.2,
     "forex_profit_target_pct": 0.25,
     "forex_trailing_gap_pct": 0.15,
     "forex_max_total_exposure_pct": 0.0,
+    "forex_session_mode": "all",  # all | london_ny | london | ny | asia
+    "forex_live_guarded_score_mult": 1.15,
+    "forex_min_calib_prob_live_guarded": 0.56,
+    "forex_max_slippage_bps": 6.0,
+    "forex_order_retry_count": 2,
+    "forex_max_loss_streak": 3,
+    "forex_loss_cooldown_seconds": 1800,
+    "forex_max_daily_loss_usd": 0.0,
+    "forex_max_daily_loss_pct": 0.0,
+    "forex_min_samples_live_guarded": 5,
+    "forex_max_signal_age_seconds": 300,
+    "forex_reject_drift_warn_pct": 65.0,
+    "market_max_total_exposure_pct": 0.0,
     "auto_start_scripts": False,
 }
 
@@ -2246,6 +2285,7 @@ class PowerTraderHub(tk.Tk):
         self._last_market_refresh_ts: Dict[str, float] = {}
         self._last_market_thinker_ts: Dict[str, float] = {}
         self._last_market_trader_ts: Dict[str, float] = {}
+        self._market_line_caches: Dict[str, Dict[str, Any]] = {}
 
         # file written by pt_thinker.py (runner readiness gate used for Start All)
         self.runner_ready_path = os.path.join(self.hub_dir, "runner_ready.json")
@@ -3849,19 +3889,6 @@ class PowerTraderHub(tk.Tk):
         test_btn.pack(anchor="w", padx=6, pady=(0, 6))
         trader_step_btn = None
         trader_step_market_key = ""
-        trader_step_name = ""
-        trader_step_cmd = None
-        if market_key == "stocks":
-            trader_step_market_key = "stocks"
-            trader_step_name = "Stocks"
-            trader_step_cmd = lambda: self._run_stock_trader_step(force=True)
-        if market_key == "forex":
-            trader_step_market_key = "forex"
-            trader_step_name = "Forex"
-            trader_step_cmd = lambda: self._run_forex_trader_step(force=True)
-        if trader_step_cmd is not None:
-            trader_step_btn = ttk.Button(system_box, text=f"Run {trader_step_name} Trader Step", command=trader_step_cmd)
-            trader_step_btn.pack(anchor="w", padx=6, pady=(0, 6))
 
         portfolio_box = ttk.LabelFrame(dashboard, text="Portfolio")
         portfolio_box.pack(fill="x", padx=6, pady=(0, 6))
@@ -3885,8 +3912,15 @@ class PowerTraderHub(tk.Tk):
 
         notes_box = ttk.LabelFrame(dashboard, text="Market Notes")
         notes_box.pack(fill="both", expand=True, padx=6, pady=(0, 6))
+        notes_hdr = ttk.Frame(notes_box)
+        notes_hdr.pack(fill="x", padx=6, pady=(6, 0))
+        notes_collapsed_var = tk.BooleanVar(value=True)
+        notes_toggle_btn = ttk.Button(notes_hdr, text="Show")
+        notes_toggle_btn.pack(side="right")
+        notes_body = ttk.Frame(notes_box)
+        notes_body.pack(fill="both", expand=True, padx=6, pady=6)
         notes_text = tk.Text(
-            notes_box,
+            notes_body,
             height=8,
             wrap="word",
             font=self._live_log_font,
@@ -3905,27 +3939,76 @@ class PowerTraderHub(tk.Tk):
         notes_text.insert("1.0", notes)
         notes_text.configure(state="disabled")
 
+        def _toggle_notes() -> None:
+            try:
+                collapsed = bool(notes_collapsed_var.get())
+            except Exception:
+                collapsed = False
+            if collapsed:
+                try:
+                    notes_body.pack(fill="both", expand=True, padx=6, pady=6)
+                except Exception:
+                    pass
+                notes_toggle_btn.configure(text="Hide")
+                notes_collapsed_var.set(False)
+            else:
+                try:
+                    notes_body.pack_forget()
+                except Exception:
+                    pass
+                notes_toggle_btn.configure(text="Show")
+                notes_collapsed_var.set(True)
+
+        notes_toggle_btn.configure(command=_toggle_notes)
+        try:
+            notes_body.pack_forget()
+        except Exception:
+            pass
+
         left_split.add(dashboard, weight=1)
 
         charts_frame = ttk.LabelFrame(right_split, text=f"{market_name} Charts")
         charts_top = ttk.Frame(charts_frame)
         charts_top.pack(fill="x", padx=6, pady=(6, 0))
-        ttk.Label(charts_top, text=f"{market_name} View:").pack(side="left")
-        selector = ttk.Combobox(
-            charts_top,
-            values=["Overview", "Scanner", "Leaders", "Positions"],
-            state="readonly",
-            width=18,
-        )
-        selector.set("Overview")
-        selector.pack(side="left", padx=(6, 12))
-        ttk.Label(charts_top, text=subtitle, foreground=DARK_MUTED).pack(side="left")
-        run_btn = ttk.Button(
-            charts_top,
-            text="Run Scan",
-            command=lambda mk=market_key: self._run_market_thinker_scan(mk, force=True),
-        )
-        run_btn.pack(side="right")
+        charts_top_row1 = ttk.Frame(charts_top)
+        charts_top_row1.pack(fill="x")
+        charts_top_row2 = ttk.Frame(charts_top)
+        charts_top_row2.pack(fill="x", pady=(6, 0))
+
+        ttk.Label(charts_top_row1, text=f"{market_name} View:").pack(side="left")
+        view_options = ("Overview", "Scanner", "Leaders", "Positions", "Execution", "Health")
+        market_view_var = tk.StringVar(value="Overview")
+        view_tabs = ttk.Frame(charts_top_row1)
+        view_tabs.pack(side="left", padx=(6, 12))
+        view_buttons: Dict[str, ttk.Button] = {}
+
+        def _set_market_view(view_name: str) -> None:
+            market_view_var.set(view_name)
+            for vname, btn in view_buttons.items():
+                try:
+                    btn.configure(style=("ChartTabSelected.TButton" if vname == view_name else "ChartTab.TButton"))
+                except Exception:
+                    pass
+            self._refresh_parallel_market_panels()
+
+        for v in view_options:
+            btn = ttk.Button(
+                view_tabs,
+                text=v,
+                style=("ChartTabSelected.TButton" if v == "Overview" else "ChartTab.TButton"),
+                command=lambda name=v: _set_market_view(name),
+                width=10,
+            )
+            btn.pack(side="left", padx=(0, 4))
+            view_buttons[v] = btn
+
+        ttk.Label(charts_top_row2, text=subtitle, foreground=DARK_MUTED).pack(side="left")
+        top_pick_var = tk.StringVar(value="")
+        ttk.Label(charts_top_row2, textvariable=top_pick_var, foreground=DARK_ACCENT2).pack(side="left", padx=(10, 0))
+        charts_age_var = tk.StringVar(value="Updated: N/A")
+        ttk.Label(charts_top_row2, textvariable=charts_age_var, foreground=DARK_MUTED).pack(side="right", padx=(0, 10))
+        run_btn = None
+        ttk.Label(charts_top_row2, text="Auto scan (background)", foreground=DARK_MUTED).pack(side="right")
 
         center = ttk.Frame(charts_frame)
         center.pack(fill="both", expand=True, padx=6, pady=6)
@@ -3956,16 +4039,83 @@ class PowerTraderHub(tk.Tk):
             fill=DARK_FG,
             font=(self._live_log_font.cget("family"), max(9, int(self._live_log_font.cget("size")) + 1)),
         )
-        selector.bind(
-            "<<ComboboxSelected>>",
-            lambda _e, mk=market_key: self._refresh_parallel_market_panels(),
-        )
-
+        chart_table_wrap = ttk.Frame(center)
+        chart_table_wrap.grid(row=0, column=0, sticky="nsew")
+        chart_table_wrap.columnconfigure(0, weight=1)
+        chart_table_wrap.rowconfigure(0, weight=1)
+        chart_table = ttk.Treeview(chart_table_wrap, show="headings", height=9, selectmode="browse")
+        chart_table_y = ttk.Scrollbar(chart_table_wrap, orient="vertical", command=chart_table.yview)
+        chart_table_x = ttk.Scrollbar(chart_table_wrap, orient="horizontal", command=chart_table.xview)
+        chart_table.configure(yscrollcommand=chart_table_y.set, xscrollcommand=chart_table_x.set)
+        chart_table.grid(row=0, column=0, sticky="nsew")
+        chart_table_y.grid(row=0, column=1, sticky="ns")
+        chart_table_x.grid(row=1, column=0, sticky="ew")
+        chart_table_wrap.grid_remove()
         lower = ttk.Panedwindow(right_split, orient="vertical")
         positions_box = ttk.LabelFrame(lower, text=f"{market_name} Positions")
-        positions_text = tk.Text(
-            positions_box,
+        pos_header = ttk.Frame(positions_box)
+        pos_header.pack(fill="x", padx=6, pady=(6, 0))
+        positions_summary_var = tk.StringVar(value="No open positions.")
+        ttk.Label(pos_header, textvariable=positions_summary_var, foreground=DARK_MUTED).pack(side="left")
+        positions_age_var = tk.StringVar(value="Updated: N/A")
+        ttk.Label(pos_header, textvariable=positions_age_var, foreground=DARK_MUTED).pack(side="right")
+
+        pos_table_wrap = ttk.Frame(positions_box)
+        pos_table_wrap.pack(fill="both", expand=True, padx=6, pady=6)
+        pos_table_wrap.columnconfigure(0, weight=1)
+        pos_table_wrap.rowconfigure(0, weight=1)
+        if market_key == "stocks":
+            pos_columns = ("symbol", "qty", "value", "upl")
+            pos_headings = {
+                "symbol": "Symbol",
+                "qty": "Qty",
+                "value": "Value",
+                "upl": "uPnL",
+            }
+            pos_widths = {"symbol": 120, "qty": 110, "value": 140, "upl": 120}
+        else:
+            pos_columns = ("pair", "side", "units", "upl")
+            pos_headings = {
+                "pair": "Pair",
+                "side": "Side",
+                "units": "Units",
+                "upl": "uPnL",
+            }
+            pos_widths = {"pair": 120, "side": 90, "units": 120, "upl": 120}
+        positions_tree = ttk.Treeview(
+            pos_table_wrap,
+            columns=pos_columns,
+            show="headings",
             height=6,
+            selectmode="browse",
+        )
+        for col in pos_columns:
+            positions_tree.heading(col, text=pos_headings.get(col, col.title()))
+            positions_tree.column(col, anchor=("w" if col in ("symbol", "pair") else "e"), width=pos_widths.get(col, 110), stretch=True)
+        try:
+            positions_tree.tag_configure("upl_pos", foreground="#00FF99")
+            positions_tree.tag_configure("upl_neg", foreground="#FF6B57")
+            positions_tree.tag_configure("upl_neu", foreground=DARK_FG)
+            positions_tree.tag_configure("placeholder", foreground=DARK_MUTED)
+        except Exception:
+            pass
+        positions_scroll_y = ttk.Scrollbar(pos_table_wrap, orient="vertical", command=positions_tree.yview)
+        positions_scroll_x = ttk.Scrollbar(pos_table_wrap, orient="horizontal", command=positions_tree.xview)
+        positions_tree.configure(yscrollcommand=positions_scroll_y.set, xscrollcommand=positions_scroll_x.set)
+        positions_tree.grid(row=0, column=0, sticky="nsew")
+        positions_scroll_y.grid(row=0, column=1, sticky="ns")
+        positions_scroll_x.grid(row=1, column=0, sticky="ew")
+
+        history_box = ttk.LabelFrame(lower, text=f"{market_name} History")
+        history_header = ttk.Frame(history_box)
+        history_header.pack(fill="x", padx=6, pady=(6, 0))
+        history_age_var = tk.StringVar(value="Updated: N/A")
+        ttk.Label(history_header, textvariable=history_age_var, foreground=DARK_MUTED).pack(side="left")
+        history_autoscroll_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(history_header, text="Auto-scroll", variable=history_autoscroll_var).pack(side="right")
+        history_text = tk.Text(
+            history_box,
+            height=5,
             wrap="none",
             font=self._live_log_font,
             bg=DARK_PANEL,
@@ -3979,19 +4129,26 @@ class PowerTraderHub(tk.Tk):
             highlightbackground=DARK_BORDER,
             highlightcolor=DARK_ACCENT,
         )
-        positions_scroll = ttk.Scrollbar(positions_box, orient="vertical", command=positions_text.yview)
-        positions_text.configure(yscrollcommand=positions_scroll.set)
-        positions_text.pack(side="left", fill="both", expand=True, padx=(6, 0), pady=6)
-        positions_scroll.pack(side="right", fill="y", padx=(0, 6), pady=6)
-        positions_text.insert(
-            "1.0",
-            "No market connection yet. Positions will appear here once the AI is linked.\n",
-        )
-        positions_text.configure(state="disabled")
+        history_scroll = ttk.Scrollbar(history_box, orient="vertical", command=history_text.yview)
+        history_text.configure(yscrollcommand=history_scroll.set)
+        history_text.pack(side="left", fill="both", expand=True, padx=(6, 0), pady=(4, 6))
+        history_scroll.pack(side="right", fill="y", padx=(0, 6), pady=(4, 6))
+        history_text.insert("1.0", "No trader actions yet.\n")
+        history_text.configure(state="disabled")
 
-        history_box = ttk.LabelFrame(lower, text=f"{market_name} Logs")
+        logs_box = ttk.LabelFrame(lower, text=f"{market_name} Logs")
+        logs_header = ttk.Frame(logs_box)
+        logs_header.pack(fill="x", padx=6, pady=(6, 0))
+        logs_age_var = tk.StringVar(value="Updated: N/A")
+        ttk.Label(logs_header, textvariable=logs_age_var, foreground=DARK_MUTED).pack(side="left")
+        log_filter_var = tk.StringVar(value="All")
+        ttk.Label(logs_header, text="Filter:", foreground=DARK_MUTED).pack(side="left", padx=(12, 4))
+        log_filter_combo = ttk.Combobox(logs_header, values=["All", "Thinker", "Trader", "Broker"], state="readonly", width=9, textvariable=log_filter_var)
+        log_filter_combo.pack(side="left")
+        logs_autoscroll_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(logs_header, text="Auto-scroll", variable=logs_autoscroll_var).pack(side="right")
         log_text = tk.Text(
-            history_box,
+            logs_box,
             height=8,
             wrap="none",
             font=self._live_log_font,
@@ -4006,18 +4163,12 @@ class PowerTraderHub(tk.Tk):
             highlightbackground=DARK_BORDER,
             highlightcolor=DARK_ACCENT,
         )
-        log_scroll = ttk.Scrollbar(history_box, orient="vertical", command=log_text.yview)
+        log_scroll = ttk.Scrollbar(logs_box, orient="vertical", command=log_text.yview)
         log_text.configure(yscrollcommand=log_scroll.set)
-        log_text.pack(side="left", fill="both", expand=True, padx=(6, 0), pady=6)
-        log_scroll.pack(side="right", fill="y", padx=(0, 6), pady=6)
-        log_text.insert(
-            "1.0",
-            (
-                f"[{market_name.upper()}] UI scaffold initialized\n"
-                f"[{market_name.upper()}] Waiting for broker credentials and engine wiring\n"
-            ),
-        )
+        log_text.pack(side="left", fill="both", expand=True, padx=(6, 0), pady=(4, 6))
+        log_scroll.pack(side="right", fill="y", padx=(0, 6), pady=(4, 6))
         log_text.configure(state="disabled")
+        log_filter_combo.bind("<<ComboboxSelected>>", lambda _e, mk=market_key: self._render_market_log(mk))
 
         self.market_panels[market_key] = {
             "market_name": market_name,
@@ -4029,21 +4180,44 @@ class PowerTraderHub(tk.Tk):
             "endpoint_var": endpoint_var,
             "portfolio_vars": portfolio_vars,
             "notes_text": notes_text,
+            "notes_toggle_btn": notes_toggle_btn,
+            "notes_collapsed_var": notes_collapsed_var,
             "log_text": log_text,
-            "positions_text": positions_text,
+            "logs_age_var": logs_age_var,
+            "log_filter_var": log_filter_var,
+            "logs_autoscroll_var": logs_autoscroll_var,
+            "log_lines": [
+                f"[{market_name.upper()}] UI scaffold initialized",
+                f"[{market_name.upper()}] Waiting for broker credentials and engine wiring",
+            ],
+            "positions_tree": positions_tree,
+            "positions_summary_var": positions_summary_var,
+            "positions_age_var": positions_age_var,
+            "history_text": history_text,
+            "history_age_var": history_age_var,
+            "history_autoscroll_var": history_autoscroll_var,
+            "history_lines": [],
             "test_btn": test_btn,
             "trader_step_btn": trader_step_btn,
             "trader_step_market_key": trader_step_market_key,
             "run_btn": run_btn,
-            "selector": selector,
+            "market_view_var": market_view_var,
+            "view_buttons": view_buttons,
             "chart_canvas": placeholder,
+            "chart_table_wrap": chart_table_wrap,
+            "chart_table": chart_table,
+            "top_pick_var": top_pick_var,
+            "charts_age_var": charts_age_var,
             "last_log_sig": None,
+            "last_history_sig": None,
         }
+        self._render_market_log(market_key)
 
-        right_split.add(charts_frame, weight=3)
+        right_split.add(charts_frame, weight=4)
         right_split.add(lower, weight=2)
-        lower.add(positions_box, weight=1)
+        lower.add(positions_box, weight=2)
         lower.add(history_box, weight=1)
+        lower.add(logs_box, weight=1)
 
     def _mask_secret(self, value: str, keep: int = 4) -> str:
         raw = str(value or "").strip()
@@ -4068,30 +4242,205 @@ class PowerTraderHub(tk.Tk):
 
     def _append_market_log(self, market_key: str, line: str) -> None:
         panel = self.market_panels.get(market_key, {})
+        lines = panel.get("log_lines")
+        if not isinstance(lines, list):
+            lines = []
+            panel["log_lines"] = lines
+        txt = str(line or "").rstrip()
+        if not txt:
+            return
+        lines.append(txt)
+        if len(lines) > 1200:
+            panel["log_lines"] = lines[-1200:]
+        self._render_market_log(market_key)
+
+    def _render_market_log(self, market_key: str) -> None:
+        panel = self.market_panels.get(market_key, {})
         widget = panel.get("log_text")
         if not widget:
             return
+        all_lines = list(panel.get("log_lines", []) or [])
+        mode = str((panel.get("log_filter_var").get() if panel.get("log_filter_var") else "All") or "All").strip().lower()
+
+        def _match(line: str) -> bool:
+            up = str(line or "").upper()
+            if mode == "thinker":
+                return "[THINKER]" in up
+            if mode == "trader":
+                return "[TRADER]" in up
+            if mode == "broker":
+                return any(tok in up for tok in ("[OANDA]", "[ALPACA]", "[TEST]", "[OK]", "[FAIL]"))
+            return True
+
+        payload = [ln for ln in all_lines if _match(ln)]
+        if not payload:
+            payload = ["(no log lines for selected filter)"]
         try:
             widget.configure(state="normal")
-            widget.insert("end", str(line or "").rstrip() + "\n")
-            widget.see("end")
+            widget.delete("1.0", "end")
+            widget.insert("1.0", "\n".join(str(x) for x in payload[-500:]) + "\n")
             widget.configure(state="disabled")
+            try:
+                do_scroll = bool(panel.get("logs_autoscroll_var").get()) if panel.get("logs_autoscroll_var") else True
+            except Exception:
+                do_scroll = True
+            if do_scroll:
+                widget.see("end")
         except Exception:
             pass
 
-    def _set_market_positions(self, market_key: str, lines: List[str]) -> None:
+    def _market_fmt_num(self, value: Any, digits: int = 2) -> str:
+        try:
+            return f"{float(value):.{int(digits)}f}"
+        except Exception:
+            return str(value if value is not None else "0")
+
+    def _market_fmt_money(self, value: Any, digits: int = 2) -> str:
+        try:
+            return f"${float(value):,.{int(digits)}f}"
+        except Exception:
+            return str(value if value is not None else "0")
+
+    def _market_fmt_signed_money(self, value: Any, digits: int = 2) -> str:
+        try:
+            v = float(value)
+            return f"{v:+,.{int(digits)}f}"
+        except Exception:
+            return str(value if value is not None else "0")
+
+    def _market_age_text(self, ts: Any) -> str:
+        try:
+            tsv = float(ts or 0.0)
+        except Exception:
+            tsv = 0.0
+        if tsv <= 0.0:
+            return "Updated: N/A"
+        delta = max(0, int(time.time() - tsv))
+        return f"Updated: {delta}s ago"
+
+    def _set_market_positions(self, market_key: str, lines: List[str], raw_positions: Optional[List[Dict[str, Any]]] = None) -> None:
         panel = self.market_panels.get(market_key, {})
-        widget = panel.get("positions_text")
+        tree = panel.get("positions_tree")
+        summary_var = panel.get("positions_summary_var")
+        if not tree:
+            return
+        rows = list(raw_positions or [])
+        if not rows:
+            rows = []
+        try:
+            for iid in tree.get_children():
+                tree.delete(iid)
+
+            inserted = 0
+            if market_key == "stocks":
+                for row in rows:
+                    if not isinstance(row, dict):
+                        continue
+                    sym = str(row.get("symbol", "") or "").strip().upper()
+                    if not sym:
+                        continue
+                    try:
+                        qty_f = float(row.get("qty", 0.0) or 0.0)
+                    except Exception:
+                        qty_f = 0.0
+                    try:
+                        value_f = float(row.get("market_value", 0.0) or 0.0)
+                    except Exception:
+                        value_f = 0.0
+                    try:
+                        upl_f = float(row.get("unrealized_pl", 0.0) or 0.0)
+                    except Exception:
+                        upl_f = 0.0
+                    tag = "upl_pos" if upl_f > 0 else ("upl_neg" if upl_f < 0 else "upl_neu")
+                    tree.insert(
+                        "",
+                        "end",
+                        values=(
+                            sym,
+                            self._market_fmt_num(qty_f, 6),
+                            self._market_fmt_money(value_f, 2),
+                            self._market_fmt_signed_money(upl_f, 4),
+                        ),
+                        tags=(tag,),
+                    )
+                    inserted += 1
+            else:
+                for row in rows:
+                    if not isinstance(row, dict):
+                        continue
+                    inst = str(row.get("instrument", "") or "").strip().upper()
+                    if not inst:
+                        continue
+                    long_leg = row.get("long", {}) or {}
+                    short_leg = row.get("short", {}) or {}
+                    long_units = str(long_leg.get("units", "0") or "0")
+                    short_units = str(short_leg.get("units", "0") or "0")
+                    if long_units not in ("", "0", "0.0"):
+                        side = "LONG"
+                        try:
+                            units_f = float(long_units or 0.0)
+                        except Exception:
+                            units_f = 0.0
+                        try:
+                            upl_f = float(long_leg.get("unrealizedPL", 0.0) or 0.0)
+                        except Exception:
+                            upl_f = 0.0
+                    elif short_units not in ("", "0", "0.0"):
+                        side = "SHORT"
+                        try:
+                            units_f = float(short_units or 0.0)
+                        except Exception:
+                            units_f = 0.0
+                        try:
+                            upl_f = float(short_leg.get("unrealizedPL", 0.0) or 0.0)
+                        except Exception:
+                            upl_f = 0.0
+                    else:
+                        side = "FLAT"
+                        units_f = 0.0
+                        upl_f = 0.0
+                    tag = "upl_pos" if upl_f > 0 else ("upl_neg" if upl_f < 0 else "upl_neu")
+                    tree.insert(
+                        "",
+                        "end",
+                        values=(inst, side, self._market_fmt_num(units_f, 0), self._market_fmt_signed_money(upl_f, 4)),
+                        tags=(tag,),
+                    )
+                    inserted += 1
+
+            if inserted == 0:
+                tree.insert("", "end", values=("No open positions", "-", "-", "-"), tags=("placeholder",))
+                if isinstance(summary_var, tk.StringVar):
+                    summary_var.set("No open positions.")
+            else:
+                if isinstance(summary_var, tk.StringVar):
+                    summary_var.set(f"Open positions: {inserted}")
+
+            if (inserted == 0) and lines:
+                if isinstance(summary_var, tk.StringVar):
+                    summary_var.set(str(lines[0]).strip() or "No open positions.")
+        except Exception:
+            pass
+
+    def _set_market_history(self, market_key: str, lines: List[str]) -> None:
+        panel = self.market_panels.get(market_key, {})
+        widget = panel.get("history_text")
         if not widget:
             return
         payload = list(lines or [])
         if not payload:
-            payload = ["No open positions."]
+            payload = ["No trader actions yet."]
         try:
             widget.configure(state="normal")
             widget.delete("1.0", "end")
-            widget.insert("1.0", "\n".join(str(x) for x in payload) + "\n")
+            widget.insert("1.0", "\n".join(str(x) for x in payload[-80:]) + "\n")
             widget.configure(state="disabled")
+            try:
+                do_scroll = bool(panel.get("history_autoscroll_var").get()) if panel.get("history_autoscroll_var") else True
+            except Exception:
+                do_scroll = True
+            if do_scroll:
+                widget.see("end")
         except Exception:
             pass
 
@@ -4124,10 +4473,11 @@ class PowerTraderHub(tk.Tk):
         except Exception:
             pass
 
-    def _render_market_canvas(self, market_key: str, thinker_data: Dict[str, Any]) -> None:
+    def _render_market_canvas(self, market_key: str, thinker_data: Dict[str, Any], status_data: Optional[Dict[str, Any]] = None) -> None:
         panel = self.market_panels.get(market_key, {})
         canvas = panel.get("chart_canvas")
-        selector = panel.get("selector")
+        table_wrap = panel.get("chart_table_wrap")
+        table = panel.get("chart_table")
         if not canvas:
             return
         try:
@@ -4142,9 +4492,12 @@ class PowerTraderHub(tk.Tk):
         except Exception:
             return
 
-        view = str(selector.get() if selector else "Overview").strip() or "Overview"
+        view_var = panel.get("market_view_var")
+        view = str((view_var.get() if view_var else "Overview") or "Overview").strip() or "Overview"
         leaders = list(thinker_data.get("leaders", []) or [])
         top_pick = thinker_data.get("top_pick") or (leaders[0] if leaders else None)
+        if not isinstance(status_data, dict):
+            status_data = {}
         updated_at = thinker_data.get("updated_at")
         updated_txt = ""
         try:
@@ -4153,7 +4506,216 @@ class PowerTraderHub(tk.Tk):
         except Exception:
             updated_txt = ""
 
+        def _table_mode(columns: Tuple[str, ...], rows: List[Tuple[Any, ...]], headings: Optional[Dict[str, str]] = None) -> None:
+            if not table or not table_wrap:
+                return
+            try:
+                canvas.grid_remove()
+                table_wrap.grid(row=0, column=0, sticky="nsew")
+            except Exception:
+                pass
+            try:
+                table["columns"] = columns
+                for iid in table.get_children():
+                    table.delete(iid)
+                for col in columns:
+                    title = (headings or {}).get(col, col.title())
+                    table.heading(col, text=title)
+                    anchor = "w" if col in ("symbol", "pair", "side", "conf", "note") else "e"
+                    base_w = 120
+                    if col in ("rank",):
+                        base_w = 56
+                    elif col in ("score",):
+                        base_w = 110
+                    elif col in ("note",):
+                        base_w = 280
+                    table.column(col, anchor=anchor, width=base_w, stretch=True)
+                if not rows:
+                    rows = [("No rows",) + tuple("" for _ in range(max(0, len(columns) - 1)))]
+                for row in rows:
+                    table.insert("", "end", values=row)
+            except Exception:
+                pass
+
+        def _canvas_mode() -> None:
+            try:
+                if table_wrap:
+                    table_wrap.grid_remove()
+            except Exception:
+                pass
+            try:
+                canvas.grid(row=0, column=0, sticky="nsew")
+            except Exception:
+                pass
+
+        if view == "Scanner":
+            all_scores = list(thinker_data.get("all_scores", leaders) or [])
+            show_rejected_key = "stock_show_rejected_rows" if market_key == "stocks" else "forex_show_rejected_rows"
+            show_rejected = bool(self.settings.get(show_rejected_key, False))
+            rows: List[Tuple[Any, ...]] = []
+            filtered_scores: List[Dict[str, Any]] = []
+            for row in all_scores:
+                try:
+                    if float(row.get("score", -9999.0) or -9999.0) <= -9999.0:
+                        continue
+                except Exception:
+                    pass
+                filtered_scores.append(row)
+            display_scores = all_scores if show_rejected else filtered_scores
+            for idx, row in enumerate(display_scores[:40], start=1):
+                ident = str(row.get("pair") or row.get("symbol") or "N/A")
+                side = str(row.get("side", "watch") or "watch").upper()
+                try:
+                    score_txt = f"{float(row.get('score', 0.0)):+.6f}"
+                except Exception:
+                    score_txt = str(row.get("score", "N/A"))
+                conf = str(row.get("confidence", "N/A") or "N/A")
+                note = str(row.get("reason", "") or "").strip()
+                bars_count = str(row.get("bars_count", "") or "")
+                src = str(row.get("data_source", "") or "")
+                eligible = "Y" if bool(row.get("eligible_for_entry", False)) else "N"
+                rows.append((idx, ident, side, score_txt, conf, bars_count, src, eligible, note))
+            if show_rejected:
+                rejected_rows = list(thinker_data.get("rejected", []) or [])
+                base = len(rows)
+                for j, rej in enumerate(rejected_rows[:30], start=1):
+                    ident = str(rej.get("pair") or rej.get("symbol") or "N/A")
+                    reason = str(rej.get("reason", "rejected") or "rejected")
+                    bars_count = str(rej.get("bars_count", "") or "")
+                    src = str(rej.get("source", "") or "")
+                    note = reason
+                    rows.append((base + j, ident, "REJECT", "-", "-", bars_count, src, "N", note))
+            _table_mode(
+                ("rank", "symbol", "side", "score", "conf", "bars", "src", "eligible", "note"),
+                rows,
+                headings={
+                    "rank": "#",
+                    "symbol": "Symbol",
+                    "side": "Side",
+                    "score": "Score",
+                    "conf": "Conf",
+                    "bars": "Bars",
+                    "src": "Source",
+                    "eligible": "Exec",
+                    "note": "Reason",
+                },
+            )
+            return
+
+        if view == "Leaders":
+            rows = []
+            for idx, row in enumerate(leaders[:20], start=1):
+                ident = str(row.get("pair") or row.get("symbol") or "N/A")
+                side = str(row.get("side", "watch") or "watch").upper()
+                try:
+                    score_txt = f"{float(row.get('score', 0.0)):+.6f}"
+                except Exception:
+                    score_txt = str(row.get("score", "N/A"))
+                conf = str(row.get("confidence", "N/A") or "N/A")
+                note = str(row.get("reason", "") or "").strip()
+                rows.append((idx, ident, side, score_txt, conf, note))
+            _table_mode(
+                ("rank", "symbol", "side", "score", "conf", "note"),
+                rows,
+                headings={"rank": "#", "symbol": ("Pair" if market_key == "forex" else "Symbol"), "side": "Side", "score": "Score", "conf": "Conf", "note": "Reason"},
+            )
+            return
+
+        if view == "Positions":
+            raw_positions = list(status_data.get("raw_positions", []) or [])
+            rows = []
+            if market_key == "stocks":
+                for row in raw_positions:
+                    if not isinstance(row, dict):
+                        continue
+                    sym = str(row.get("symbol", "") or "").strip().upper()
+                    if not sym:
+                        continue
+                    qty = self._market_fmt_num(row.get("qty", 0.0), 6)
+                    val = self._market_fmt_money(row.get("market_value", 0.0), 2)
+                    upl = self._market_fmt_signed_money(row.get("unrealized_pl", 0.0), 4)
+                    rows.append((sym, qty, val, upl))
+                _table_mode(("symbol", "qty", "value", "upl"), rows, headings={"symbol": "Symbol", "qty": "Qty", "value": "Value", "upl": "uPnL"})
+            else:
+                for row in raw_positions:
+                    if not isinstance(row, dict):
+                        continue
+                    inst = str(row.get("instrument", "") or "").strip().upper()
+                    if not inst:
+                        continue
+                    long_leg = row.get("long", {}) or {}
+                    short_leg = row.get("short", {}) or {}
+                    long_units = str(long_leg.get("units", "0") or "0")
+                    short_units = str(short_leg.get("units", "0") or "0")
+                    if long_units not in ("", "0", "0.0"):
+                        side = "LONG"
+                        units = self._market_fmt_num(long_units, 0)
+                        upl = self._market_fmt_signed_money(long_leg.get("unrealizedPL", 0.0), 4)
+                    elif short_units not in ("", "0", "0.0"):
+                        side = "SHORT"
+                        units = self._market_fmt_num(short_units, 0)
+                        upl = self._market_fmt_signed_money(short_leg.get("unrealizedPL", 0.0), 4)
+                    else:
+                        side = "FLAT"
+                        units = "0"
+                        upl = "0.0000"
+                    rows.append((inst, side, units, upl))
+                _table_mode(("pair", "side", "units", "upl"), rows, headings={"pair": "Pair", "side": "Side", "units": "Units", "upl": "uPnL"})
+            return
+
+        if view == "Execution":
+            audit_path = os.path.join(self.market_state_dirs.get(market_key, self.hub_dir), "execution_audit.jsonl")
+            rows: List[Tuple[Any, ...]] = []
+            try:
+                with open(audit_path, "r", encoding="utf-8") as f:
+                    data = [ln.strip() for ln in f if ln.strip()]
+                for ln in data[-80:]:
+                    try:
+                        row = json.loads(ln)
+                    except Exception:
+                        continue
+                    when = ""
+                    try:
+                        when = time.strftime("%H:%M:%S", time.localtime(float(row.get("ts", 0) or 0)))
+                    except Exception:
+                        when = ""
+                    ident = str(row.get("symbol", "") or row.get("instrument", "") or "").strip().upper()
+                    evt = str(row.get("event", "") or "").strip()
+                    side = str(row.get("side", "") or "").strip().upper()
+                    ok = str(row.get("ok", "")).strip()
+                    msg = str(row.get("msg", "") or "").strip()
+                    rows.append((when, ident, evt, side, ok, msg[:120]))
+            except Exception:
+                rows = []
+            _table_mode(
+                ("time", "symbol", "event", "side", "ok", "msg"),
+                rows,
+                headings={"time": "Time", "symbol": ("Pair" if market_key == "forex" else "Symbol"), "event": "Event", "side": "Side", "ok": "OK", "msg": "Message"},
+            )
+            return
+
+        if view == "Health":
+            health = {}
+            try:
+                health = _safe_read_json(os.path.join(self.market_state_dirs.get(market_key, self.hub_dir), "health_status.json")) or {}
+            except Exception:
+                health = {}
+            row = (
+                "YES" if bool(health.get("data_ok", True)) else "NO",
+                "YES" if bool(health.get("broker_ok", True)) else "NO",
+                "YES" if bool(health.get("orders_ok", True)) else "NO",
+                "YES" if bool(health.get("drift_warning", False)) else "NO",
+                self._market_age_text(health.get("ts", 0)),
+            )
+            _table_mode(
+                ("data", "broker", "orders", "drift", "updated"),
+                [row],
+                headings={"data": "Data OK", "broker": "Broker OK", "orders": "Orders OK", "drift": "Drift Warning", "updated": "Updated"},
+            )
+            return
+
         if view == "Overview":
+            _canvas_mode()
             title = f"{panel.get('market_name', market_key.title())} Thinker Overview"
             body_lines = []
             if top_pick:
@@ -4165,30 +4727,20 @@ class PowerTraderHub(tk.Tk):
                 body_lines.append(str(top_pick.get("reason", "") or "").strip())
             else:
                 body_lines.append("No ranked candidates yet.")
-            if updated_txt:
-                body_lines.append(f"Last scan: {updated_txt}")
-        elif view == "Leaders":
-            title = "Top Leaders"
-            body_lines = []
-            if not leaders:
-                body_lines.append("No leaders available.")
-            for idx, row in enumerate(leaders[:5], start=1):
+            leaders_preview = []
+            for idx, row in enumerate(leaders[:4], start=1):
                 ident = row.get("pair") or row.get("symbol") or "N/A"
                 side = str(row.get("side", "watch") or "watch").upper()
-                body_lines.append(f"{idx}. {ident} | {side} | score {row.get('score', 'N/A')}")
-                body_lines.append(f"   {row.get('reason', '')}")
-        elif view == "Scanner":
-            title = "Scanner"
-            all_scores = list(thinker_data.get("all_scores", leaders) or [])
-            body_lines = []
-            if not all_scores:
-                body_lines.append("Scanner waiting for data.")
-            for idx, row in enumerate(all_scores[:8], start=1):
-                ident = row.get("pair") or row.get("symbol") or "N/A"
-                body_lines.append(
-                    f"{idx}. {ident} | {str(row.get('side', 'watch')).upper()} | score {row.get('score', 'N/A')} | {row.get('confidence', 'N/A')}"
-                )
+                score = row.get("score", "N/A")
+                leaders_preview.append(f"{idx}. {ident:<10} {side:<5} score {score}")
+            if leaders_preview:
+                body_lines.append("")
+                body_lines.append("Leaders:")
+                body_lines.extend(leaders_preview)
+            if updated_txt:
+                body_lines.append(f"Last scan: {updated_txt}")
         else:
+            _canvas_mode()
             title = "Positions-Aware View"
             body_lines = ["Use the Positions panel below for linked broker positions."]
             if top_pick:
@@ -4196,6 +4748,18 @@ class PowerTraderHub(tk.Tk):
                 body_lines.append(f"Current strongest candidate: {ident}")
 
         try:
+            top_chart = list(thinker_data.get("top_chart", []) or [])
+            chart_points = []
+            chart_times = []
+            for p in top_chart[-120:]:
+                try:
+                    cv = float((p or {}).get("c", 0.0) or 0.0)
+                except Exception:
+                    cv = 0.0
+                if cv <= 0:
+                    continue
+                chart_points.append(cv)
+                chart_times.append(str((p or {}).get("t", "") or ""))
             canvas.create_text(
                 18,
                 16,
@@ -4205,15 +4769,54 @@ class PowerTraderHub(tk.Tk):
                 font=(self._live_log_font.cget("family"), max(10, int(self._live_log_font.cget("size")) + 3), "bold"),
             )
             body = "\n".join(str(x) for x in body_lines)
+            text_right = max(240, int(width * 0.42))
             canvas.create_text(
                 18,
                 48,
                 anchor="nw",
                 text=body,
                 fill=DARK_FG,
-                width=max(260, width - 40),
+                width=max(220, text_right - 24),
                 font=(self._live_log_font.cget("family"), max(9, int(self._live_log_font.cget("size")) + 1)),
             )
+
+            if len(chart_points) >= 2:
+                plot_left = min(width - 140, text_right + 14)
+                plot_right = width - 18
+                plot_top = 36
+                plot_bot = max(plot_top + 80, height - 26)
+                if plot_right > plot_left + 40 and plot_bot > plot_top + 40:
+                    vmin = min(chart_points)
+                    vmax = max(chart_points)
+                    vrange = max(1e-9, vmax - vmin)
+
+                    canvas.create_rectangle(plot_left, plot_top, plot_right, plot_bot, outline=DARK_BORDER, fill=DARK_PANEL2)
+                    # Mid grid line
+                    mid_y = plot_top + ((plot_bot - plot_top) * 0.5)
+                    canvas.create_line(plot_left, mid_y, plot_right, mid_y, fill=DARK_BORDER)
+
+                    pts = []
+                    for i, v in enumerate(chart_points):
+                        x = plot_left + (float(i) / float(max(1, len(chart_points) - 1))) * (plot_right - plot_left)
+                        y = plot_bot - ((v - vmin) / vrange) * (plot_bot - plot_top)
+                        pts.extend([x, y])
+                    canvas.create_line(*pts, fill=DARK_ACCENT2, width=2, smooth=True)
+
+                    first_v = chart_points[0]
+                    last_v = chart_points[-1]
+                    delta_pct = (((last_v - first_v) / first_v) * 100.0) if first_v > 0 else 0.0
+                    try:
+                        t0 = chart_times[0]
+                        t1 = chart_times[-1]
+                        t_lbl = f"{t0[5:16]} -> {t1[5:16]}" if t0 and t1 else f"{len(chart_points)} bars"
+                    except Exception:
+                        t_lbl = f"{len(chart_points)} bars"
+
+                    canvas.create_text(plot_left, plot_top - 2, anchor="sw", text=t_lbl, fill=DARK_MUTED, font=(self._live_log_font.cget("family"), max(8, int(self._live_log_font.cget("size")))))
+                    canvas.create_text(plot_right, plot_top, anchor="ne", text=f"max {self._market_fmt_num(vmax, 6)}", fill=DARK_MUTED, font=(self._live_log_font.cget("family"), max(8, int(self._live_log_font.cget("size")))))
+                    canvas.create_text(plot_right, plot_bot, anchor="se", text=f"min {self._market_fmt_num(vmin, 6)}", fill=DARK_MUTED, font=(self._live_log_font.cget("family"), max(8, int(self._live_log_font.cget("size")))))
+                    canvas.create_text(plot_right, plot_top + 14, anchor="ne", text=f"last {self._market_fmt_num(last_v, 6)}", fill=DARK_ACCENT2, font=(self._live_log_font.cget("family"), max(9, int(self._live_log_font.cget("size")))))
+                    canvas.create_text(plot_right, plot_top + 30, anchor="ne", text=f"delta {delta_pct:+.2f}%", fill=(DARK_ACCENT if delta_pct >= 0 else "#FF6B57"), font=(self._live_log_font.cget("family"), max(9, int(self._live_log_font.cget("size")))))
         except Exception:
             pass
 
@@ -4261,8 +4864,34 @@ class PowerTraderHub(tk.Tk):
             state_line = f"Trade State: {str(thinker_data.get('state', status_data.get('state', state_txt)) or state_txt)}"
             if msg:
                 state_line += f" | {msg}"
+            health = {}
+            if isinstance(thinker_data.get("health"), dict):
+                health = thinker_data.get("health") or {}
+            elif isinstance(trader_data.get("health"), dict):
+                health = trader_data.get("health") or {}
+            if health:
+                hb = (
+                    f"Data={'OK' if bool(health.get('data_ok', True)) else 'NO'} "
+                    f"Broker={'OK' if bool(health.get('broker_ok', True)) else 'NO'} "
+                    f"Orders={'OK' if bool(health.get('orders_ok', True)) else 'NO'} "
+                    f"Drift={'YES' if bool(health.get('drift_warning', False)) else 'NO'}"
+                )
+                state_line += f" | {hb}"
             panel["state_var"].set(state_line)
             panel["endpoint_var"].set(f"Broker: {broker} | {mode_txt} | {endpoint or 'endpoint not set'}")
+            top_pick = thinker_data.get("top_pick", {}) or {}
+            if not isinstance(top_pick, dict):
+                top_pick = {}
+            top_ident = str(top_pick.get("pair") or top_pick.get("symbol") or "N/A")
+            top_side = str(top_pick.get("side", "watch") or "watch").upper()
+            try:
+                top_score = f"{float(top_pick.get('score', 0.0)):+.4f}"
+            except Exception:
+                top_score = str(top_pick.get("score", "N/A"))
+            try:
+                panel["top_pick_var"].set(f"Top: {top_ident} | {top_side} | {top_score}")
+            except Exception:
+                pass
 
             pvars = panel.get("portfolio_vars", {})
             if isinstance(pvars, dict):
@@ -4270,7 +4899,32 @@ class PowerTraderHub(tk.Tk):
                 pvars["open_positions"].set(str(status_data.get("open_positions", "0") or "0"))
                 pvars["realized_pnl"].set(str(status_data.get("realized_pnl", "N/A") or "N/A"))
                 pvars["mode"].set(mode_txt or "Paper first")
-            self._set_market_positions(market_key, list(status_data.get("positions_preview", []) or []))
+            self._set_market_positions(
+                market_key,
+                list(status_data.get("positions_preview", []) or []),
+                raw_positions=list(status_data.get("raw_positions", []) or []),
+            )
+
+            history_lines: List[str] = []
+            trader_ts = trader_data.get("updated_at")
+            if trader_ts:
+                try:
+                    history_lines.append(f"[{time.strftime('%H:%M:%S', time.localtime(float(trader_ts)))}] {str(trader_data.get('msg', '') or '').strip()}")
+                except Exception:
+                    history_lines.append(str(trader_data.get("msg", "") or "").strip())
+            elif trader_data.get("msg"):
+                history_lines.append(str(trader_data.get("msg", "") or "").strip())
+            for row in list(trader_data.get("actions", []) or [])[-20:]:
+                txt = str(row or "").strip()
+                if txt:
+                    history_lines.append(txt)
+            if thinker_data.get("msg"):
+                history_lines.append(f"Thinker: {str(thinker_data.get('msg', '') or '').strip()}")
+            history_sig = tuple(history_lines[-40:])
+            if panel.get("last_history_sig") != history_sig:
+                panel["last_history_sig"] = history_sig
+                panel["history_lines"] = list(history_lines[-120:])
+                self._set_market_history(market_key, history_lines)
 
             extra_note = str(thinker_data.get("pdt_note", "") or status_data.get("pdt_note", "") or "").strip()
 
@@ -4289,7 +4943,30 @@ class PowerTraderHub(tk.Tk):
                     ]
                 ),
             )
-            self._render_market_canvas(market_key, thinker_data)
+            self._render_market_canvas(market_key, thinker_data, status_data=status_data)
+            source_ts = (
+                trader_data.get("updated_at")
+                or thinker_data.get("updated_at")
+                or thinker_data.get("ts")
+                or status_data.get("ts")
+            )
+            age_txt = self._market_age_text(source_ts)
+            try:
+                panel["charts_age_var"].set(age_txt)
+            except Exception:
+                pass
+            try:
+                panel["positions_age_var"].set(age_txt)
+            except Exception:
+                pass
+            try:
+                panel["history_age_var"].set(age_txt)
+            except Exception:
+                pass
+            try:
+                panel["logs_age_var"].set(age_txt)
+            except Exception:
+                pass
 
             log_sig = (
                 configured,
@@ -4312,19 +4989,27 @@ class PowerTraderHub(tk.Tk):
 
             try:
                 busy = bool(self._market_test_busy.get(market_key, False))
-                panel["test_btn"].configure(state=("disabled" if busy else "normal"))
+                panel["test_btn"].configure(
+                    state=("disabled" if busy else "normal"),
+                    text=("Testing..." if busy else f"Test {panel.get('broker_name', broker)} Connection"),
+                )
             except Exception:
                 pass
             try:
                 scan_busy = bool(self._market_thinker_busy.get(market_key, False))
-                panel["run_btn"].configure(state=("disabled" if scan_busy else "normal"))
+                panel["run_btn"].configure(state=("disabled" if scan_busy else "normal"), text=("Scanning..." if scan_busy else "Run Scan"))
             except Exception:
                 pass
             try:
                 step_btn = panel.get("trader_step_btn")
                 if step_btn is not None:
                     step_market = str(panel.get("trader_step_market_key", "") or "")
-                    step_btn.configure(state=("disabled" if self._market_trader_busy.get(step_market, False) else "normal"))
+                    busy_step = bool(self._market_trader_busy.get(step_market, False))
+                    step_name = "Stocks" if step_market == "stocks" else "Forex"
+                    step_btn.configure(
+                        state=("disabled" if busy_step else "normal"),
+                        text=(f"Running {step_name} Step..." if busy_step else f"Run {step_name} Trader Step"),
+                    )
             except Exception:
                 pass
 
@@ -5208,24 +5893,30 @@ class PowerTraderHub(tk.Tk):
                 fetcher_changed = bool(self.fetcher.drain_results())
         except Exception:
             fetcher_changed = False
-        try:
-            self._schedule_market_snapshot_refresh("stocks", every_s=20.0)
-            self._schedule_market_snapshot_refresh("forex", every_s=10.0)
-        except Exception:
-            pass
-        try:
-            self._schedule_market_thinker_scan("stocks", every_s=75.0)
-            self._schedule_market_thinker_scan("forex", every_s=45.0)
-        except Exception:
-            pass
-        try:
-            self._run_stock_trader_step(force=False, min_interval_s=18.0)
-        except Exception:
-            pass
-        try:
-            self._run_forex_trader_step(force=False, min_interval_s=12.0)
-        except Exception:
-            pass
+        runtime_early = self._read_runner_status()
+        runner_state_early = str(runtime_early.get("state", "") or "").upper().strip()
+        runner_pid_early = runtime_early.get("runner_pid", None)
+        runner_ts_early = float(runtime_early.get("ts", 0.0) or 0.0)
+        runner_live = bool(runner_pid_early) and ((time.time() - runner_ts_early) <= 12.0) and runner_state_early in {"RUNNING", "ERROR", "STOPPING"}
+        if not runner_live:
+            try:
+                self._schedule_market_snapshot_refresh("stocks", every_s=20.0)
+                self._schedule_market_snapshot_refresh("forex", every_s=10.0)
+            except Exception:
+                pass
+            try:
+                self._schedule_market_thinker_scan("stocks", every_s=75.0)
+                self._schedule_market_thinker_scan("forex", every_s=45.0)
+            except Exception:
+                pass
+            try:
+                self._run_stock_trader_step(force=False, min_interval_s=18.0)
+            except Exception:
+                pass
+            try:
+                self._run_forex_trader_step(force=False, min_interval_s=12.0)
+            except Exception:
+                pass
         try:
             self._refresh_parallel_market_panels()
         except Exception:
@@ -6722,6 +7413,12 @@ class PowerTraderHub(tk.Tk):
         stock_min_price_var = tk.StringVar(value=str(self.settings.get("stock_min_price", DEFAULT_SETTINGS.get("stock_min_price", 5.0))))
         stock_max_price_var = tk.StringVar(value=str(self.settings.get("stock_max_price", DEFAULT_SETTINGS.get("stock_max_price", 500.0))))
         stock_min_dollar_volume_var = tk.StringVar(value=str(self.settings.get("stock_min_dollar_volume", DEFAULT_SETTINGS.get("stock_min_dollar_volume", 5000000.0))))
+        stock_max_spread_bps_var = tk.StringVar(value=str(self.settings.get("stock_max_spread_bps", DEFAULT_SETTINGS.get("stock_max_spread_bps", 40.0))))
+        stock_gate_hours_var = tk.BooleanVar(value=bool(self.settings.get("stock_gate_market_hours_scan", DEFAULT_SETTINGS.get("stock_gate_market_hours_scan", True))))
+        stock_min_bars_var = tk.StringVar(value=str(self.settings.get("stock_min_bars_required", DEFAULT_SETTINGS.get("stock_min_bars_required", 24))))
+        stock_min_valid_ratio_var = tk.StringVar(value=str(self.settings.get("stock_min_valid_bars_ratio", DEFAULT_SETTINGS.get("stock_min_valid_bars_ratio", 0.7))))
+        stock_max_stale_hours_var = tk.StringVar(value=str(self.settings.get("stock_max_stale_hours", DEFAULT_SETTINGS.get("stock_max_stale_hours", 6.0))))
+        stock_show_rejected_var = tk.BooleanVar(value=bool(self.settings.get("stock_show_rejected_rows", DEFAULT_SETTINGS.get("stock_show_rejected_rows", False))))
         stock_auto_trade_var = tk.BooleanVar(value=bool(self.settings.get("stock_auto_trade_enabled", DEFAULT_SETTINGS.get("stock_auto_trade_enabled", False))))
         stock_notional_var = tk.StringVar(value=str(self.settings.get("stock_trade_notional_usd", DEFAULT_SETTINGS.get("stock_trade_notional_usd", 100.0))))
         stock_max_pos_var = tk.StringVar(value=str(self.settings.get("stock_max_open_positions", DEFAULT_SETTINGS.get("stock_max_open_positions", 1))))
@@ -6731,6 +7428,19 @@ class PowerTraderHub(tk.Tk):
         stock_day_trades_var = tk.StringVar(value=str(self.settings.get("stock_max_day_trades", DEFAULT_SETTINGS.get("stock_max_day_trades", 3))))
         stock_max_position_usd_var = tk.StringVar(value=str(self.settings.get("stock_max_position_usd_per_symbol", DEFAULT_SETTINGS.get("stock_max_position_usd_per_symbol", 0.0))))
         stock_max_exposure_var = tk.StringVar(value=str(self.settings.get("stock_max_total_exposure_pct", DEFAULT_SETTINGS.get("stock_max_total_exposure_pct", 0.0))))
+        stock_guarded_mult_var = tk.StringVar(value=str(self.settings.get("stock_live_guarded_score_mult", DEFAULT_SETTINGS.get("stock_live_guarded_score_mult", 1.2))))
+        stock_min_calib_prob_var = tk.StringVar(value=str(self.settings.get("stock_min_calib_prob_live_guarded", DEFAULT_SETTINGS.get("stock_min_calib_prob_live_guarded", 0.58))))
+        stock_max_slippage_bps_var = tk.StringVar(value=str(self.settings.get("stock_max_slippage_bps", DEFAULT_SETTINGS.get("stock_max_slippage_bps", 35.0))))
+        stock_order_retry_count_var = tk.StringVar(value=str(self.settings.get("stock_order_retry_count", DEFAULT_SETTINGS.get("stock_order_retry_count", 2))))
+        stock_max_loss_streak_var = tk.StringVar(value=str(self.settings.get("stock_max_loss_streak", DEFAULT_SETTINGS.get("stock_max_loss_streak", 3))))
+        stock_loss_cooldown_var = tk.StringVar(value=str(self.settings.get("stock_loss_cooldown_seconds", DEFAULT_SETTINGS.get("stock_loss_cooldown_seconds", 1800))))
+        stock_max_daily_loss_usd_var = tk.StringVar(value=str(self.settings.get("stock_max_daily_loss_usd", DEFAULT_SETTINGS.get("stock_max_daily_loss_usd", 0.0))))
+        stock_max_daily_loss_pct_var = tk.StringVar(value=str(self.settings.get("stock_max_daily_loss_pct", DEFAULT_SETTINGS.get("stock_max_daily_loss_pct", 0.0))))
+        stock_min_samples_guarded_var = tk.StringVar(value=str(self.settings.get("stock_min_samples_live_guarded", DEFAULT_SETTINGS.get("stock_min_samples_live_guarded", 5))))
+        stock_max_signal_age_var = tk.StringVar(value=str(self.settings.get("stock_max_signal_age_seconds", DEFAULT_SETTINGS.get("stock_max_signal_age_seconds", 300))))
+        stock_reject_warn_pct_var = tk.StringVar(value=str(self.settings.get("stock_reject_drift_warn_pct", DEFAULT_SETTINGS.get("stock_reject_drift_warn_pct", 65.0))))
+        stock_block_near_close_var = tk.BooleanVar(value=bool(self.settings.get("stock_block_new_entries_near_close", DEFAULT_SETTINGS.get("stock_block_new_entries_near_close", True))))
+        stock_no_new_close_mins_var = tk.StringVar(value=str(self.settings.get("stock_no_new_entries_mins_to_close", DEFAULT_SETTINGS.get("stock_no_new_entries_mins_to_close", 15))))
         oanda_account_var = tk.StringVar(value=str(self.settings.get("oanda_account_id", DEFAULT_SETTINGS.get("oanda_account_id", "")) or ""))
         oanda_token_var = tk.StringVar(value=str(self.settings.get("oanda_api_token", DEFAULT_SETTINGS.get("oanda_api_token", "")) or ""))
         oanda_rest_url_var = tk.StringVar(value=str(self.settings.get("oanda_rest_url", DEFAULT_SETTINGS.get("oanda_rest_url", "")) or ""))
@@ -6738,13 +7448,33 @@ class PowerTraderHub(tk.Tk):
         oanda_practice_var = tk.BooleanVar(value=bool(self.settings.get("oanda_practice_mode", DEFAULT_SETTINGS.get("oanda_practice_mode", True))))
         forex_pairs_var = tk.StringVar(value=str(self.settings.get("forex_universe_pairs", DEFAULT_SETTINGS.get("forex_universe_pairs", "")) or ""))
         forex_scan_max_pairs_var = tk.StringVar(value=str(self.settings.get("forex_scan_max_pairs", DEFAULT_SETTINGS.get("forex_scan_max_pairs", 16))))
+        fx_max_spread_bps_var = tk.StringVar(value=str(self.settings.get("forex_max_spread_bps", DEFAULT_SETTINGS.get("forex_max_spread_bps", 8.0))))
+        fx_min_vol_pct_var = tk.StringVar(value=str(self.settings.get("forex_min_volatility_pct", DEFAULT_SETTINGS.get("forex_min_volatility_pct", 0.01))))
+        fx_min_bars_var = tk.StringVar(value=str(self.settings.get("forex_min_bars_required", DEFAULT_SETTINGS.get("forex_min_bars_required", 24))))
+        fx_min_valid_ratio_var = tk.StringVar(value=str(self.settings.get("forex_min_valid_bars_ratio", DEFAULT_SETTINGS.get("forex_min_valid_bars_ratio", 0.7))))
+        fx_max_stale_hours_var = tk.StringVar(value=str(self.settings.get("forex_max_stale_hours", DEFAULT_SETTINGS.get("forex_max_stale_hours", 8.0))))
+        fx_show_rejected_var = tk.BooleanVar(value=bool(self.settings.get("forex_show_rejected_rows", DEFAULT_SETTINGS.get("forex_show_rejected_rows", False))))
         fx_auto_trade_var = tk.BooleanVar(value=bool(self.settings.get("forex_auto_trade_enabled", DEFAULT_SETTINGS.get("forex_auto_trade_enabled", False))))
         fx_trade_units_var = tk.StringVar(value=str(self.settings.get("forex_trade_units", DEFAULT_SETTINGS.get("forex_trade_units", 1000))))
         fx_max_pos_var = tk.StringVar(value=str(self.settings.get("forex_max_open_positions", DEFAULT_SETTINGS.get("forex_max_open_positions", 1))))
+        fx_max_pos_usd_pair_var = tk.StringVar(value=str(self.settings.get("forex_max_position_usd_per_pair", DEFAULT_SETTINGS.get("forex_max_position_usd_per_pair", 0.0))))
         fx_score_threshold_var = tk.StringVar(value=str(self.settings.get("forex_score_threshold", DEFAULT_SETTINGS.get("forex_score_threshold", 0.2))))
         fx_profit_target_var = tk.StringVar(value=str(self.settings.get("forex_profit_target_pct", DEFAULT_SETTINGS.get("forex_profit_target_pct", 0.25))))
         fx_trailing_gap_var = tk.StringVar(value=str(self.settings.get("forex_trailing_gap_pct", DEFAULT_SETTINGS.get("forex_trailing_gap_pct", 0.15))))
         fx_max_exposure_var = tk.StringVar(value=str(self.settings.get("forex_max_total_exposure_pct", DEFAULT_SETTINGS.get("forex_max_total_exposure_pct", 0.0))))
+        fx_session_mode_var = tk.StringVar(value=str(self.settings.get("forex_session_mode", DEFAULT_SETTINGS.get("forex_session_mode", "all")) or "all"))
+        fx_guarded_mult_var = tk.StringVar(value=str(self.settings.get("forex_live_guarded_score_mult", DEFAULT_SETTINGS.get("forex_live_guarded_score_mult", 1.15))))
+        fx_min_calib_prob_var = tk.StringVar(value=str(self.settings.get("forex_min_calib_prob_live_guarded", DEFAULT_SETTINGS.get("forex_min_calib_prob_live_guarded", 0.56))))
+        fx_max_slippage_bps_var = tk.StringVar(value=str(self.settings.get("forex_max_slippage_bps", DEFAULT_SETTINGS.get("forex_max_slippage_bps", 6.0))))
+        fx_order_retry_count_var = tk.StringVar(value=str(self.settings.get("forex_order_retry_count", DEFAULT_SETTINGS.get("forex_order_retry_count", 2))))
+        fx_max_loss_streak_var = tk.StringVar(value=str(self.settings.get("forex_max_loss_streak", DEFAULT_SETTINGS.get("forex_max_loss_streak", 3))))
+        fx_loss_cooldown_var = tk.StringVar(value=str(self.settings.get("forex_loss_cooldown_seconds", DEFAULT_SETTINGS.get("forex_loss_cooldown_seconds", 1800))))
+        fx_max_daily_loss_usd_var = tk.StringVar(value=str(self.settings.get("forex_max_daily_loss_usd", DEFAULT_SETTINGS.get("forex_max_daily_loss_usd", 0.0))))
+        fx_max_daily_loss_pct_var = tk.StringVar(value=str(self.settings.get("forex_max_daily_loss_pct", DEFAULT_SETTINGS.get("forex_max_daily_loss_pct", 0.0))))
+        fx_min_samples_guarded_var = tk.StringVar(value=str(self.settings.get("forex_min_samples_live_guarded", DEFAULT_SETTINGS.get("forex_min_samples_live_guarded", 5))))
+        fx_max_signal_age_var = tk.StringVar(value=str(self.settings.get("forex_max_signal_age_seconds", DEFAULT_SETTINGS.get("forex_max_signal_age_seconds", 300))))
+        fx_reject_warn_pct_var = tk.StringVar(value=str(self.settings.get("forex_reject_drift_warn_pct", DEFAULT_SETTINGS.get("forex_reject_drift_warn_pct", 65.0))))
+        market_global_exposure_var = tk.StringVar(value=str(self.settings.get("market_max_total_exposure_pct", DEFAULT_SETTINGS.get("market_max_total_exposure_pct", 0.0))))
 
         hub_dir_var = tk.StringVar(value=self.settings.get("hub_data_dir", ""))
 
@@ -6859,7 +7589,7 @@ class PowerTraderHub(tk.Tk):
 
         ttk.Separator(advanced_frame, orient="horizontal").grid(row=ar, column=0, columnspan=3, sticky="ew", pady=10); ar += 1
         add_row(ar, "Market rollout stage:", rollout_stage_var, parent=advanced_frame); ar += 1
-        ttk.Label(advanced_frame, text="Stages: legacy -> scan_expanded -> risk_caps -> execution_v2", foreground=DARK_MUTED).grid(row=ar, column=0, columnspan=3, sticky="w", pady=(0, 6)); ar += 1
+        ttk.Label(advanced_frame, text="Stages: legacy -> scan_expanded -> risk_caps -> execution_v2 -> shadow_only -> live_guarded", foreground=DARK_MUTED).grid(row=ar, column=0, columnspan=3, sticky="w", pady=(0, 6)); ar += 1
 
         ttk.Label(advanced_frame, text="Alpaca API:").grid(row=ar, column=0, sticky="w", padx=(0, 10), pady=6)
         alpaca_mode_chk = ttk.Checkbutton(advanced_frame, text="Paper mode", variable=alpaca_paper_var)
@@ -6875,6 +7605,16 @@ class PowerTraderHub(tk.Tk):
         add_row(ar, "Stock min price:", stock_min_price_var, parent=advanced_frame); ar += 1
         add_row(ar, "Stock max price:", stock_max_price_var, parent=advanced_frame); ar += 1
         add_row(ar, "Stock min dollar volume:", stock_min_dollar_volume_var, parent=advanced_frame); ar += 1
+        add_row(ar, "Stock max spread bps:", stock_max_spread_bps_var, parent=advanced_frame); ar += 1
+        ttk.Label(advanced_frame, text="Stock scan market-hours gate:").grid(row=ar, column=0, sticky="w", padx=(0, 10), pady=6)
+        ttk.Checkbutton(advanced_frame, text="Only scan during market hours", variable=stock_gate_hours_var).grid(row=ar, column=1, sticky="w", pady=6)
+        ttk.Label(advanced_frame, text="").grid(row=ar, column=2, sticky="e", padx=(10, 0), pady=6); ar += 1
+        add_row(ar, "Stock min bars required:", stock_min_bars_var, parent=advanced_frame); ar += 1
+        add_row(ar, "Stock min valid bars ratio (0-1):", stock_min_valid_ratio_var, parent=advanced_frame); ar += 1
+        add_row(ar, "Stock max stale hours:", stock_max_stale_hours_var, parent=advanced_frame); ar += 1
+        ttk.Label(advanced_frame, text="Stock scanner show rejected rows:").grid(row=ar, column=0, sticky="w", padx=(0, 10), pady=6)
+        ttk.Checkbutton(advanced_frame, text="Include rejected rows in Scanner table", variable=stock_show_rejected_var).grid(row=ar, column=1, sticky="w", pady=6)
+        ttk.Label(advanced_frame, text="").grid(row=ar, column=2, sticky="e", padx=(10, 0), pady=6); ar += 1
         ttk.Label(advanced_frame, text="Stocks AI trader:").grid(row=ar, column=0, sticky="w", padx=(0, 10), pady=6)
         ttk.Checkbutton(advanced_frame, text="Enable auto-trade (paper-safe)", variable=stock_auto_trade_var).grid(row=ar, column=1, sticky="w", pady=6)
         ttk.Label(advanced_frame, text="").grid(row=ar, column=2, sticky="e", padx=(10, 0), pady=6); ar += 1
@@ -6886,6 +7626,21 @@ class PowerTraderHub(tk.Tk):
         add_row(ar, "Stock max day trades / day:", stock_day_trades_var, parent=advanced_frame); ar += 1
         add_row(ar, "Stock max position USD/symbol (risk_caps):", stock_max_position_usd_var, parent=advanced_frame); ar += 1
         add_row(ar, "Stock max total exposure % (risk_caps):", stock_max_exposure_var, parent=advanced_frame); ar += 1
+        add_row(ar, "Stock live_guarded score multiplier:", stock_guarded_mult_var, parent=advanced_frame); ar += 1
+        add_row(ar, "Stock live_guarded min calibrated prob:", stock_min_calib_prob_var, parent=advanced_frame); ar += 1
+        add_row(ar, "Stock max slippage bps:", stock_max_slippage_bps_var, parent=advanced_frame); ar += 1
+        add_row(ar, "Stock order retry count:", stock_order_retry_count_var, parent=advanced_frame); ar += 1
+        add_row(ar, "Stock max loss streak:", stock_max_loss_streak_var, parent=advanced_frame); ar += 1
+        add_row(ar, "Stock loss cooldown seconds:", stock_loss_cooldown_var, parent=advanced_frame); ar += 1
+        add_row(ar, "Stock max daily loss USD (0=off):", stock_max_daily_loss_usd_var, parent=advanced_frame); ar += 1
+        add_row(ar, "Stock max daily loss % (0=off):", stock_max_daily_loss_pct_var, parent=advanced_frame); ar += 1
+        add_row(ar, "Stock min calibration samples (live_guarded):", stock_min_samples_guarded_var, parent=advanced_frame); ar += 1
+        add_row(ar, "Stock max signal age seconds:", stock_max_signal_age_var, parent=advanced_frame); ar += 1
+        add_row(ar, "Stock reject drift warn %:", stock_reject_warn_pct_var, parent=advanced_frame); ar += 1
+        ttk.Label(advanced_frame, text="Stock near-close entry block:").grid(row=ar, column=0, sticky="w", padx=(0, 10), pady=6)
+        ttk.Checkbutton(advanced_frame, text="Block new entries near close", variable=stock_block_near_close_var).grid(row=ar, column=1, sticky="w", pady=6)
+        ttk.Label(advanced_frame, text="").grid(row=ar, column=2, sticky="e", padx=(10, 0), pady=6); ar += 1
+        add_row(ar, "Stock block mins to close:", stock_no_new_close_mins_var, parent=advanced_frame); ar += 1
 
         ttk.Separator(advanced_frame, orient="horizontal").grid(row=ar, column=0, columnspan=3, sticky="ew", pady=10); ar += 1
 
@@ -6899,15 +7654,37 @@ class PowerTraderHub(tk.Tk):
         add_row(ar, "OANDA stream URL:", oanda_stream_url_var, parent=advanced_frame); ar += 1
         add_row(ar, "Forex universe pairs:", forex_pairs_var, parent=advanced_frame); ar += 1
         add_row(ar, "Forex scan max pairs:", forex_scan_max_pairs_var, parent=advanced_frame); ar += 1
+        add_row(ar, "Forex max spread bps:", fx_max_spread_bps_var, parent=advanced_frame); ar += 1
+        add_row(ar, "Forex min volatility %:", fx_min_vol_pct_var, parent=advanced_frame); ar += 1
+        add_row(ar, "Forex min bars required:", fx_min_bars_var, parent=advanced_frame); ar += 1
+        add_row(ar, "Forex min valid bars ratio (0-1):", fx_min_valid_ratio_var, parent=advanced_frame); ar += 1
+        add_row(ar, "Forex max stale hours:", fx_max_stale_hours_var, parent=advanced_frame); ar += 1
+        ttk.Label(advanced_frame, text="Forex scanner show rejected rows:").grid(row=ar, column=0, sticky="w", padx=(0, 10), pady=6)
+        ttk.Checkbutton(advanced_frame, text="Include rejected rows in Scanner table", variable=fx_show_rejected_var).grid(row=ar, column=1, sticky="w", pady=6)
+        ttk.Label(advanced_frame, text="").grid(row=ar, column=2, sticky="e", padx=(10, 0), pady=6); ar += 1
         ttk.Label(advanced_frame, text="Forex AI trader:").grid(row=ar, column=0, sticky="w", padx=(0, 10), pady=6)
         ttk.Checkbutton(advanced_frame, text="Enable auto-trade (practice only)", variable=fx_auto_trade_var).grid(row=ar, column=1, sticky="w", pady=6)
         ttk.Label(advanced_frame, text="").grid(row=ar, column=2, sticky="e", padx=(10, 0), pady=6); ar += 1
         add_row(ar, "Forex trade units:", fx_trade_units_var, parent=advanced_frame); ar += 1
         add_row(ar, "Forex max open positions:", fx_max_pos_var, parent=advanced_frame); ar += 1
+        add_row(ar, "Forex max position USD/pair (risk_caps):", fx_max_pos_usd_pair_var, parent=advanced_frame); ar += 1
         add_row(ar, "Forex score threshold:", fx_score_threshold_var, parent=advanced_frame); ar += 1
         add_row(ar, "Forex profit target %:", fx_profit_target_var, parent=advanced_frame); ar += 1
         add_row(ar, "Forex trailing gap %:", fx_trailing_gap_var, parent=advanced_frame); ar += 1
         add_row(ar, "Forex max exposure % (risk_caps proxy):", fx_max_exposure_var, parent=advanced_frame); ar += 1
+        add_row(ar, "Forex session mode (all/london_ny/london/ny/asia):", fx_session_mode_var, parent=advanced_frame); ar += 1
+        add_row(ar, "Forex live_guarded score multiplier:", fx_guarded_mult_var, parent=advanced_frame); ar += 1
+        add_row(ar, "Forex live_guarded min calibrated prob:", fx_min_calib_prob_var, parent=advanced_frame); ar += 1
+        add_row(ar, "Forex max slippage bps:", fx_max_slippage_bps_var, parent=advanced_frame); ar += 1
+        add_row(ar, "Forex order retry count:", fx_order_retry_count_var, parent=advanced_frame); ar += 1
+        add_row(ar, "Forex max loss streak:", fx_max_loss_streak_var, parent=advanced_frame); ar += 1
+        add_row(ar, "Forex loss cooldown seconds:", fx_loss_cooldown_var, parent=advanced_frame); ar += 1
+        add_row(ar, "Forex max daily loss USD (0=off):", fx_max_daily_loss_usd_var, parent=advanced_frame); ar += 1
+        add_row(ar, "Forex max daily loss % (0=off):", fx_max_daily_loss_pct_var, parent=advanced_frame); ar += 1
+        add_row(ar, "Forex min calibration samples (live_guarded):", fx_min_samples_guarded_var, parent=advanced_frame); ar += 1
+        add_row(ar, "Forex max signal age seconds:", fx_max_signal_age_var, parent=advanced_frame); ar += 1
+        add_row(ar, "Forex reject drift warn %:", fx_reject_warn_pct_var, parent=advanced_frame); ar += 1
+        add_row(ar, "Global max exposure % (all markets, 0=off):", market_global_exposure_var, parent=advanced_frame); ar += 1
 
         # --- Robinhood API setup (writes r_key.txt + r_secret.txt used by pt_trader.py) ---
         def _api_paths() -> Tuple[str, str]:
@@ -7608,7 +8385,7 @@ class PowerTraderHub(tk.Tk):
                 self.settings["alpaca_data_url"] = alpaca_data_url_var.get().strip() or str(DEFAULT_SETTINGS.get("alpaca_data_url", ""))
                 self.settings["alpaca_paper_mode"] = bool(alpaca_paper_var.get())
                 stage = str(rollout_stage_var.get() or "").strip().lower()
-                if stage not in {"legacy", "scan_expanded", "risk_caps", "execution_v2"}:
+                if stage not in {"legacy", "scan_expanded", "risk_caps", "execution_v2", "shadow_only", "live_guarded"}:
                     stage = str(DEFAULT_SETTINGS.get("market_rollout_stage", "legacy"))
                 self.settings["market_rollout_stage"] = stage
                 mode = str(stock_universe_mode_var.get() or "").strip().lower()
@@ -7632,6 +8409,24 @@ class PowerTraderHub(tk.Tk):
                     self.settings["stock_min_dollar_volume"] = max(0.0, float((stock_min_dollar_volume_var.get() or "").strip() or 5000000.0))
                 except Exception:
                     self.settings["stock_min_dollar_volume"] = float(DEFAULT_SETTINGS.get("stock_min_dollar_volume", 5000000.0))
+                try:
+                    self.settings["stock_max_spread_bps"] = max(0.0, float((stock_max_spread_bps_var.get() or "").strip() or 40.0))
+                except Exception:
+                    self.settings["stock_max_spread_bps"] = float(DEFAULT_SETTINGS.get("stock_max_spread_bps", 40.0))
+                self.settings["stock_gate_market_hours_scan"] = bool(stock_gate_hours_var.get())
+                try:
+                    self.settings["stock_min_bars_required"] = max(8, int(float((stock_min_bars_var.get() or "").strip() or 24)))
+                except Exception:
+                    self.settings["stock_min_bars_required"] = int(DEFAULT_SETTINGS.get("stock_min_bars_required", 24))
+                try:
+                    self.settings["stock_min_valid_bars_ratio"] = max(0.0, min(1.0, float((stock_min_valid_ratio_var.get() or "").strip() or 0.7)))
+                except Exception:
+                    self.settings["stock_min_valid_bars_ratio"] = float(DEFAULT_SETTINGS.get("stock_min_valid_bars_ratio", 0.7))
+                try:
+                    self.settings["stock_max_stale_hours"] = max(0.5, float((stock_max_stale_hours_var.get() or "").strip() or 6.0))
+                except Exception:
+                    self.settings["stock_max_stale_hours"] = float(DEFAULT_SETTINGS.get("stock_max_stale_hours", 6.0))
+                self.settings["stock_show_rejected_rows"] = bool(stock_show_rejected_var.get())
                 self.settings["stock_auto_trade_enabled"] = bool(stock_auto_trade_var.get())
                 try:
                     self.settings["stock_trade_notional_usd"] = max(1.0, float((stock_notional_var.get() or "").strip().replace("$", "") or 100.0))
@@ -7665,6 +8460,55 @@ class PowerTraderHub(tk.Tk):
                     self.settings["stock_max_total_exposure_pct"] = max(0.0, float((stock_max_exposure_var.get() or "").strip().replace("%", "") or 0.0))
                 except Exception:
                     self.settings["stock_max_total_exposure_pct"] = float(DEFAULT_SETTINGS.get("stock_max_total_exposure_pct", 0.0))
+                try:
+                    self.settings["stock_live_guarded_score_mult"] = max(1.0, float((stock_guarded_mult_var.get() or "").strip() or 1.2))
+                except Exception:
+                    self.settings["stock_live_guarded_score_mult"] = float(DEFAULT_SETTINGS.get("stock_live_guarded_score_mult", 1.2))
+                try:
+                    self.settings["stock_min_calib_prob_live_guarded"] = max(0.0, min(1.0, float((stock_min_calib_prob_var.get() or "").strip() or 0.58)))
+                except Exception:
+                    self.settings["stock_min_calib_prob_live_guarded"] = float(DEFAULT_SETTINGS.get("stock_min_calib_prob_live_guarded", 0.58))
+                try:
+                    self.settings["stock_max_slippage_bps"] = max(0.0, float((stock_max_slippage_bps_var.get() or "").strip() or 35.0))
+                except Exception:
+                    self.settings["stock_max_slippage_bps"] = float(DEFAULT_SETTINGS.get("stock_max_slippage_bps", 35.0))
+                try:
+                    self.settings["stock_order_retry_count"] = max(1, int(float((stock_order_retry_count_var.get() or "").strip() or 2)))
+                except Exception:
+                    self.settings["stock_order_retry_count"] = int(DEFAULT_SETTINGS.get("stock_order_retry_count", 2))
+                try:
+                    self.settings["stock_max_loss_streak"] = max(0, int(float((stock_max_loss_streak_var.get() or "").strip() or 3)))
+                except Exception:
+                    self.settings["stock_max_loss_streak"] = int(DEFAULT_SETTINGS.get("stock_max_loss_streak", 3))
+                try:
+                    self.settings["stock_loss_cooldown_seconds"] = max(60, int(float((stock_loss_cooldown_var.get() or "").strip() or 1800)))
+                except Exception:
+                    self.settings["stock_loss_cooldown_seconds"] = int(DEFAULT_SETTINGS.get("stock_loss_cooldown_seconds", 1800))
+                try:
+                    self.settings["stock_max_daily_loss_usd"] = max(0.0, float((stock_max_daily_loss_usd_var.get() or "").strip().replace("$", "") or 0.0))
+                except Exception:
+                    self.settings["stock_max_daily_loss_usd"] = float(DEFAULT_SETTINGS.get("stock_max_daily_loss_usd", 0.0))
+                try:
+                    self.settings["stock_max_daily_loss_pct"] = max(0.0, float((stock_max_daily_loss_pct_var.get() or "").strip().replace("%", "") or 0.0))
+                except Exception:
+                    self.settings["stock_max_daily_loss_pct"] = float(DEFAULT_SETTINGS.get("stock_max_daily_loss_pct", 0.0))
+                try:
+                    self.settings["stock_min_samples_live_guarded"] = max(0, int(float((stock_min_samples_guarded_var.get() or "").strip() or 5)))
+                except Exception:
+                    self.settings["stock_min_samples_live_guarded"] = int(DEFAULT_SETTINGS.get("stock_min_samples_live_guarded", 5))
+                try:
+                    self.settings["stock_max_signal_age_seconds"] = max(30, int(float((stock_max_signal_age_var.get() or "").strip() or 300)))
+                except Exception:
+                    self.settings["stock_max_signal_age_seconds"] = int(DEFAULT_SETTINGS.get("stock_max_signal_age_seconds", 300))
+                try:
+                    self.settings["stock_reject_drift_warn_pct"] = max(10.0, min(100.0, float((stock_reject_warn_pct_var.get() or "").strip().replace("%", "") or 65.0)))
+                except Exception:
+                    self.settings["stock_reject_drift_warn_pct"] = float(DEFAULT_SETTINGS.get("stock_reject_drift_warn_pct", 65.0))
+                self.settings["stock_block_new_entries_near_close"] = bool(stock_block_near_close_var.get())
+                try:
+                    self.settings["stock_no_new_entries_mins_to_close"] = max(0, int(float((stock_no_new_close_mins_var.get() or "").strip() or 15)))
+                except Exception:
+                    self.settings["stock_no_new_entries_mins_to_close"] = int(DEFAULT_SETTINGS.get("stock_no_new_entries_mins_to_close", 15))
                 self.settings["oanda_account_id"] = oanda_account_var.get().strip()
                 self.settings["oanda_api_token"] = oanda_token_var.get().strip()
                 self.settings["oanda_rest_url"] = oanda_rest_url_var.get().strip() or str(DEFAULT_SETTINGS.get("oanda_rest_url", ""))
@@ -7675,9 +8519,34 @@ class PowerTraderHub(tk.Tk):
                     self.settings["forex_scan_max_pairs"] = max(4, int(float((forex_scan_max_pairs_var.get() or "").strip() or 16)))
                 except Exception:
                     self.settings["forex_scan_max_pairs"] = int(DEFAULT_SETTINGS.get("forex_scan_max_pairs", 16))
+                try:
+                    self.settings["forex_max_spread_bps"] = max(0.0, float((fx_max_spread_bps_var.get() or "").strip() or 8.0))
+                except Exception:
+                    self.settings["forex_max_spread_bps"] = float(DEFAULT_SETTINGS.get("forex_max_spread_bps", 8.0))
+                try:
+                    self.settings["forex_min_volatility_pct"] = max(0.0, float((fx_min_vol_pct_var.get() or "").strip() or 0.01))
+                except Exception:
+                    self.settings["forex_min_volatility_pct"] = float(DEFAULT_SETTINGS.get("forex_min_volatility_pct", 0.01))
+                try:
+                    self.settings["forex_min_bars_required"] = max(8, int(float((fx_min_bars_var.get() or "").strip() or 24)))
+                except Exception:
+                    self.settings["forex_min_bars_required"] = int(DEFAULT_SETTINGS.get("forex_min_bars_required", 24))
+                try:
+                    self.settings["forex_min_valid_bars_ratio"] = max(0.0, min(1.0, float((fx_min_valid_ratio_var.get() or "").strip() or 0.7)))
+                except Exception:
+                    self.settings["forex_min_valid_bars_ratio"] = float(DEFAULT_SETTINGS.get("forex_min_valid_bars_ratio", 0.7))
+                try:
+                    self.settings["forex_max_stale_hours"] = max(0.5, float((fx_max_stale_hours_var.get() or "").strip() or 8.0))
+                except Exception:
+                    self.settings["forex_max_stale_hours"] = float(DEFAULT_SETTINGS.get("forex_max_stale_hours", 8.0))
+                self.settings["forex_show_rejected_rows"] = bool(fx_show_rejected_var.get())
                 self.settings["forex_auto_trade_enabled"] = bool(fx_auto_trade_var.get())
                 self.settings["forex_trade_units"] = max(1, int(float((fx_trade_units_var.get() or "").strip() or 1000)))
                 self.settings["forex_max_open_positions"] = max(1, int(float((fx_max_pos_var.get() or "").strip() or 1)))
+                try:
+                    self.settings["forex_max_position_usd_per_pair"] = max(0.0, float((fx_max_pos_usd_pair_var.get() or "").strip().replace("$", "") or 0.0))
+                except Exception:
+                    self.settings["forex_max_position_usd_per_pair"] = float(DEFAULT_SETTINGS.get("forex_max_position_usd_per_pair", 0.0))
                 self.settings["forex_score_threshold"] = max(0.0, float((fx_score_threshold_var.get() or "").strip() or 0.2))
                 self.settings["forex_profit_target_pct"] = max(0.0, float((fx_profit_target_var.get() or "").strip().replace("%", "") or 0.25))
                 self.settings["forex_trailing_gap_pct"] = max(0.0, float((fx_trailing_gap_var.get() or "").strip().replace("%", "") or 0.15))
@@ -7685,6 +8554,58 @@ class PowerTraderHub(tk.Tk):
                     self.settings["forex_max_total_exposure_pct"] = max(0.0, float((fx_max_exposure_var.get() or "").strip().replace("%", "") or 0.0))
                 except Exception:
                     self.settings["forex_max_total_exposure_pct"] = float(DEFAULT_SETTINGS.get("forex_max_total_exposure_pct", 0.0))
+                fx_session_mode = str(fx_session_mode_var.get() or "").strip().lower()
+                if fx_session_mode not in {"all", "london_ny", "london", "ny", "asia"}:
+                    fx_session_mode = str(DEFAULT_SETTINGS.get("forex_session_mode", "all"))
+                self.settings["forex_session_mode"] = fx_session_mode
+                try:
+                    self.settings["forex_live_guarded_score_mult"] = max(1.0, float((fx_guarded_mult_var.get() or "").strip() or 1.15))
+                except Exception:
+                    self.settings["forex_live_guarded_score_mult"] = float(DEFAULT_SETTINGS.get("forex_live_guarded_score_mult", 1.15))
+                try:
+                    self.settings["forex_min_calib_prob_live_guarded"] = max(0.0, min(1.0, float((fx_min_calib_prob_var.get() or "").strip() or 0.56)))
+                except Exception:
+                    self.settings["forex_min_calib_prob_live_guarded"] = float(DEFAULT_SETTINGS.get("forex_min_calib_prob_live_guarded", 0.56))
+                try:
+                    self.settings["forex_max_slippage_bps"] = max(0.0, float((fx_max_slippage_bps_var.get() or "").strip() or 6.0))
+                except Exception:
+                    self.settings["forex_max_slippage_bps"] = float(DEFAULT_SETTINGS.get("forex_max_slippage_bps", 6.0))
+                try:
+                    self.settings["forex_order_retry_count"] = max(1, int(float((fx_order_retry_count_var.get() or "").strip() or 2)))
+                except Exception:
+                    self.settings["forex_order_retry_count"] = int(DEFAULT_SETTINGS.get("forex_order_retry_count", 2))
+                try:
+                    self.settings["forex_max_loss_streak"] = max(0, int(float((fx_max_loss_streak_var.get() or "").strip() or 3)))
+                except Exception:
+                    self.settings["forex_max_loss_streak"] = int(DEFAULT_SETTINGS.get("forex_max_loss_streak", 3))
+                try:
+                    self.settings["forex_loss_cooldown_seconds"] = max(60, int(float((fx_loss_cooldown_var.get() or "").strip() or 1800)))
+                except Exception:
+                    self.settings["forex_loss_cooldown_seconds"] = int(DEFAULT_SETTINGS.get("forex_loss_cooldown_seconds", 1800))
+                try:
+                    self.settings["forex_max_daily_loss_usd"] = max(0.0, float((fx_max_daily_loss_usd_var.get() or "").strip().replace("$", "") or 0.0))
+                except Exception:
+                    self.settings["forex_max_daily_loss_usd"] = float(DEFAULT_SETTINGS.get("forex_max_daily_loss_usd", 0.0))
+                try:
+                    self.settings["forex_max_daily_loss_pct"] = max(0.0, float((fx_max_daily_loss_pct_var.get() or "").strip().replace("%", "") or 0.0))
+                except Exception:
+                    self.settings["forex_max_daily_loss_pct"] = float(DEFAULT_SETTINGS.get("forex_max_daily_loss_pct", 0.0))
+                try:
+                    self.settings["forex_min_samples_live_guarded"] = max(0, int(float((fx_min_samples_guarded_var.get() or "").strip() or 5)))
+                except Exception:
+                    self.settings["forex_min_samples_live_guarded"] = int(DEFAULT_SETTINGS.get("forex_min_samples_live_guarded", 5))
+                try:
+                    self.settings["forex_max_signal_age_seconds"] = max(30, int(float((fx_max_signal_age_var.get() or "").strip() or 300)))
+                except Exception:
+                    self.settings["forex_max_signal_age_seconds"] = int(DEFAULT_SETTINGS.get("forex_max_signal_age_seconds", 300))
+                try:
+                    self.settings["forex_reject_drift_warn_pct"] = max(10.0, min(100.0, float((fx_reject_warn_pct_var.get() or "").strip().replace("%", "") or 65.0)))
+                except Exception:
+                    self.settings["forex_reject_drift_warn_pct"] = float(DEFAULT_SETTINGS.get("forex_reject_drift_warn_pct", 65.0))
+                try:
+                    self.settings["market_max_total_exposure_pct"] = max(0.0, float((market_global_exposure_var.get() or "").strip().replace("%", "") or 0.0))
+                except Exception:
+                    self.settings["market_max_total_exposure_pct"] = float(DEFAULT_SETTINGS.get("market_max_total_exposure_pct", 0.0))
 
                 self.settings["script_neural_runner2"] = neural_script_var.get().strip()
                 self.settings["script_neural_trainer"] = trainer_script_var.get().strip()

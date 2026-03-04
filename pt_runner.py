@@ -20,6 +20,7 @@ os.makedirs(LOG_DIR, exist_ok=True)
 RUNNER_LOG_PATH = os.path.join(LOG_DIR, "runner.log")
 THINKER_LOG_PATH = os.path.join(LOG_DIR, "thinker.log")
 TRADER_LOG_PATH = os.path.join(LOG_DIR, "trader.log")
+MARKETS_LOG_PATH = os.path.join(LOG_DIR, "markets.log")
 
 HEARTBEAT_INTERVAL_S = 2.0
 MAX_BACKOFF_S = 30.0
@@ -87,9 +88,11 @@ def _settings_scripts() -> Dict[str, str]:
     data = read_settings_file(settings_path, module_name="pt_runner") or {}
     thinker_name = str(data.get("script_neural_runner2", "pt_thinker.py") or "pt_thinker.py").strip()
     trader_name = str(data.get("script_trader", "pt_trader.py") or "pt_trader.py").strip()
+    markets_name = str(data.get("script_markets_runner", "pt_markets.py") or "pt_markets.py").strip()
     return {
         "thinker": os.path.abspath(os.path.join(BASE_DIR, thinker_name)),
         "trader": os.path.abspath(os.path.join(BASE_DIR, trader_name)),
+        "markets": os.path.abspath(os.path.join(BASE_DIR, markets_name)),
     }
 
 
@@ -130,6 +133,7 @@ class Runner:
         self.children = {
             "thinker": ChildSpec("thinker", scripts["thinker"], THINKER_LOG_PATH),
             "trader": ChildSpec("trader", scripts["trader"], TRADER_LOG_PATH),
+            "markets": ChildSpec("markets", scripts["markets"], MARKETS_LOG_PATH),
         }
         self.state = "RUNNING"
         self.msg = "Supervisor starting"
@@ -143,13 +147,16 @@ class Runner:
             "runner_pid": int(os.getpid()),
             "thinker_pid": self.children["thinker"].pid(),
             "trader_pid": self.children["trader"].pid(),
+            "markets_pid": self.children["markets"].pid(),
             "restarts": {
                 "thinker": int(self.children["thinker"].restarts),
                 "trader": int(self.children["trader"].restarts),
+                "markets": int(self.children["markets"].restarts),
             },
             "last_exit": {
                 "thinker": self.children["thinker"].last_exit or None,
                 "trader": self.children["trader"].last_exit or None,
+                "markets": self.children["markets"].last_exit or None,
             },
             "backoff_s": float(self.current_backoff_s),
             "msg": self.msg,

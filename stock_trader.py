@@ -3,13 +3,22 @@ from __future__ import annotations
 import json
 import os
 import time
+from datetime import datetime, timezone
 from typing import Any, Dict, List
+from zoneinfo import ZoneInfo
 
 from broker_alpaca import AlpacaBrokerClient
 from path_utils import resolve_runtime_paths
 
 BASE_DIR, _SETTINGS_PATH, HUB_DATA_DIR, _BOOT_SETTINGS = resolve_runtime_paths(__file__, "stock_trader")
-ROLLOUT_ORDER = {"legacy": 0, "scan_expanded": 1, "risk_caps": 2, "execution_v2": 3}
+ROLLOUT_ORDER = {
+    "legacy": 0,
+    "scan_expanded": 1,
+    "risk_caps": 2,
+    "execution_v2": 3,
+    "shadow_only": 4,
+    "live_guarded": 5,
+}
 
 
 def _safe_read_json(path: str) -> Dict[str, Any]:
@@ -27,6 +36,15 @@ def _safe_write_json(path: str, data: Dict[str, Any]) -> None:
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
         os.replace(tmp, path)
+    except Exception:
+        pass
+
+
+def _append_jsonl(path: str, row: Dict[str, Any]) -> None:
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(row, separators=(",", ":")) + "\n")
     except Exception:
         pass
 
@@ -60,23 +78,144 @@ def _parse_positions(rows: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
     return out
 
 
+def _now_et() -> datetime:
+    return datetime.now(timezone.utc).astimezone(ZoneInfo("America/New_York"))
+
+
+def _market_open_now() -> bool:
+    now = _now_et()
+    if now.weekday() >= 5:
+        return False
+    mins = (now.hour * 60) + now.minute
+    return (9 * 60 + 30) <= mins < (16 * 60)
+
+
+def _near_close_blocked(settings: Dict[str, Any]) -> bool:
+    if not bool(settings.get("stock_block_new_entries_near_close", True)):
+        return False
+    mins_to_close = max(0, int(float(settings.get("stock_no_new_entries_mins_to_close", 15) or 15)))
+    now = _now_et()
+    if now.weekday() >= 5:
+        return True
+    cur = now.hour * 60 + now.minute
+    close = 16 * 60
+    return (close - cur) <= mins_to_close
+
+
+def _daily_loss_guard_triggered(
+    audit_path: str,
+    max_daily_loss_usd: float,
+    max_daily_loss_pct: float,
+    equity: float,
+) -> bool:
+    if max_daily_loss_usd <= 0.0 and max_daily_loss_pct <= 0.0:
+        return False
+    today = time.strftime("%Y-%m-%d", time.localtime())
+    loss_usd = 0.0
+    try:
+        with open(audit_path, "r", encoding="utf-8") as f:
+            for ln in f:
+                ln = ln.strip()
+                if not ln:
+                    continue
+                try:
+                    row = json.loads(ln)
+                except Exception:
+                    continue
+                if str(row.get("date", "") or "") != today:
+                    continue
+                if str(row.get("event", "")).lower() not in {"exit", "shadow_exit"}:
+                    continue
+                pnl_usd = float(row.get("pnl_usd", 0.0) or 0.0)
+                if pnl_usd < 0:
+                    loss_usd += abs(pnl_usd)
+    except Exception:
+        return False
+    if max_daily_loss_usd > 0.0 and loss_usd >= max_daily_loss_usd:
+        return True
+    if max_daily_loss_pct > 0.0 and equity > 0.0 and ((loss_usd / equity) * 100.0) >= max_daily_loss_pct:
+        return True
+    return False
+
+
+def _parse_order_id(msg: str, payload: Dict[str, Any]) -> str:
+    oid = ""
+    try:
+        oid = str((payload or {}).get("id", "") or "").strip()
+    except Exception:
+        oid = ""
+    if oid:
+        return oid
+    txt = str(msg or "")
+    if "order_id=" in txt:
+        return txt.split("order_id=", 1)[1].strip().split(" ", 1)[0]
+    return ""
+
+
+def _safe_float_from_dict(d: Dict[str, Any], keys: List[str]) -> float:
+    for k in keys:
+        try:
+            if k in d:
+                return float(d.get(k, 0.0) or 0.0)
+        except Exception:
+            continue
+    return 0.0
+
+
+def _crypto_holdings_usd(hub_dir: str) -> float:
+    path = os.path.join(hub_dir, "trader_status.json")
+    data = _safe_read_json(path)
+    if not isinstance(data, dict):
+        return 0.0
+    return _safe_float_from_dict(
+        data,
+        [
+            "total_holdings_value",
+            "holdings_value",
+            "holdingsValue",
+            "holdings_usd",
+        ],
+    )
+
+
+def _market_status_exposure_usd(hub_dir: str, market_key: str) -> float:
+    path = os.path.join(hub_dir, market_key, f"{market_key[:-1] if market_key.endswith('s') else market_key}_trader_status.json")
+    # Explicit fallback names for current file layout.
+    if market_key == "forex":
+        path = os.path.join(hub_dir, "forex", "forex_trader_status.json")
+    elif market_key == "stocks":
+        path = os.path.join(hub_dir, "stocks", "stock_trader_status.json")
+    data = _safe_read_json(path)
+    if not isinstance(data, dict):
+        return 0.0
+    return _safe_float_from_dict(data, ["exposure_usd", "total_positions_value_usd", "positions_value_usd"])
+
+
 def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
     stocks_dir = os.path.join(hub_dir, "stocks")
     os.makedirs(stocks_dir, exist_ok=True)
     thinker_path = os.path.join(stocks_dir, "stock_thinker_status.json")
     state_path = os.path.join(stocks_dir, "stock_trader_state.json")
+    audit_path = os.path.join(stocks_dir, "execution_audit.jsonl")
+    health_path = os.path.join(stocks_dir, "health_status.json")
 
     auto_enabled = bool(settings.get("stock_auto_trade_enabled", False))
     trade_notional = max(1.0, float(settings.get("stock_trade_notional_usd", 100.0) or 100.0))
     max_open_positions = max(1, int(float(settings.get("stock_max_open_positions", 1) or 1)))
     score_threshold = max(0.0, float(settings.get("stock_score_threshold", 0.2) or 0.2))
+    guarded_score_mult = max(1.0, float(settings.get("stock_live_guarded_score_mult", 1.2) or 1.2))
     profit_target_pct = max(0.0, float(settings.get("stock_profit_target_pct", 0.35) or 0.35))
     trailing_gap_pct = max(0.0, float(settings.get("stock_trailing_gap_pct", 0.2) or 0.2))
     max_day_trades = max(0, int(float(settings.get("stock_max_day_trades", 3) or 3)))
-    enable_exec_v2 = _rollout_at_least(settings, "execution_v2")
-    enable_risk_caps = _rollout_at_least(settings, "risk_caps")
     max_pos_usd = max(0.0, float(settings.get("stock_max_position_usd_per_symbol", 0.0) or 0.0))
     max_total_exposure_pct = max(0.0, float(settings.get("stock_max_total_exposure_pct", 0.0) or 0.0))
+    max_daily_loss_usd = max(0.0, float(settings.get("stock_max_daily_loss_usd", 0.0) or 0.0))
+    max_daily_loss_pct = max(0.0, float(settings.get("stock_max_daily_loss_pct", 0.0) or 0.0))
+    stage = str(settings.get("market_rollout_stage", "legacy") or "legacy").strip().lower()
+    enable_exec_v2 = _rollout_at_least(settings, "execution_v2")
+    enable_risk_caps = _rollout_at_least(settings, "risk_caps")
+    shadow_only = stage == "shadow_only"
+    live_guarded = stage == "live_guarded"
 
     client = AlpacaBrokerClient(
         api_key_id=str(settings.get("alpaca_api_key_id", "") or ""),
@@ -84,13 +223,14 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
         base_url=str(settings.get("alpaca_base_url", "https://paper-api.alpaca.markets") or ""),
         data_url=str(settings.get("alpaca_data_url", "https://data.alpaca.markets") or ""),
     )
+    now_ts = int(time.time())
     if not client.configured():
         return {
             "state": "IDLE",
             "trader_state": "Credentials missing",
             "msg": "Alpaca credentials not configured",
             "auto_enabled": auto_enabled,
-            "updated_at": int(time.time()),
+            "updated_at": now_ts,
         }
 
     thinker = _safe_read_json(thinker_path)
@@ -98,23 +238,34 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
     if not isinstance(top_pick, dict):
         top_pick = {}
 
-    now_ts = int(time.time())
     today = time.strftime("%Y-%m-%d", time.localtime(now_ts))
     state = _safe_read_json(state_path)
     trail_state = state.get("trail", {}) or {}
     opened_today = state.get("opened_today", {}) or {}
     day_trades = state.get("day_trades", {}) or {}
+    cooldown_until = state.get("cooldown_until", {}) or {}
+    loss_streak = int(float(state.get("loss_streak", 0) or 0))
+    last_divergence_ts = int(float(state.get("last_divergence_ts", 0) or 0))
+    last_divergence_msg = str(state.get("last_divergence_msg", "") or "")
+    open_meta = state.get("open_meta", {}) or {}
+    pending = state.get("pending", {}) or {}
     if not isinstance(trail_state, dict):
         trail_state = {}
     if not isinstance(opened_today, dict):
         opened_today = {}
     if not isinstance(day_trades, dict):
         day_trades = {}
-
-    # Retain only today's day-trade counter.
+    if not isinstance(cooldown_until, dict):
+        cooldown_until = {}
+    if not isinstance(open_meta, dict):
+        open_meta = {}
+    if not isinstance(pending, dict):
+        pending = {}
     day_trades_today = int(float(day_trades.get(today, 0) or 0))
     day_trades = {today: day_trades_today}
     opened_today = {str(k).upper(): int(v) for k, v in opened_today.items() if str(k).strip()}
+    cooldown_until = {str(k).upper(): float(v) for k, v in cooldown_until.items() if str(k).strip()}
+    open_meta = {str(k).upper(): (v if isinstance(v, dict) else {}) for k, v in open_meta.items() if str(k).strip()}
 
     raw_positions = client.list_positions()
     positions = _parse_positions(raw_positions)
@@ -125,11 +276,27 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
     prices = client.get_mid_prices(sorted(all_symbols))
     acct = client.get_account_summary()
     equity = float(acct.get("equity", 0.0) or 0.0) if isinstance(acct, dict) else 0.0
-    total_positions_value = 0.0
-    for pos in positions.values():
-        total_positions_value += max(0.0, float(pos.get("market_value", 0.0) or 0.0))
+    total_positions_value = sum(max(0.0, float(pos.get("market_value", 0.0) or 0.0)) for pos in positions.values())
 
     actions: List[str] = []
+    thinker_health = thinker.get("health", {}) if isinstance(thinker, dict) else {}
+    thinker_data_ok = bool((thinker_health or {}).get("data_ok", True))
+    drift_warning = False
+    # Reconciliation for prior pending submissions.
+    if pending:
+        p_sym = str(pending.get("symbol", "") or "").strip().upper()
+        p_ts = float(pending.get("ts", 0.0) or 0.0)
+        if p_sym and p_sym in positions:
+            actions.append(f"RECONCILE OK {p_sym} reflected")
+            pending = {}
+        elif p_sym and (now_ts - p_ts) > 90:
+            drift_warning = True
+            actions.append(f"RECONCILE WARN {p_sym} not reflected")
+            _append_jsonl(
+                audit_path,
+                {"ts": now_ts, "date": today, "event": "reconcile_warning", "symbol": p_sym, "msg": "pending timed out"},
+            )
+            pending = {}
     for symbol, pos in positions.items():
         qty = float(pos.get("qty", 0.0) or 0.0)
         avg = float(pos.get("avg_entry_price", 0.0) or 0.0)
@@ -137,6 +304,12 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
         if qty <= 0 or avg <= 0 or mid <= 0:
             continue
         pnl = ((mid - avg) / avg) * 100.0
+        pnl_usd = (mid - avg) * qty
+        meta = open_meta.get(symbol, {}) or {}
+        mfe = max(float(meta.get("mfe_pct", pnl) or pnl), pnl)
+        mae = min(float(meta.get("mae_pct", pnl) or pnl), pnl)
+        entry_ts = float(meta.get("entry_ts", now_ts) or now_ts)
+        open_meta[symbol] = {"entry_ts": entry_ts, "mfe_pct": mfe, "mae_pct": mae, "last_pnl_pct": pnl}
         st = trail_state.get(symbol, {}) or {}
         armed = bool(st.get("armed", False))
         peak = float(st.get("peak_pct", pnl) or pnl)
@@ -146,14 +319,41 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
         if armed:
             peak = max(peak, pnl)
             if pnl <= (peak - trailing_gap_pct):
-                ok, msg, _ = client.close_position(symbol)
+                ok, msg, payload = client.close_position(symbol)
                 actions.append(f"CLOSE {symbol} | {'OK' if ok else 'FAIL'} | {msg}")
+                _append_jsonl(
+                    audit_path,
+                    {
+                        "ts": now_ts,
+                        "date": today,
+                        "event": "exit" if ok else "exit_fail",
+                        "symbol": symbol,
+                        "side": "sell",
+                        "qty": qty,
+                        "avg_entry_price": avg,
+                        "price": mid,
+                        "pnl_pct": pnl,
+                        "pnl_usd": pnl_usd,
+                        "mfe_pct": round(mfe, 4),
+                        "mae_pct": round(mae, 4),
+                        "hold_s": max(0, int(now_ts - entry_ts)),
+                        "ok": ok,
+                        "msg": msg,
+                        "payload": payload if isinstance(payload, dict) else {},
+                    },
+                )
                 if ok:
                     trail_state.pop(symbol, None)
+                    open_meta.pop(symbol, None)
                     if symbol in opened_today:
                         day_trades_today += 1
                         day_trades[today] = day_trades_today
                         opened_today.pop(symbol, None)
+                    if pnl_usd < 0:
+                        loss_streak += 1
+                        cooldown_until[symbol] = float(now_ts + max(60, int(float(settings.get("stock_loss_cooldown_seconds", 1800) or 1800))))
+                    else:
+                        loss_streak = 0
                 else:
                     trail_state[symbol] = {"armed": armed, "peak_pct": peak, "last_pnl_pct": pnl, "updated_at": now_ts}
                 continue
@@ -162,31 +362,141 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
     entry_msg = "Auto-trade disabled (paper-safe)"
     if auto_enabled:
         score = float(top_pick.get("score", 0.0) or 0.0)
+        calib_prob = float(top_pick.get("calib_prob", 0.0) or 0.0)
+        sample_count = int(float(top_pick.get("samples", 0) or 0))
+        bars_count = int(float(top_pick.get("bars_count", 0) or 0))
         side = str(top_pick.get("side", "watch") or "watch").strip().lower()
+        signal_age_s = max(0, int(now_ts - int(float(thinker.get("updated_at", now_ts) or now_ts))))
+        max_signal_age_s = max(30, int(float(settings.get("stock_max_signal_age_seconds", 300) or 300)))
+        min_bars_required = max(8, int(float(settings.get("stock_min_bars_required", 24) or 24)))
+        min_samples_guarded = max(0, int(float(settings.get("stock_min_samples_live_guarded", 5) or 5)))
+        adaptive_thr = float(thinker.get("adaptive_threshold", score_threshold) or score_threshold)
+        required_score = ((adaptive_thr if adaptive_thr > 0 else score_threshold) * (guarded_score_mult if live_guarded else 1.0))
+        max_slippage_bps = max(0.0, float(settings.get("stock_max_slippage_bps", 35.0) or 35.0))
+        max_loss_streak = max(0, int(float(settings.get("stock_max_loss_streak", 3) or 3)))
+        global_cap_pct = max(0.0, float(settings.get("market_max_total_exposure_pct", 0.0) or 0.0))
+        spreads = client.get_snapshot_details([top_symbol]) if top_symbol else {}
+        top_mid = float((spreads.get(top_symbol, {}) or {}).get("mid", 0.0) or 0.0)
+        top_spread_bps = float((spreads.get(top_symbol, {}) or {}).get("spread_bps", 0.0) or 0.0)
+        crypto_exposure_usd = _crypto_holdings_usd(hub_dir)
+        forex_exposure_usd = _market_status_exposure_usd(hub_dir, "forex")
+        projected_global_exposure = total_positions_value + trade_notional + crypto_exposure_usd + forex_exposure_usd
+        if live_guarded and (calib_prob <= 0.0):
+            calib_prob = 0.5
         if not top_symbol:
             entry_msg = "No top symbol from thinker"
+        elif signal_age_s > max_signal_age_s:
+            entry_msg = f"Signal stale ({signal_age_s}s > {max_signal_age_s}s)"
+        elif bars_count > 0 and bars_count < min_bars_required:
+            entry_msg = f"Bars preflight failed ({bars_count} < {min_bars_required})"
         elif side != "long":
             entry_msg = f"Top pick {top_symbol} is {side.upper()}"
-        elif score < score_threshold:
-            entry_msg = f"Top score below threshold ({score:.4f} < {score_threshold:.4f})"
+        elif not bool(top_pick.get("eligible_for_entry", True)):
+            entry_msg = "Universe health gate: symbol not in eligible bucket"
+        elif not bool(top_pick.get("data_quality_ok", True)):
+            entry_msg = "Data quality gate blocked entry"
+        elif top_mid <= 0.0:
+            entry_msg = "Quote preflight failed: missing mid price"
+        elif live_guarded and sample_count < min_samples_guarded:
+            entry_msg = f"Calibration sample gate ({sample_count} < {min_samples_guarded})"
+        elif live_guarded and calib_prob < float(settings.get("stock_min_calib_prob_live_guarded", 0.58) or 0.58):
+            entry_msg = f"Calibrated confidence gate ({calib_prob:.2f})"
+        elif score < required_score:
+            entry_msg = f"Top score below threshold ({score:.4f} < {required_score:.4f})"
+        elif max_loss_streak > 0 and loss_streak >= max_loss_streak:
+            entry_msg = f"Loss-streak guard active ({loss_streak}/{max_loss_streak})"
+        elif float(cooldown_until.get(top_symbol, 0.0) or 0.0) > float(now_ts):
+            cd_left = int(float(cooldown_until.get(top_symbol, 0.0) - now_ts))
+            entry_msg = f"Cooldown active for {top_symbol} ({cd_left}s)"
         elif len(positions) >= max_open_positions and top_symbol not in positions:
             entry_msg = f"Max open positions reached ({len(positions)}/{max_open_positions})"
         elif top_symbol in positions:
             entry_msg = f"Already in position: {top_symbol}"
         elif max_day_trades > 0 and day_trades_today >= max_day_trades:
             entry_msg = f"PDT guard: day-trade cap reached ({day_trades_today}/{max_day_trades})"
+        elif not _market_open_now():
+            entry_msg = "Market hours gate: market closed"
+        elif _near_close_blocked(settings):
+            entry_msg = "Near-close gate: no new entries"
+        elif _daily_loss_guard_triggered(audit_path, max_daily_loss_usd, max_daily_loss_pct, equity):
+            entry_msg = "Daily loss guard active: blocking new entries"
+        elif max_slippage_bps > 0.0 and top_spread_bps > max_slippage_bps:
+            entry_msg = f"Slippage guard: spread {top_spread_bps:.2f}bps > {max_slippage_bps:.2f}bps"
         elif enable_risk_caps and max_pos_usd > 0.0 and (float(positions.get(top_symbol, {}).get("market_value", 0.0) or 0.0) + trade_notional) > max_pos_usd:
             entry_msg = f"Risk cap: {top_symbol} projected position exceeds ${max_pos_usd:.2f}"
         elif enable_risk_caps and max_total_exposure_pct > 0.0 and equity > 0.0 and (((total_positions_value + trade_notional) / equity) * 100.0) > max_total_exposure_pct:
             entry_msg = f"Risk cap: projected exposure exceeds {max_total_exposure_pct:.2f}%"
+        elif global_cap_pct > 0.0 and equity > 0.0 and ((projected_global_exposure / equity) * 100.0) > global_cap_pct:
+            entry_msg = f"Global cap: projected cross-market exposure exceeds {global_cap_pct:.2f}%"
         elif not enable_exec_v2:
-            entry_msg = "Execution gated by rollout stage (set execution_v2)"
+            entry_msg = "Execution gated by rollout stage"
+        elif shadow_only:
+            entry_msg = f"SHADOW entry simulated for {top_symbol}"
+            actions.append(f"SHADOW ENTRY {top_symbol} BUY ${trade_notional:.2f}")
+            _append_jsonl(
+                audit_path,
+                {
+                    "ts": now_ts,
+                    "date": today,
+                    "event": "shadow_entry",
+                    "symbol": top_symbol,
+                    "side": "buy",
+                    "notional": trade_notional,
+                    "score": score,
+                    "ok": True,
+                    "msg": "shadow_only stage",
+                },
+            )
         else:
-            ok, msg, _ = client.place_market_order(top_symbol, side="buy", notional=trade_notional)
+            client_id = f"pt-{top_symbol}-{now_ts}"
+            ok, msg, payload = client.place_market_order(
+                top_symbol,
+                side="buy",
+                notional=trade_notional,
+                client_order_id=client_id,
+                max_retries=max(1, int(float(settings.get("stock_order_retry_count", 2) or 2))),
+            )
             actions.append(f"ENTRY {top_symbol} BUY ${trade_notional:.2f} | {'OK' if ok else 'FAIL'} | {msg}")
+            oid = _parse_order_id(msg, payload if isinstance(payload, dict) else {})
+            _append_jsonl(
+                audit_path,
+                {
+                    "ts": now_ts,
+                    "date": today,
+                    "event": "entry" if ok else "entry_fail",
+                    "symbol": top_symbol,
+                    "side": "buy",
+                    "notional": trade_notional,
+                    "score": score,
+                    "calib_prob": calib_prob,
+                    "samples": sample_count,
+                    "bars_count": bars_count,
+                    "spread_bps": top_spread_bps,
+                    "client_order_id": client_id,
+                    "order_id": oid,
+                    "ok": ok,
+                    "msg": msg,
+                    "payload": payload if isinstance(payload, dict) else {},
+                },
+            )
             entry_msg = f"Entry {'placed' if ok else 'failed'} for {top_symbol}"
             if ok:
                 opened_today[top_symbol] = now_ts
+                open_meta[top_symbol] = {"entry_ts": now_ts, "mfe_pct": 0.0, "mae_pct": 0.0, "last_pnl_pct": 0.0}
+                pending = {"symbol": top_symbol, "side": "buy", "ts": now_ts, "order_id": oid, "client_order_id": client_id}
+                recon_positions = _parse_positions(client.list_positions())
+                if top_symbol not in recon_positions:
+                    drift_warning = True
+                    _append_jsonl(
+                        audit_path,
+                        {
+                            "ts": now_ts,
+                            "date": today,
+                            "event": "reconcile_warning",
+                            "symbol": top_symbol,
+                            "msg": "submitted but not reflected in positions",
+                        },
+                    )
     else:
         entry_msg = "Auto-trade disabled (paper-safe)"
 
@@ -194,9 +504,50 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
         "trail": trail_state,
         "opened_today": opened_today,
         "day_trades": day_trades,
-        "last_actions": actions[-50:],
+        "cooldown_until": cooldown_until,
+        "loss_streak": int(loss_streak),
+        "open_meta": open_meta,
+        "pending": pending,
+        "last_divergence_ts": int(last_divergence_ts),
+        "last_divergence_msg": str(last_divergence_msg),
+        "last_actions": actions[-80:],
         "updated_at": now_ts,
     }
+    _safe_write_json(state_path, out_state)
+    _safe_write_json(
+        health_path,
+        {
+            "ts": now_ts,
+            "data_ok": thinker_data_ok,
+            "broker_ok": True,
+            "orders_ok": True,
+            "drift_warning": drift_warning,
+        },
+    )
+
+    if auto_enabled and (not shadow_only):
+        try:
+            sp = str(top_pick.get("side", "watch") or "watch").strip().lower()
+            if sp == "long" and top_symbol and ("Entry placed" not in entry_msg) and ("Already in position" not in entry_msg):
+                should_log = ((now_ts - int(last_divergence_ts)) >= 300) or (str(entry_msg) != str(last_divergence_msg))
+                if should_log:
+                    _append_jsonl(
+                        audit_path,
+                        {
+                            "ts": now_ts,
+                            "date": today,
+                            "event": "shadow_live_divergence",
+                            "symbol": top_symbol,
+                            "score": float(top_pick.get("score", 0.0) or 0.0),
+                            "msg": entry_msg,
+                        },
+                    )
+                    last_divergence_ts = int(now_ts)
+                    last_divergence_msg = str(entry_msg)
+        except Exception:
+            pass
+    out_state["last_divergence_ts"] = int(last_divergence_ts)
+    out_state["last_divergence_msg"] = str(last_divergence_msg)
     _safe_write_json(state_path, out_state)
 
     msg_parts = [entry_msg]
@@ -206,13 +557,18 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
         "state": "READY",
         "trader_state": ("Paper auto-run" if auto_enabled else "Paper manual-ready"),
         "msg": " | ".join(x for x in msg_parts if x),
-        "actions": actions[-8:],
+        "actions": actions[-12:],
         "open_positions": len(positions),
         "auto_enabled": auto_enabled,
         "day_trades_today": day_trades_today,
         "rollout_stage": str(settings.get("market_rollout_stage", "legacy") or "legacy"),
-        "execution_enabled": enable_exec_v2,
+        "execution_enabled": enable_exec_v2 and (not shadow_only),
+        "exposure_usd": round(total_positions_value, 4),
+        "crypto_exposure_usd": round(crypto_exposure_usd, 4) if auto_enabled else round(_crypto_holdings_usd(hub_dir), 4),
+        "other_market_exposure_usd": round(forex_exposure_usd, 4) if auto_enabled else round(_market_status_exposure_usd(hub_dir, "forex"), 4),
+        "account_value_usd": round(equity, 4),
         "updated_at": now_ts,
+        "health": {"data_ok": thinker_data_ok, "broker_ok": True, "orders_ok": True, "drift_warning": drift_warning},
     }
 
 

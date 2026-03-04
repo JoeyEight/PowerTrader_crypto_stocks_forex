@@ -1748,6 +1748,16 @@ class CryptoAPITrading:
         holdings = self.get_holdings()
         # Fetch trading pairs
         trading_pairs = self.get_trading_pairs()
+        if not isinstance(account, dict):
+            account = {}
+        holdings_results = []
+        if isinstance(holdings, dict):
+            raw_results = holdings.get("results", [])
+            if isinstance(raw_results, list):
+                holdings_results = raw_results
+        holdings = {"results": holdings_results}
+        if not isinstance(trading_pairs, list):
+            trading_pairs = []
 
         # Use the stored cost_basis instead of recalculating
         cost_basis = self.cost_basis

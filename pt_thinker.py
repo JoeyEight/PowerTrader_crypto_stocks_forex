@@ -2,8 +2,32 @@ import os
 import time
 import random
 import requests
-from kucoin.client import Market
-market = Market(url='https://api.kucoin.com')
+try:
+	from kucoin.client import Market  # type: ignore
+except Exception:
+	Market = None  # type: ignore
+
+
+class _KucoinMarketFallback:
+	def __init__(self, url: str = "https://api.kucoin.com"):
+		self.url = str(url or "https://api.kucoin.com").rstrip("/")
+		self._session = requests.Session()
+
+	def get_kline(self, symbol: str, kline_type: str):
+		params = {"symbol": str(symbol or ""), "type": str(kline_type or "")}
+		resp = self._session.get(f"{self.url}/api/v1/market/candles", params=params, timeout=12)
+		resp.raise_for_status()
+		payload = resp.json() if resp.content else {}
+		if not isinstance(payload, dict):
+			return []
+		data = payload.get("data", [])
+		return data if isinstance(data, list) else []
+
+
+if Market is not None:
+	market = Market(url='https://api.kucoin.com')
+else:
+	market = _KucoinMarketFallback(url='https://api.kucoin.com')
 import sys
 import datetime
 import traceback
@@ -13,7 +37,10 @@ import calendar
 import hashlib
 import hmac
 from datetime import datetime
-import psutil
+try:
+	import psutil  # type: ignore
+except Exception:
+	psutil = None  # type: ignore
 import logging
 import json
 import uuid
