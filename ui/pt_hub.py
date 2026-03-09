@@ -3150,6 +3150,7 @@ class PowerTraderHub(tk.Tk):
             self._schedule_paned_clamp(getattr(self, "_pw_outer", None))
             self._schedule_paned_clamp(getattr(self, "_pw_left_split", None))
             self._schedule_paned_clamp(getattr(self, "_pw_right_split", None))
+            self._schedule_paned_clamp(getattr(self, "_pw_chart_watch_split", None))
         except Exception:
             pass
         if persist:
@@ -6483,6 +6484,7 @@ class PowerTraderHub(tk.Tk):
             self._schedule_paned_clamp(getattr(self, "_pw_outer", None)),
             self._schedule_paned_clamp(getattr(self, "_pw_left_split", None)),
             self._schedule_paned_clamp(getattr(self, "_pw_right_split", None)),
+            self._schedule_paned_clamp(getattr(self, "_pw_chart_watch_split", None)),
             self._schedule_paned_clamp(getattr(self, "_pw_right_bottom_split", None)),
             self._persist_ui_layout_state(),
         ))
@@ -6493,15 +6495,83 @@ class PowerTraderHub(tk.Tk):
         # ----------------------------
         top_controls = ttk.LabelFrame(left_split, text="Dashboard")
 
+        # Scrollable dashboard body so small windows can still reach every control/metric.
+        dash_viewport = ttk.Frame(top_controls)
+        dash_viewport.pack(fill="both", expand=True, padx=0, pady=0)
+        dash_viewport.grid_rowconfigure(0, weight=1)
+        dash_viewport.grid_columnconfigure(0, weight=1)
+
+        dash_canvas = tk.Canvas(
+            dash_viewport,
+            bg=DARK_BG,
+            highlightthickness=0,
+            bd=0,
+        )
+        dash_scroll = ttk.Scrollbar(dash_viewport, orient="vertical", command=dash_canvas.yview)
+        dash_canvas.configure(yscrollcommand=dash_scroll.set)
+        dash_canvas.grid(row=0, column=0, sticky="nsew")
+        dash_scroll.grid(row=0, column=1, sticky="ns")
+        dash_scroll.grid_remove()
+
+        dashboard_body = ttk.Frame(dash_canvas)
+        _dash_body_id = dash_canvas.create_window((0, 0), window=dashboard_body, anchor="nw")
+
+        def _update_dashboard_scroll(_e=None) -> None:
+            try:
+                dash_canvas.configure(scrollregion=dash_canvas.bbox("all"))
+                sr = dash_canvas.bbox("all")
+                if not sr:
+                    dash_scroll.grid_remove()
+                    return
+                x0, y0, x1, y1 = sr
+                content_h = max(0, int(y1 - y0))
+                view_h = max(0, int(dash_canvas.winfo_height()))
+                if content_h > (view_h + 1):
+                    dash_scroll.grid()
+                else:
+                    dash_scroll.grid_remove()
+                    dash_canvas.yview_moveto(0)
+            except Exception:
+                pass
+
+        def _on_dashboard_canvas_configure(e) -> None:
+            try:
+                dash_canvas.itemconfigure(_dash_body_id, width=max(1, int(getattr(e, "width", 1))))
+            except Exception:
+                pass
+            _update_dashboard_scroll()
+
+        dash_canvas.bind("<Configure>", _on_dashboard_canvas_configure, add="+")
+        dashboard_body.bind("<Configure>", _update_dashboard_scroll, add="+")
+        dash_canvas.bind("<Enter>", lambda _e: dash_canvas.focus_set(), add="+")
+
+        def _dashboard_mousewheel_global(e) -> None:
+            try:
+                if not bool(dash_scroll.winfo_ismapped()):
+                    return
+                p = self.winfo_containing(self.winfo_pointerx(), self.winfo_pointery())
+                in_dashboard = False
+                while p is not None:
+                    if str(p) in {str(top_controls), str(dash_canvas), str(dashboard_body), str(dash_viewport)}:
+                        in_dashboard = True
+                        break
+                    p = getattr(p, "master", None)
+                if in_dashboard:
+                    dash_canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
+            except Exception:
+                pass
+
+        self.bind_all("<MouseWheel>", _dashboard_mousewheel_global, add="+")
+
         # Layout requirement:
         #   - Buttons (full width) ABOVE
         #   - Dual section BELOW:
         #       LEFT  = Status + Account + Profit
         #       RIGHT = free for future expansion (training now lives in Live Output)
-        buttons_bar = ttk.Frame(top_controls)
+        buttons_bar = ttk.Frame(dashboard_body)
         buttons_bar.pack(fill="x", expand=False, padx=0, pady=0)
 
-        info_row = ttk.Frame(top_controls)
+        info_row = ttk.Frame(dashboard_body)
         info_row.pack(fill="x", expand=False, padx=0, pady=0)
 
         # LEFT column (status + account/legend)
@@ -6811,7 +6881,7 @@ class PowerTraderHub(tk.Tk):
 
         # Neural levels overview (spans FULL width under the dual section)
         # Shows the current LONG/SHORT level (0..7) for every coin at once.
-        neural_box = ttk.LabelFrame(top_controls, text="Neural Levels (0–7)")
+        neural_box = ttk.LabelFrame(dashboard_body, text="Neural Levels (0–7)")
         neural_box.pack(fill="both", expand=True, padx=6, pady=(0, 6))
         self.neural_box = neural_box
 
@@ -6916,6 +6986,7 @@ class PowerTraderHub(tk.Tk):
         self._rebuild_neural_overview()
         try:
             self.after_idle(self._update_neural_overview_scrollbars)
+            self.after_idle(_update_dashboard_scroll)
         except Exception:
             pass
 
@@ -7133,9 +7204,9 @@ class PowerTraderHub(tk.Tk):
         left_split.add(logs_frame, weight=1)
 
         try:
-            # Ensure the top pane can't start (or be clamped) too small to show Neural Levels.
-            left_split.paneconfigure(top_controls, minsize=360)
-            left_split.paneconfigure(logs_frame, minsize=220)
+            # Keep both panes reachable on laptop-height screens.
+            left_split.paneconfigure(top_controls, minsize=220)
+            left_split.paneconfigure(logs_frame, minsize=150)
         except Exception:
             pass
 
@@ -7154,11 +7225,11 @@ class PowerTraderHub(tk.Tk):
                     self.after(10, _init_left_split_sash_once)
                     return
 
-                min_top = 360
-                min_bottom = 220
+                min_top = 220
+                min_bottom = 150
 
-                # Match screenshot feel: keep Live Output ~260px high, give the rest to top.
-                desired_bottom = 260
+                # Keep logs visible while still favoring dashboard content.
+                desired_bottom = 230
                 target = total - max(min_bottom, desired_bottom)
                 target = max(min_top, min(total - min_bottom, target))
 
@@ -7225,10 +7296,20 @@ class PowerTraderHub(tk.Tk):
         # Navigation is now handled by the dropdown only; keep a hidden placeholder for rebuild logic.
         self.chart_tabs_bar = ttk.Frame(charts_frame)
 
+        # Resizable split for chart + watchlist so both remain usable on smaller windows.
+        chart_watch_split = ttk.Panedwindow(charts_frame, orient="vertical")
+        chart_watch_split.pack(fill="both", expand=True, padx=(6, 0), pady=(0, 6))
+        self._pw_chart_watch_split = chart_watch_split
+        chart_watch_split.bind("<Configure>", lambda e: self._schedule_paned_clamp(self._pw_chart_watch_split))
+        chart_watch_split.bind("<ButtonRelease-1>", lambda e: (
+            setattr(self, "_user_moved_chart_watch_split", True),
+            self._schedule_paned_clamp(self._pw_chart_watch_split),
+            self._persist_ui_layout_state(),
+        ))
+
         # Page container (no ttk.Notebook, so there are NO native tabs to show)
-        self.chart_pages_container = ttk.Frame(charts_frame)
-        # Keep left padding, remove right padding so charts fill to the edge
-        self.chart_pages_container.pack(fill="both", expand=True, padx=(6, 0), pady=(0, 6))
+        self.chart_pages_container = ttk.Frame(chart_watch_split)
+        chart_watch_split.add(self.chart_pages_container, weight=4)
 
 
         self._chart_tab_buttons: Dict[str, ttk.Button] = {}
@@ -7426,8 +7507,35 @@ class PowerTraderHub(tk.Tk):
         self.crypto_watchlist_tree = watch_tree
         self.crypto_watchlist_cols = watch_cols
 
-        watch_box.pack(fill="x", padx=6, pady=(0, 6))
+        chart_watch_split.add(watch_box, weight=2)
+        try:
+            chart_watch_split.paneconfigure(self.chart_pages_container, minsize=220)
+            chart_watch_split.paneconfigure(watch_box, minsize=120)
+        except Exception:
+            pass
         self._refresh_crypto_watchlist_visibility()
+
+        def _init_chart_watch_split_sash_once():
+            try:
+                if getattr(self, "_did_init_chart_watch_split_sash", False):
+                    return
+                if getattr(self, "_user_moved_chart_watch_split", False):
+                    self._did_init_chart_watch_split_sash = True
+                    return
+                total = chart_watch_split.winfo_height()
+                if total <= 2:
+                    self.after(10, _init_chart_watch_split_sash_once)
+                    return
+                min_top = 220
+                min_bottom = 120
+                desired_top = int(round(total * 0.67))
+                target = max(min_top, min(total - min_bottom, desired_top))
+                chart_watch_split.sashpos(0, int(target))
+                self._did_init_chart_watch_split_sash = True
+            except Exception:
+                pass
+
+        self.after_idle(_init_chart_watch_split_sash_once)
 
 
 
@@ -7609,9 +7717,9 @@ class PowerTraderHub(tk.Tk):
         right_bottom_split.add(hist_frame, weight=1)
 
         try:
-            # Screenshot-style sizing: don't force Charts to be enormous by default.
-            right_split.paneconfigure(charts_frame, minsize=360)
-            right_split.paneconfigure(right_bottom_split, minsize=220)
+            # Keep chart + trades both visible on smaller laptop windows.
+            right_split.paneconfigure(charts_frame, minsize=240)
+            right_split.paneconfigure(right_bottom_split, minsize=170)
         except Exception:
             pass
 
@@ -7636,9 +7744,9 @@ class PowerTraderHub(tk.Tk):
                     self.after(10, _init_right_split_sash_once)
                     return
 
-                min_top = 360
-                min_bottom = 220
-                desired_top = 455  # favor more height for the active chart
+                min_top = 240
+                min_bottom = 170
+                desired_top = 420  # favor more height for the active chart
                 target = max(min_top, min(total - min_bottom, desired_top))
 
                 right_split.sashpos(0, int(target))
@@ -7678,6 +7786,7 @@ class PowerTraderHub(tk.Tk):
             self._schedule_paned_clamp(getattr(self, "_pw_outer", None)),
             self._schedule_paned_clamp(getattr(self, "_pw_left_split", None)),
             self._schedule_paned_clamp(getattr(self, "_pw_right_split", None)),
+            self._schedule_paned_clamp(getattr(self, "_pw_chart_watch_split", None)),
             self._schedule_paned_clamp(getattr(self, "_pw_right_bottom_split", None)),
         ))
 
@@ -11116,6 +11225,51 @@ class PowerTraderHub(tk.Tk):
 
         threading.Thread(target=_worker, daemon=True).start()
 
+    def _paned_total_size(self, pw: ttk.Panedwindow) -> int:
+        try:
+            orient = str(pw.cget("orient") or "").strip().lower()
+            raw = pw.winfo_height() if orient == "vertical" else pw.winfo_width()
+            return max(0, int(raw or 0))
+        except Exception:
+            return 0
+
+    def _paned_sash_bounds(self, pw: ttk.Panedwindow, sash_index: int = 0) -> Optional[Tuple[int, int, int]]:
+        try:
+            panes = list(pw.panes())
+            if len(panes) < 2:
+                return None
+            if sash_index < 0 or sash_index >= (len(panes) - 1):
+                return None
+
+            total = self._paned_total_size(pw)
+            if total <= 2:
+                return None
+
+            mins: List[int] = []
+            for pane in panes:
+                try:
+                    cfg = pw.paneconfigure(pane)
+                    raw_minsize = cfg.get("minsize", 0)
+                    if isinstance(raw_minsize, (tuple, list)) and raw_minsize:
+                        raw_minsize = raw_minsize[-1]
+                    mins.append(max(0, int(float(raw_minsize or 0))))
+                except Exception:
+                    mins.append(0)
+
+            if sum(mins) >= total:
+                floor = 24
+                mins = [max(floor, int(m)) for m in mins]
+                if sum(mins) >= total:
+                    return None
+
+            min_pos = int(sum(mins[: sash_index + 1]))
+            max_pos = int(total - sum(mins[sash_index + 1 :]))
+            if max_pos < min_pos:
+                return None
+            return min_pos, max_pos, total
+        except Exception:
+            return None
+
     def _persist_ui_layout_state(self) -> None:
         try:
             payload: Dict[str, Any] = {"ts": int(time.time()), "panes": {}}
@@ -11123,6 +11277,7 @@ class PowerTraderHub(tk.Tk):
                 ("outer", "_pw_outer"),
                 ("left_split", "_pw_left_split"),
                 ("right_split", "_pw_right_split"),
+                ("chart_watch_split", "_pw_chart_watch_split"),
                 ("right_bottom_split", "_pw_right_bottom_split"),
             ):
                 pw = getattr(self, widget_name, None)
@@ -11132,7 +11287,23 @@ class PowerTraderHub(tk.Tk):
                     pos = int(pw.sashpos(0))
                 except Exception:
                     continue
-                payload["panes"][key] = int(pos)
+                bounds = self._paned_sash_bounds(pw, 0)
+                if not bounds:
+                    continue
+                min_pos, max_pos, total = bounds
+                if pos < min_pos or pos > max_pos:
+                    # Ignore transient/invalid sash values to avoid restoring collapsed panes.
+                    continue
+                ratio = 0.0
+                try:
+                    ratio = float(pos) / float(total) if total > 0 else 0.0
+                except Exception:
+                    ratio = 0.0
+                payload["panes"][key] = {
+                    "pos": int(pos),
+                    "total": int(total),
+                    "ratio": round(ratio, 6),
+                }
             _safe_write_json(self.ui_layout_state_path, payload)
         except Exception:
             pass
@@ -11146,6 +11317,7 @@ class PowerTraderHub(tk.Tk):
             ("outer", "_pw_outer"),
             ("left_split", "_pw_left_split"),
             ("right_split", "_pw_right_split"),
+            ("chart_watch_split", "_pw_chart_watch_split"),
             ("right_bottom_split", "_pw_right_bottom_split"),
         ):
             if key not in panes:
@@ -11153,12 +11325,44 @@ class PowerTraderHub(tk.Tk):
             pw = getattr(self, widget_name, None)
             if pw is None:
                 continue
-            try:
-                target = int(float(panes.get(key, 0) or 0))
-            except Exception:
+            raw = panes.get(key, 0)
+            saved_pos = 0
+            saved_total = 0
+            saved_ratio = 0.0
+            if isinstance(raw, dict):
+                try:
+                    saved_pos = int(float(raw.get("pos", 0) or 0))
+                except Exception:
+                    saved_pos = 0
+                try:
+                    saved_total = int(float(raw.get("total", 0) or 0))
+                except Exception:
+                    saved_total = 0
+                try:
+                    saved_ratio = float(raw.get("ratio", 0.0) or 0.0)
+                except Exception:
+                    saved_ratio = 0.0
+            else:
+                try:
+                    saved_pos = int(float(raw or 0))
+                except Exception:
+                    saved_pos = 0
+
+            bounds = self._paned_sash_bounds(pw, 0)
+            if not bounds:
                 continue
+            min_pos, max_pos, total = bounds
+
+            target = 0
+            if 0.0 < saved_ratio < 1.0:
+                target = int(round(saved_ratio * float(total)))
+            elif saved_pos > 0 and saved_total > 0:
+                target = int(round(float(saved_pos) * (float(total) / float(saved_total))))
+            else:
+                target = int(saved_pos)
             if target <= 0:
                 continue
+            target = max(min_pos, min(max_pos, int(target)))
             try:
                 pw.sashpos(0, target)
             except Exception:
@@ -11167,7 +11371,10 @@ class PowerTraderHub(tk.Tk):
             self._schedule_paned_clamp(getattr(self, "_pw_outer", None))
             self._schedule_paned_clamp(getattr(self, "_pw_left_split", None))
             self._schedule_paned_clamp(getattr(self, "_pw_right_split", None))
+            self._schedule_paned_clamp(getattr(self, "_pw_chart_watch_split", None))
             self._schedule_paned_clamp(getattr(self, "_pw_right_bottom_split", None))
+            # Rewrite old/int-only payload into ratio-based layout state after successful restore.
+            self.after(50, self._persist_ui_layout_state)
         except Exception:
             pass
 
@@ -13599,6 +13806,33 @@ class PowerTraderHub(tk.Tk):
             return
         current_page = str(getattr(self, "_current_chart_page", "ACCOUNT") or "ACCOUNT").strip().upper()
         should_show = (current_page == "ACCOUNT")
+        split = getattr(self, "_pw_chart_watch_split", None)
+
+        # Preferred path: the watchlist is a pane under chart/watch split.
+        try:
+            if split is not None and int(split.winfo_exists()):
+                try:
+                    panes = list(split.panes())
+                except Exception:
+                    panes = []
+                present = str(box) in set(str(p) for p in panes)
+                if should_show and (not present):
+                    split.add(box, weight=2)
+                    try:
+                        split.paneconfigure(box, minsize=120)
+                    except Exception:
+                        pass
+                    self._schedule_paned_clamp(split)
+                elif (not should_show) and present:
+                    try:
+                        split.forget(box)
+                    except Exception:
+                        pass
+                    self._schedule_paned_clamp(split)
+                return
+        except Exception:
+            pass
+
         try:
             is_visible = bool(box.winfo_manager())
         except Exception:
@@ -14452,8 +14686,23 @@ class PowerTraderHub(tk.Tk):
         # Recreate (dropdown-only navigation; no visible button tab bar)
         self.chart_tabs_bar = ttk.Frame(charts_frame)
 
-        self.chart_pages_container = ttk.Frame(charts_frame)
-        self.chart_pages_container.pack(fill="both", expand=True, padx=6, pady=(0, 6))
+        chart_watch_split = getattr(self, "_pw_chart_watch_split", None)
+        if chart_watch_split is not None and hasattr(chart_watch_split, "winfo_exists") and chart_watch_split.winfo_exists():
+            self.chart_pages_container = ttk.Frame(chart_watch_split)
+            chart_watch_split.add(self.chart_pages_container, weight=4)
+            try:
+                chart_watch_split.paneconfigure(self.chart_pages_container, minsize=220)
+            except Exception:
+                pass
+            # Keep chart pane as the first pane.
+            try:
+                if len(chart_watch_split.panes()) > 1:
+                    chart_watch_split.insert(0, self.chart_pages_container)
+            except Exception:
+                pass
+        else:
+            self.chart_pages_container = ttk.Frame(charts_frame)
+            self.chart_pages_container.pack(fill="both", expand=True, padx=6, pady=(0, 6))
 
         try:
             if hasattr(self, "chart_search_combo") and self.chart_search_combo.winfo_exists():
@@ -14485,6 +14734,10 @@ class PowerTraderHub(tk.Tk):
                 pass
             try:
                 self._refresh_neural_overview_visibility()
+            except Exception:
+                pass
+            try:
+                self._refresh_crypto_watchlist_visibility()
             except Exception:
                 pass
 
@@ -14519,6 +14772,14 @@ class PowerTraderHub(tk.Tk):
 
         # Restore selection
         self._show_chart_page(selected)
+        try:
+            self._refresh_crypto_watchlist_visibility()
+        except Exception:
+            pass
+        try:
+            self._schedule_paned_clamp(getattr(self, "_pw_chart_watch_split", None))
+        except Exception:
+            pass
 
 
 
