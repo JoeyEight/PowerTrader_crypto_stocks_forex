@@ -42,10 +42,16 @@ class TestSettingsSanitize(unittest.TestCase):
             "stock_cached_scan_entry_size_mult": "3.0",
             "stock_require_data_quality_ok_for_entries": "0",
             "stock_require_reject_rate_max_pct": "999",
+            "stock_replay_adaptive_enabled": "0",
+            "stock_replay_adaptive_weight": "2.5",
+            "stock_replay_adaptive_step_cap_pct": "1",
             "forex_cached_scan_hard_block_age_s": "5",
             "forex_cached_scan_entry_size_mult": "0.01",
             "forex_require_data_quality_ok_for_entries": "no",
             "forex_require_reject_rate_max_pct": "-5",
+            "forex_replay_adaptive_enabled": "no",
+            "forex_replay_adaptive_weight": "-5",
+            "forex_replay_adaptive_step_cap_pct": "200",
             "runtime_alert_cadence_warn_count": "0",
             "runtime_alert_cadence_crit_count": "0",
             "runtime_alert_cadence_late_warn_pct": "1",
@@ -100,10 +106,16 @@ class TestSettingsSanitize(unittest.TestCase):
         self.assertEqual(float(out["stock_cached_scan_entry_size_mult"]), 1.0)
         self.assertFalse(bool(out["stock_require_data_quality_ok_for_entries"]))
         self.assertEqual(float(out["stock_require_reject_rate_max_pct"]), 100.0)
+        self.assertFalse(bool(out["stock_replay_adaptive_enabled"]))
+        self.assertEqual(float(out["stock_replay_adaptive_weight"]), 1.0)
+        self.assertEqual(float(out["stock_replay_adaptive_step_cap_pct"]), 5.0)
         self.assertEqual(int(out["forex_cached_scan_hard_block_age_s"]), 30)
         self.assertEqual(float(out["forex_cached_scan_entry_size_mult"]), 0.10)
         self.assertFalse(bool(out["forex_require_data_quality_ok_for_entries"]))
         self.assertEqual(float(out["forex_require_reject_rate_max_pct"]), 0.0)
+        self.assertFalse(bool(out["forex_replay_adaptive_enabled"]))
+        self.assertEqual(float(out["forex_replay_adaptive_weight"]), 0.0)
+        self.assertEqual(float(out["forex_replay_adaptive_step_cap_pct"]), 90.0)
         self.assertEqual(int(out["runtime_alert_cadence_warn_count"]), 1)
         self.assertEqual(int(out["runtime_alert_cadence_crit_count"]), 1)
         self.assertEqual(float(out["runtime_alert_cadence_late_warn_pct"]), 10.0)

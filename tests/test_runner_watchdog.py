@@ -92,6 +92,129 @@ class TestRunnerWatchdog(unittest.TestCase):
                 self.assertIn("runner_market_loop_status_stale", events)
                 self.assertIn("runner_market_loop_restart", events)
 
+    def test_script_watch_restarts_child_when_script_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            hub = os.path.join(td, "hub_data")
+            logs = os.path.join(hub, "logs")
+            os.makedirs(logs, exist_ok=True)
+            settings_path = os.path.join(td, "gui_settings.json")
+            with open(settings_path, "w", encoding="utf-8") as f:
+                f.write("{}")
+
+            scripts = {
+                "thinker": os.path.join(td, "noop_thinker.py"),
+                "trader": os.path.join(td, "noop_trader.py"),
+                "markets": os.path.join(td, "noop_markets.py"),
+                "autopilot": os.path.join(td, "noop_autopilot.py"),
+                "autofix": os.path.join(td, "noop_autofix.py"),
+            }
+            for path in scripts.values():
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write("print('noop')\n")
+
+            with ExitStack() as stack:
+                stack.enter_context(patch.object(pt_runner, "BASE_DIR", td))
+                stack.enter_context(patch.object(pt_runner, "HUB_DATA_DIR", hub))
+                stack.enter_context(patch.object(pt_runner, "LOG_DIR", logs))
+                stack.enter_context(patch.object(pt_runner, "RUNNER_LOG_PATH", os.path.join(logs, "runner.log")))
+                stack.enter_context(patch.object(pt_runner, "THINKER_LOG_PATH", os.path.join(logs, "thinker.log")))
+                stack.enter_context(patch.object(pt_runner, "TRADER_LOG_PATH", os.path.join(logs, "trader.log")))
+                stack.enter_context(patch.object(pt_runner, "MARKETS_LOG_PATH", os.path.join(logs, "markets.log")))
+                stack.enter_context(patch.object(pt_runner, "AUTOPILOT_LOG_PATH", os.path.join(logs, "autopilot.log")))
+                stack.enter_context(patch.object(pt_runner, "AUTOFIX_LOG_PATH", os.path.join(logs, "autofix.log")))
+                stack.enter_context(patch.object(pt_runner, "MARKET_LOOP_STATUS_PATH", os.path.join(hub, "market_loop_status.json")))
+                stack.enter_context(patch.object(pt_runner, "RUNTIME_EVENTS_PATH", os.path.join(hub, "runtime_events.jsonl")))
+                stack.enter_context(patch.object(pt_runner, "INCIDENTS_PATH", os.path.join(hub, "incidents.jsonl")))
+                stack.enter_context(patch.object(pt_runner, "TRADER_STATUS_PATH", os.path.join(hub, "trader_status.json")))
+                stack.enter_context(patch.object(pt_runner, "resolve_settings_path", return_value=settings_path))
+                stack.enter_context(patch.object(pt_runner, "read_settings_file", return_value={}))
+                stack.enter_context(
+                    patch.object(
+                        pt_runner,
+                        "sanitize_settings",
+                        side_effect=lambda x: (x if isinstance(x, dict) else {}),
+                    )
+                )
+                stack.enter_context(patch.object(pt_runner, "_settings_scripts", return_value=scripts))
+                runner = pt_runner.Runner()
+                child = runner.children["trader"]
+                child.proc = _AliveProc()  # type: ignore[assignment]
+                child.started_at = time.time() - 20.0
+                child.loaded_script_mtime = os.path.getmtime(child.script_path)
+                os.utime(child.script_path, None)
+
+                with patch.object(pt_runner, "_append_incident") as mock_incident, patch.object(
+                    pt_runner, "_runner_log"
+                ), patch.object(pt_runner, "_terminate_process") as mock_term:
+                    runner._script_watch_tick(time.time())
+
+                self.assertGreaterEqual(int(mock_term.call_count), 1)
+                events = [str(call.args[1]) for call in mock_incident.call_args_list if len(call.args) >= 2]
+                self.assertIn("runner_script_hot_reload", events)
+
+    def test_script_watch_restarts_child_when_script_path_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            hub = os.path.join(td, "hub_data")
+            logs = os.path.join(hub, "logs")
+            os.makedirs(logs, exist_ok=True)
+            settings_path = os.path.join(td, "gui_settings.json")
+            with open(settings_path, "w", encoding="utf-8") as f:
+                f.write("{}")
+
+            scripts_old = {
+                "thinker": os.path.join(td, "noop_thinker.py"),
+                "trader": os.path.join(td, "noop_trader.py"),
+                "markets": os.path.join(td, "noop_markets.py"),
+                "autopilot": os.path.join(td, "noop_autopilot.py"),
+                "autofix": os.path.join(td, "noop_autofix.py"),
+            }
+            scripts_new = dict(scripts_old)
+            scripts_new["trader"] = os.path.join(td, "new_trader.py")
+            for path in set(list(scripts_old.values()) + [scripts_new["trader"]]):
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write("print('noop')\n")
+
+            with ExitStack() as stack:
+                stack.enter_context(patch.object(pt_runner, "BASE_DIR", td))
+                stack.enter_context(patch.object(pt_runner, "HUB_DATA_DIR", hub))
+                stack.enter_context(patch.object(pt_runner, "LOG_DIR", logs))
+                stack.enter_context(patch.object(pt_runner, "RUNNER_LOG_PATH", os.path.join(logs, "runner.log")))
+                stack.enter_context(patch.object(pt_runner, "THINKER_LOG_PATH", os.path.join(logs, "thinker.log")))
+                stack.enter_context(patch.object(pt_runner, "TRADER_LOG_PATH", os.path.join(logs, "trader.log")))
+                stack.enter_context(patch.object(pt_runner, "MARKETS_LOG_PATH", os.path.join(logs, "markets.log")))
+                stack.enter_context(patch.object(pt_runner, "AUTOPILOT_LOG_PATH", os.path.join(logs, "autopilot.log")))
+                stack.enter_context(patch.object(pt_runner, "AUTOFIX_LOG_PATH", os.path.join(logs, "autofix.log")))
+                stack.enter_context(patch.object(pt_runner, "MARKET_LOOP_STATUS_PATH", os.path.join(hub, "market_loop_status.json")))
+                stack.enter_context(patch.object(pt_runner, "RUNTIME_EVENTS_PATH", os.path.join(hub, "runtime_events.jsonl")))
+                stack.enter_context(patch.object(pt_runner, "INCIDENTS_PATH", os.path.join(hub, "incidents.jsonl")))
+                stack.enter_context(patch.object(pt_runner, "TRADER_STATUS_PATH", os.path.join(hub, "trader_status.json")))
+                stack.enter_context(patch.object(pt_runner, "resolve_settings_path", return_value=settings_path))
+                stack.enter_context(patch.object(pt_runner, "read_settings_file", return_value={}))
+                stack.enter_context(
+                    patch.object(
+                        pt_runner,
+                        "sanitize_settings",
+                        side_effect=lambda x: (x if isinstance(x, dict) else {}),
+                    )
+                )
+                stack.enter_context(patch.object(pt_runner, "_settings_scripts", side_effect=[scripts_old, scripts_new]))
+                runner = pt_runner.Runner()
+                child = runner.children["trader"]
+                old_path = child.script_path
+                child.proc = _AliveProc()  # type: ignore[assignment]
+                child.started_at = time.time() - 20.0
+
+                with patch.object(pt_runner, "_append_incident") as mock_incident, patch.object(
+                    pt_runner, "_runner_log"
+                ), patch.object(pt_runner, "_terminate_process") as mock_term:
+                    runner._script_watch_tick(time.time())
+
+                self.assertEqual(os.path.abspath(child.script_path), os.path.abspath(scripts_new["trader"]))
+                self.assertNotEqual(os.path.abspath(old_path), os.path.abspath(child.script_path))
+                self.assertGreaterEqual(int(mock_term.call_count), 1)
+                events = [str(call.args[1]) for call in mock_incident.call_args_list if len(call.args) >= 2]
+                self.assertIn("runner_script_path_changed", events)
+
     def test_market_watchdog_startup_grace_skips_early_restarts(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             hub = os.path.join(td, "hub_data")

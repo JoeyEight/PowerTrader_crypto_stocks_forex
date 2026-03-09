@@ -16,6 +16,26 @@ _QUICKFIX_MAP: Dict[str, str] = {
     "key_rotation_due": "Rotate API keys/secrets and update credentials before switching to live mode.",
     "drawdown_guard_triggered": "Review drawdown guard payload and account-value history before restarting trading.",
     "stop_flag_active": "Clear stop flag only after root cause is resolved and checks are green.",
+    "shadow_scorecard_blocked": "Keep shadow mode; resolve scorecard blockers before enabling live rollout.",
+    "notification_center_critical": "Open Alerts panel and clear critical notifications before proceeding.",
+}
+
+_RUNBOOK_LINK_MAP: Dict[str, str] = {
+    "startup_checks_failed": "docs/RUNBOOK.md#1-runtime-not-starting",
+    "startup_warnings": "docs/RUNBOOK.md#0-preflight-before-shadowlive",
+    "scan_reject_pressure": "docs/RUNBOOK.md#8-universe-quality-tuning",
+    "error_incidents": "docs/RUNBOOK.md#6-core-logs",
+    "api_unstable": "docs/RUNBOOK.md#2-brokerapi-instability",
+    "scanner_reject_spike": "docs/RUNBOOK.md#8-universe-quality-tuning",
+    "cadence_drift_pressure": "docs/RUNBOOK.md#7-scanner-cadence-troubleshooting",
+    "market_loop_stale": "docs/RUNBOOK.md#7-scanner-cadence-troubleshooting",
+    "exposure_concentration": "docs/RUNBOOK.md#4-trading-disabled-in-live-mode",
+    "execution_temporarily_disabled": "docs/RUNBOOK.md#2-brokerapi-instability",
+    "key_rotation_due": "docs/RUNBOOK.md#5-key-hygiene",
+    "drawdown_guard_triggered": "docs/RUNBOOK.md#4-trading-disabled-in-live-mode",
+    "stop_flag_active": "docs/RUNBOOK.md#4-trading-disabled-in-live-mode",
+    "shadow_scorecard_blocked": "docs/RUNBOOK.md#0-preflight-before-shadowlive",
+    "notification_center_critical": "docs/RUNBOOK.md#6-core-logs",
 }
 
 
@@ -26,6 +46,11 @@ def evaluate_runtime_alerts(runtime_state: Dict[str, Any], settings: Dict[str, A
     checks = runtime_state.get("checks", {}) if isinstance(runtime_state.get("checks", {}), dict) else {}
     incidents = runtime_state.get("incidents_last_200", {}) if isinstance(runtime_state.get("incidents_last_200", {}), dict) else {}
     sev = incidents.get("by_severity", {}) if isinstance(incidents.get("by_severity", {}), dict) else {}
+    sev_1h = incidents.get("by_severity_1h", {}) if isinstance(incidents.get("by_severity_1h", {}), dict) else {}
+    by_event_sev_1h = (
+        incidents.get("by_event_severity_1h", {}) if isinstance(incidents.get("by_event_severity_1h", {}), dict) else {}
+    )
+    by_event_sev = incidents.get("by_event_severity", {}) if isinstance(incidents.get("by_event_severity", {}), dict) else {}
     autopilot = runtime_state.get("autopilot", {}) if isinstance(runtime_state.get("autopilot", {}), dict) else {}
     scan_drift = runtime_state.get("scan_drift", {}) if isinstance(runtime_state.get("scan_drift", {}), dict) else {}
     active_drift = scan_drift.get("active", []) if isinstance(scan_drift.get("active", []), list) else []
@@ -38,6 +63,8 @@ def evaluate_runtime_alerts(runtime_state: Dict[str, Any], settings: Dict[str, A
     top_positions = exposure_map.get("top_positions", []) if isinstance(exposure_map.get("top_positions", []), list) else []
     drawdown_guard = runtime_state.get("drawdown_guard", {}) if isinstance(runtime_state.get("drawdown_guard", {}), dict) else {}
     stop_flag = runtime_state.get("stop_flag", {}) if isinstance(runtime_state.get("stop_flag", {}), dict) else {}
+    shadow_scorecards = runtime_state.get("shadow_scorecards", {}) if isinstance(runtime_state.get("shadow_scorecards", {}), dict) else {}
+    notification_center = runtime_state.get("notification_center", {}) if isinstance(runtime_state.get("notification_center", {}), dict) else {}
 
     reject_warn = float(settings.get("runtime_alert_scan_reject_warn_pct", 65.0) or 65.0)
     reject_crit = float(settings.get("runtime_alert_scan_reject_crit_pct", 85.0) or 85.0)
@@ -87,8 +114,16 @@ def evaluate_runtime_alerts(runtime_state: Dict[str, Any], settings: Dict[str, A
     f_reject = _effective_reject_pressure(f_reject_raw, f_dom, f_dom_ratio, f_leaders, f_scores)
     max_reject = max(s_reject, f_reject)
     incident_count_total = int(incidents.get("count", 0) or 0)
-    warn_count = int((sev.get("warning", 0) or 0) + (sev.get("warn", 0) or 0))
-    err_count = int((sev.get("error", 0) or 0) + (sev.get("critical", 0) or 0) + (sev.get("high", 0) or 0))
+    sev_src = sev_1h if bool(sev_1h) else sev
+    warn_count = int((sev_src.get("warning", 0) or 0) + (sev_src.get("warn", 0) or 0))
+    err_count_raw = int((sev_src.get("error", 0) or 0) + (sev_src.get("critical", 0) or 0) + (sev_src.get("high", 0) or 0))
+    evt_src = by_event_sev_1h if bool(by_event_sev_1h) else by_event_sev
+    cadence_evt = evt_src.get("scanner_cadence_drift", {}) if isinstance(evt_src.get("scanner_cadence_drift", {}), dict) else {}
+    cadence_err_count = int(
+        (cadence_evt.get("error", 0) or 0) + (cadence_evt.get("critical", 0) or 0) + (cadence_evt.get("high", 0) or 0)
+    )
+    # Cadence drift already contributes through scan_cadence metrics; avoid double-counting it as generic runtime errors.
+    err_count = max(0, int(err_count_raw - cadence_err_count))
     incident_count = int(warn_count + err_count)
     warns = len(list(checks.get("warnings", []) or []))
     startup_warnings = [str(x or "") for x in list(checks.get("warnings", []) or [])]
@@ -120,6 +155,13 @@ def evaluate_runtime_alerts(runtime_state: Dict[str, Any], settings: Dict[str, A
     if startup_age_s > 0 and startup_age_s < startup_grace_s:
         loop_stale = False
         loop_crit = False
+    cadence_critical_effective = int(cadence_critical)
+    cadence_critical_suppressed = False
+    # Cadence alerts can stay high when scanners are intentionally configured faster than the
+    # achievable loop throughput. Escalate to critical only when paired with other instability signals.
+    if cadence_critical_effective > 0 and (not loop_stale) and (not api_unstable) and (err_count < error_warn):
+        cadence_critical_effective = 0
+        cadence_critical_suppressed = True
     guard_active = 0
     for row in guard_markets.values():
         if not isinstance(row, dict):
@@ -132,6 +174,10 @@ def evaluate_runtime_alerts(runtime_state: Dict[str, Any], settings: Dict[str, A
     top_exposure_pct = 0.0
     if top_positions and isinstance(top_positions[0], dict):
         top_exposure_pct = float(top_positions[0].get("pct_of_total_exposure", 0.0) or 0.0)
+    stocks_score_gate = str((shadow_scorecards.get("stocks", {}) if isinstance(shadow_scorecards.get("stocks", {}), dict) else {}).get("promotion_gate", "") or "").strip().upper()
+    forex_score_gate = str((shadow_scorecards.get("forex", {}) if isinstance(shadow_scorecards.get("forex", {}), dict) else {}).get("promotion_gate", "") or "").strip().upper()
+    notif_by_sev = notification_center.get("by_severity", {}) if isinstance(notification_center.get("by_severity", {}), dict) else {}
+    notif_critical = int(notif_by_sev.get("critical", 0) or 0)
 
     reasons: List[str] = []
     hints: List[str] = []
@@ -143,11 +189,21 @@ def evaluate_runtime_alerts(runtime_state: Dict[str, Any], settings: Dict[str, A
         if order.get(to, 0) > order.get(severity, 0):
             severity = to
 
-    if (not checks_ok) or err_count >= error_crit or max_reject >= reject_crit or drift_count >= drift_crit or cadence_critical >= cadence_crit or loop_crit or top_exposure_pct >= exposure_crit_pct:
+    if (
+        (not checks_ok)
+        or err_count >= error_crit
+        or max_reject >= reject_crit
+        or drift_count >= drift_crit
+        or cadence_critical_effective >= cadence_crit
+        or loop_crit
+        or top_exposure_pct >= exposure_crit_pct
+        or stocks_score_gate == "BLOCK"
+        or forex_score_gate == "BLOCK"
+    ):
         bump("critical")
     if bool(drawdown_guard.get("triggered_recent", False)) or bool(stop_flag.get("active", False)):
         bump("critical")
-    if warns >= startup_warn or err_count >= error_warn or incident_count >= incident_warn or max_reject >= reject_warn or api_unstable or drift_count >= drift_warn or cadence_count >= cadence_warn or loop_stale or top_exposure_pct >= exposure_warn_pct or guard_active > 0:
+    if warns >= startup_warn or err_count >= error_warn or incident_count >= incident_warn or max_reject >= reject_warn or api_unstable or drift_count >= drift_warn or cadence_count >= cadence_warn or loop_stale or top_exposure_pct >= exposure_warn_pct or guard_active > 0 or notif_critical > 0:
         bump("warn")
 
     if not checks_ok:
@@ -189,18 +245,33 @@ def evaluate_runtime_alerts(runtime_state: Dict[str, Any], settings: Dict[str, A
     if bool(stop_flag.get("active", False)):
         reasons.append("stop_flag_active")
         hints.append("Stop flag file is present; trading should remain paused until reviewed.")
+    if stocks_score_gate == "BLOCK" or forex_score_gate == "BLOCK":
+        reasons.append("shadow_scorecard_blocked")
+        hints.append("Shadow scorecard gate is BLOCK for at least one market; keep rollout in shadow mode.")
+    if notif_critical > 0:
+        reasons.append("notification_center_critical")
+        hints.append("Notification center has active critical items; review Alerts panel.")
 
     quickfix: List[str] = []
     for r in reasons:
         tip = str(_QUICKFIX_MAP.get(r, "") or "").strip()
         if tip and tip not in quickfix:
             quickfix.append(tip)
+    runbook_links: List[Dict[str, str]] = []
+    for r in reasons:
+        link = str(_RUNBOOK_LINK_MAP.get(r, "") or "").strip()
+        if not link:
+            continue
+        if any(link == str(x.get("path", "") or "") for x in runbook_links):
+            continue
+        runbook_links.append({"reason": r, "path": link})
 
     return {
         "severity": severity,
         "reasons": reasons[:8],
         "hints": hints[:8],
         "quickfix_suggestions": quickfix[:5],
+        "runbook_links": runbook_links[:5],
         "metrics": {
             "stocks_reject_rate_pct": round(s_reject, 3),
             "forex_reject_rate_pct": round(f_reject, 3),
@@ -210,18 +281,26 @@ def evaluate_runtime_alerts(runtime_state: Dict[str, Any], settings: Dict[str, A
             "incident_count_total_last_200": int(incident_count_total),
             "warning_incidents_last_200": int(warn_count),
             "error_incidents_last_200": int(err_count),
+            "error_incidents_raw_last_1h": int(err_count_raw),
+            "error_incidents_cadence_last_1h": int(cadence_err_count),
+            "error_incidents_non_cadence_last_1h": int(err_count),
             "startup_warning_count": int(warns),
             "checks_ok": bool(checks_ok),
             "api_unstable": bool(api_unstable),
             "drift_spike_active_count": int(drift_count),
             "scan_cadence_active_count": int(cadence_count),
             "scan_cadence_critical_count": int(cadence_critical),
+            "scan_cadence_critical_effective_count": int(cadence_critical_effective),
+            "scan_cadence_critical_suppressed": bool(cadence_critical_suppressed),
             "market_loop_age_s": int(loop_age_s),
             "market_loop_stale": bool(loop_stale),
             "execution_guard_active_markets": int(guard_active),
             "top_exposure_pct_of_total": round(top_exposure_pct, 4),
             "drawdown_guard_triggered_recent": bool(drawdown_guard.get("triggered_recent", False)),
             "stop_flag_active": bool(stop_flag.get("active", False)),
+            "shadow_scorecard_stocks_gate": stocks_score_gate,
+            "shadow_scorecard_forex_gate": forex_score_gate,
+            "notification_critical_count": int(notif_critical),
         },
         "thresholds": {
             "scan_reject_warn_pct": float(reject_warn),

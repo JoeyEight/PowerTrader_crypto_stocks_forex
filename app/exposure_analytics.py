@@ -92,6 +92,65 @@ def _collect_forex_positions(hub_dir: str) -> List[Dict[str, Any]]:
     return out
 
 
+def _quote_currency(symbol: str) -> str:
+    s = str(symbol or "").strip().upper()
+    if "_" in s:
+        parts = s.split("_")
+        if len(parts) == 2 and parts[1]:
+            return parts[1]
+    if "-" in s:
+        parts = s.split("-")
+        if len(parts) == 2 and parts[1]:
+            return parts[1]
+    if "/" in s:
+        parts = s.split("/")
+        if len(parts) == 2 and parts[1]:
+            return parts[1]
+    # Stocks are effectively USD-quoted for this app's brokers.
+    if s.isalpha() and (2 <= len(s) <= 6):
+        return "USD"
+    return ""
+
+
+def _cross_market_warnings(positions: List[Dict[str, Any]], total: float, by_market: Dict[str, float]) -> List[Dict[str, Any]]:
+    if total <= 0.0:
+        return []
+    warnings: List[Dict[str, Any]] = []
+    by_quote: Dict[str, float] = {}
+    for row in positions:
+        sym = str(row.get("symbol", "") or "")
+        q = _quote_currency(sym)
+        if not q:
+            continue
+        by_quote[q] = float(by_quote.get(q, 0.0)) + max(0.0, _f(row.get("value_usd", 0.0), 0.0))
+
+    usd_quote = float(by_quote.get("USD", 0.0))
+    usd_quote_pct = (100.0 * usd_quote / total) if total > 0.0 else 0.0
+    if usd_quote_pct >= 85.0:
+        warnings.append(
+            {
+                "id": "usd_quote_concentration",
+                "severity": "warning",
+                "msg": f"USD-quoted exposure is concentrated ({usd_quote_pct:.1f}% of total).",
+                "metric": round(usd_quote_pct, 4),
+            }
+        )
+
+    stock_pct = (100.0 * float(by_market.get("stocks", 0.0)) / total) if total > 0.0 else 0.0
+    forex_pct = (100.0 * float(by_market.get("forex", 0.0)) / total) if total > 0.0 else 0.0
+    if (stock_pct + forex_pct) >= 90.0:
+        warnings.append(
+            {
+                "id": "usd_macro_correlation",
+                "severity": "warning",
+                "msg": "Stocks + Forex dominate exposure; portfolio can be highly sensitive to USD macro regime shifts.",
+                "metric": round(stock_pct + forex_pct, 4),
+            }
+        )
+
+    return warnings[:6]
+
+
 def build_exposure_payload(hub_dir: str) -> Dict[str, Any]:
     positions = _collect_crypto_positions(hub_dir) + _collect_stock_positions(hub_dir) + _collect_forex_positions(hub_dir)
 
@@ -122,6 +181,7 @@ def build_exposure_payload(hub_dir: str) -> Dict[str, Any]:
         k: round(((100.0 * float(v) / total) if total > 0.0 else 0.0), 4)
         for k, v in by_market.items()
     }
+    correlation_warnings = _cross_market_warnings(positions_sorted, total, by_market)
     return {
         "ts": int(time.time()),
         "total_exposure_usd": round(total, 6),
@@ -129,4 +189,5 @@ def build_exposure_payload(hub_dir: str) -> Dict[str, Any]:
         "by_market_pct": market_pct,
         "top_positions": heatmap,
         "position_count": int(len(positions)),
+        "correlation_warnings": correlation_warnings,
     }

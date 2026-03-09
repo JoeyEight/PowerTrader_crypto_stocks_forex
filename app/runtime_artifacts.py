@@ -26,6 +26,14 @@ def _safe_write_json(path: str, payload: Dict[str, Any]) -> None:
     os.replace(tmp, path)
 
 
+def _safe_write_text(path: str, text: str) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = f"{path}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(str(text or ""))
+    os.replace(tmp, path)
+
+
 def _default_quality_report(market: str, scan_diag: Dict[str, Any], now_ts: int) -> Dict[str, Any]:
     universe_total = int(scan_diag.get("universe_total", 0) or 0)
     candidates_total = int(scan_diag.get("candidates_total", 0) or 0)
@@ -125,6 +133,89 @@ def bootstrap_runtime_artifacts(hub_dir: str, force: bool = False, now_ts: int |
         _safe_write_json(trends_path, trends_payload)
         stats["updated"] = int(stats["updated"]) + 1
         stats["updated_files"].append(trends_path)
+
+    for rel, payload in (
+        (
+            "market_regimes.json",
+            {
+                "ts": int(ts_now),
+                "stocks": {"market": "stocks", "dominant_regime": "unknown", "symbols": [], "samples": 0},
+                "forex": {"market": "forex", "dominant_regime": "unknown", "symbols": [], "samples": 0},
+            },
+        ),
+        (
+            "walkforward_report.json",
+            {
+                "ts": int(ts_now),
+                "stocks": {"market": "stocks", "state": "READY", "stability": "insufficient", "events_considered": 0, "windows": []},
+                "forex": {"market": "forex", "state": "READY", "stability": "insufficient", "events_considered": 0, "windows": []},
+            },
+        ),
+        (
+            "confidence_calibration.json",
+            {
+                "ts": int(ts_now),
+                "stocks": {"market": "stocks", "state": "READY", "samples": 0, "curve": [], "recommendation": {}},
+                "forex": {"market": "forex", "state": "READY", "samples": 0, "curve": [], "recommendation": {}},
+            },
+        ),
+        (
+            "shadow_deployment_scorecards.json",
+            {
+                "ts": int(ts_now),
+                "stocks": {"market": "stocks", "promotion_gate": "WARN", "readiness_score": 0.0, "blockers": []},
+                "forex": {"market": "forex", "promotion_gate": "WARN", "readiness_score": 0.0, "blockers": []},
+                "all_markets_pass": False,
+            },
+        ),
+        (
+            "notification_center.json",
+            {"ts": int(ts_now), "total": 0, "by_market": {}, "by_severity": {"critical": 0, "warning": 0, "info": 0}, "items": []},
+        ),
+        (
+            "rejection_replay.json",
+            {
+                "ts": int(ts_now),
+                "stocks": {"market": "stocks", "state": "NO_DATA", "msg": "Run scanner to generate replay report.", "scenarios": [], "recommendation": {}},
+                "forex": {"market": "forex", "state": "NO_DATA", "msg": "Run scanner to generate replay report.", "scenarios": [], "recommendation": {}},
+            },
+        ),
+        (
+            "rejection_replay_stocks.json",
+            {
+                "ts": int(ts_now),
+                "stocks": {"market": "stocks", "state": "NO_DATA", "msg": "Run scanner to generate replay report.", "scenarios": [], "recommendation": {}},
+            },
+        ),
+        (
+            "rejection_replay_forex.json",
+            {
+                "ts": int(ts_now),
+                "forex": {"market": "forex", "state": "NO_DATA", "msg": "Run scanner to generate replay report.", "scenarios": [], "recommendation": {}},
+            },
+        ),
+    ):
+        path = os.path.join(hub_dir, rel)
+        cur = _safe_read_json(path)
+        if force or (not cur):
+            _safe_write_json(path, payload)
+            stats["updated"] = int(stats["updated"]) + 1
+            stats["updated_files"].append(path)
+
+    notes_md = os.path.join(hub_dir, "operator_notes.md")
+    notes_log = os.path.join(hub_dir, "operator_notes_log.jsonl")
+    if force or (not os.path.isfile(notes_md)):
+        _safe_write_text(
+            notes_md,
+            "# Operator Notes\n\n"
+            "Use this file for shift handoff, risk decisions, and incident context.\n\n",
+        )
+        stats["updated"] = int(stats["updated"]) + 1
+        stats["updated_files"].append(notes_md)
+    if force or (not os.path.isfile(notes_log)):
+        _safe_write_text(notes_log, "")
+        stats["updated"] = int(stats["updated"]) + 1
+        stats["updated_files"].append(notes_log)
 
     runtime_state_path = os.path.join(hub_dir, "runtime_state.json")
     runtime_state = _safe_read_json(runtime_state_path)

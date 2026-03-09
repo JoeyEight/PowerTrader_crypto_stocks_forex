@@ -1,10 +1,10 @@
 from __future__ import annotations
 
+import json
 import os
 import tempfile
-import time
-import json
 import threading
+import time
 import unittest
 
 from app.runtime_logging import atomic_write_json, cleanup_logs, redact_text, runtime_event, trim_jsonl_max_lines

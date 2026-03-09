@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-import os
 import json
+import os
 import tempfile
 import unittest
-from typing import Any, Dict
+from typing import Any, Dict, Literal
 from unittest.mock import patch
 
 import runtime.pt_autofix as pt_autofix
@@ -18,7 +18,7 @@ class TestAutofixRuntime(unittest.TestCase):
             def __enter__(self) -> "_Resp":
                 return self
 
-            def __exit__(self, exc_type, exc, tb) -> bool:
+            def __exit__(self, exc_type, exc, tb) -> Literal[False]:
                 return False
 
             def read(self) -> bytes:
@@ -174,6 +174,16 @@ class TestAutofixRuntime(unittest.TestCase):
             "llm_request_rejected",
         )
 
+    def test_llm_no_patch_reason(self) -> None:
+        self.assertEqual(
+            pt_autofix._llm_no_patch_reason({"used": True, "ok": False, "error": "model_output_not_json"}),
+            "llm_output_invalid",
+        )
+        self.assertEqual(
+            pt_autofix._llm_no_patch_reason({"used": True, "ok": False, "error": "", "detail": ""}),
+            "llm_no_patch_generated",
+        )
+
     def test_apply_ticket_once_marks_ticket_applied(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             tickets_dir = os.path.join(td, "autofix", "tickets")
@@ -268,6 +278,131 @@ class TestAutofixRuntime(unittest.TestCase):
             self.assertFalse(bool(out.get("ok", False)))
             self.assertEqual(str(out.get("reason", "")), "live_guarded_blocked")
 
+    def test_retry_ticket_once_updates_existing_ticket_patch(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            tickets_dir = os.path.join(td, "autofix", "tickets")
+            patches_dir = os.path.join(td, "autofix", "patches")
+            os.makedirs(tickets_dir, exist_ok=True)
+            os.makedirs(patches_dir, exist_ok=True)
+            ticket_id = "af_retry_ticket_1"
+            ticket_path = os.path.join(tickets_dir, f"{ticket_id}.json")
+            with open(ticket_path, "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "id": ticket_id,
+                        "status": "open",
+                        "classifier": {"kind": "user_request", "confidence": 1.0, "match": "assistant_chat"},
+                        "request": {"text": "Resize stocks chart", "auto_apply_requested": False, "force_apply_requested": False},
+                        "proposal": {"summary": "pending", "patch_diff_path": ""},
+                        "apply": {"attempted": False, "ok": False, "reason": "missing_patch_file", "ts": 1},
+                    },
+                    f,
+                )
+            patch_path = os.path.join(patches_dir, f"{ticket_id}.diff")
+            with open(patch_path, "w", encoding="utf-8") as f:
+                f.write("diff --git a/ui/pt_hub.py b/ui/pt_hub.py\n")
+            state_path = os.path.join(td, "autofix_state.json")
+            status_path = os.path.join(td, "autofix_status.json")
+            events_path = os.path.join(td, "runtime_events.jsonl")
+            with patch.object(pt_autofix, "AUTOFIX_TICKETS_DIR", tickets_dir), patch.object(
+                pt_autofix, "AUTOFIX_PATCHES_DIR", patches_dir
+            ), patch.object(pt_autofix, "AUTOFIX_STATE_PATH", state_path), patch.object(
+                pt_autofix, "AUTOFIX_STATUS_PATH", status_path
+            ), patch.object(pt_autofix, "RUNTIME_EVENTS_PATH", events_path), patch.object(
+                pt_autofix,
+                "_load_settings",
+                return_value=(
+                    {
+                        "autofix_enabled": True,
+                        "autofix_mode": "report_only",
+                        "market_rollout_stage": "shadow_only",
+                        "autofix_allow_live_apply": False,
+                        "autofix_max_fixes_per_day": 2,
+                    },
+                    os.path.join(td, "gui_settings.json"),
+                ),
+            ), patch.object(
+                pt_autofix,
+                "_llm_patch_proposal",
+                return_value={
+                    "used": True,
+                    "ok": True,
+                    "summary": "Patch summary",
+                    "diff": "diff --git a/ui/pt_hub.py b/ui/pt_hub.py\n",
+                    "tests": ["python -m unittest tests.test_autofix_runtime"],
+                    "target_files": ["ui/pt_hub.py"],
+                },
+            ), patch.object(
+                pt_autofix,
+                "_write_patch",
+                return_value=patch_path,
+            ):
+                out = pt_autofix.retry_ticket_once(ticket_id, auto_apply=False, force=False, dry_run=False)
+            self.assertTrue(bool(out.get("ok", False)))
+            self.assertTrue(bool(out.get("proposal_ok", False)))
+            self.assertEqual(str(out.get("status", "")), "open")
+            row = pt_autofix._safe_read_json(ticket_path)
+            proposal = row.get("proposal", {}) if isinstance(row.get("proposal", {}), dict) else {}
+            self.assertEqual(str(proposal.get("patch_diff_path", "")), patch_path)
+            apply = row.get("apply", {}) if isinstance(row.get("apply", {}), dict) else {}
+            self.assertEqual(str(apply.get("reason", "")), "awaiting_manual_approval")
+
+    def test_retry_ticket_once_blocks_no_patch_after_retry_exhausted(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            tickets_dir = os.path.join(td, "autofix", "tickets")
+            patches_dir = os.path.join(td, "autofix", "patches")
+            os.makedirs(tickets_dir, exist_ok=True)
+            os.makedirs(patches_dir, exist_ok=True)
+            ticket_id = "af_retry_ticket_2"
+            ticket_path = os.path.join(tickets_dir, f"{ticket_id}.json")
+            with open(ticket_path, "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "id": ticket_id,
+                        "status": "open",
+                        "classifier": {"kind": "user_request", "confidence": 1.0, "match": "assistant_chat"},
+                        "request": {"text": "Resize stocks chart", "auto_apply_requested": True, "force_apply_requested": True},
+                        "proposal": {"summary": "pending", "patch_diff_path": "", "llm": {"used": True, "ok": False, "error": "", "detail": ""}},
+                        "request_retry": {"attempts": 2, "last_ts": 1, "last_error": ""},
+                        "apply": {"attempted": False, "ok": False, "reason": "llm_no_patch_generated", "ts": 1},
+                    },
+                    f,
+                )
+            state_path = os.path.join(td, "autofix_state.json")
+            status_path = os.path.join(td, "autofix_status.json")
+            events_path = os.path.join(td, "runtime_events.jsonl")
+            with patch.object(pt_autofix, "AUTOFIX_TICKETS_DIR", tickets_dir), patch.object(
+                pt_autofix, "AUTOFIX_PATCHES_DIR", patches_dir
+            ), patch.object(pt_autofix, "AUTOFIX_STATE_PATH", state_path), patch.object(
+                pt_autofix, "AUTOFIX_STATUS_PATH", status_path
+            ), patch.object(pt_autofix, "RUNTIME_EVENTS_PATH", events_path), patch.object(
+                pt_autofix,
+                "_load_settings",
+                return_value=(
+                    {
+                        "autofix_enabled": True,
+                        "autofix_mode": "report_only",
+                        "market_rollout_stage": "shadow_only",
+                        "autofix_allow_live_apply": False,
+                        "autofix_max_fixes_per_day": 2,
+                        "autofix_request_retry_max_attempts": 3,
+                    },
+                    os.path.join(td, "gui_settings.json"),
+                ),
+            ), patch.object(
+                pt_autofix,
+                "_llm_patch_proposal",
+                return_value={"used": True, "ok": False, "error": "", "detail": ""},
+            ):
+                out = pt_autofix.retry_ticket_once(ticket_id, auto_apply=True, force=True, dry_run=False)
+            self.assertTrue(bool(out.get("ok", False)))
+            self.assertEqual(str(out.get("status", "")), "blocked")
+            self.assertEqual(str(out.get("blocked_reason", "")), "llm_no_patch_generated_retries_exhausted")
+            row = pt_autofix._safe_read_json(ticket_path)
+            self.assertEqual(str(row.get("status", "")), "blocked")
+            blocked = row.get("blocked", {}) if isinstance(row.get("blocked", {}), dict) else {}
+            self.assertEqual(str(blocked.get("reason", "")), "llm_no_patch_generated_retries_exhausted")
+
     def test_create_request_ticket_requires_text(self) -> None:
         out = pt_autofix.create_request_ticket("")
         self.assertFalse(bool(out.get("ok", False)))
@@ -327,7 +462,7 @@ class TestAutofixRuntime(unittest.TestCase):
             diff_stats = proposal.get("diff_stats", {}) if isinstance(proposal.get("diff_stats", {}), dict) else {}
             self.assertGreaterEqual(int(diff_stats.get("changed", 0) or 0), 0)
 
-    def test_create_request_ticket_auto_apply_sets_missing_patch_reason(self) -> None:
+    def test_create_request_ticket_auto_apply_sets_llm_output_invalid_reason(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             tickets_dir = os.path.join(td, "autofix", "tickets")
             patches_dir = os.path.join(td, "autofix", "patches")
@@ -360,12 +495,15 @@ class TestAutofixRuntime(unittest.TestCase):
             ):
                 out = pt_autofix.create_request_ticket("Fix chart autosizing.", auto_apply=True)
             self.assertTrue(bool(out.get("ok", False)))
-            self.assertEqual(str(out.get("apply_reason", "")), "missing_patch_file")
+            self.assertEqual(str(out.get("apply_reason", "")), "llm_output_invalid")
             tid = str(out.get("ticket_id", "") or "")
             row = pt_autofix._safe_read_json(os.path.join(tickets_dir, f"{tid}.json"))
+            self.assertEqual(str(row.get("status", "") or ""), "open")
             apply = row.get("apply", {}) if isinstance(row.get("apply", {}), dict) else {}
-            self.assertEqual(str(apply.get("reason", "")), "missing_patch_file")
+            self.assertEqual(str(apply.get("reason", "")), "llm_output_invalid")
             self.assertTrue(bool(apply.get("requested_auto_apply", False)))
+            retry = row.get("request_retry", {}) if isinstance(row.get("request_retry", {}), dict) else {}
+            self.assertEqual(int(retry.get("attempts", 0) or 0), 1)
 
     def test_create_request_ticket_records_force_apply_requested(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -691,6 +829,78 @@ class TestAutofixRuntime(unittest.TestCase):
             self.assertEqual(str(blocked.get("reason", "")), "llm_quota_blocked_retries_exhausted")
             apply = row.get("apply", {}) if isinstance(row.get("apply", {}), dict) else {}
             self.assertEqual(str(apply.get("reason", "")), "llm_quota_blocked_retries_exhausted")
+
+    def test_run_once_blocks_no_patch_ticket_after_retry_exhausted(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            tickets_dir = os.path.join(td, "autofix", "tickets")
+            patches_dir = os.path.join(td, "autofix", "patches")
+            os.makedirs(tickets_dir, exist_ok=True)
+            os.makedirs(patches_dir, exist_ok=True)
+            state_path = os.path.join(td, "autofix_state.json")
+            status_path = os.path.join(td, "autofix_status.json")
+            events_path = os.path.join(td, "runtime_events.jsonl")
+            incidents_path = os.path.join(td, "incidents.jsonl")
+            log_path = os.path.join(td, "logs", "autofix.log")
+            os.makedirs(os.path.dirname(log_path), exist_ok=True)
+
+            ticket_id = "af_req_block_no_patch"
+            ticket_path = os.path.join(tickets_dir, f"{ticket_id}.json")
+            with open(ticket_path, "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "id": ticket_id,
+                        "status": "open",
+                        "classifier": {"kind": "user_request", "confidence": 1.0, "match": "assistant_chat"},
+                        "request": {"text": "Resize stocks chart", "auto_apply_requested": True, "force_apply_requested": True},
+                        "proposal": {
+                            "summary": "no-patch",
+                            "patch_diff_path": "",
+                            "llm": {"used": True, "ok": False, "error": "", "detail": ""},
+                        },
+                        "request_retry": {"attempts": 3, "last_ts": 1, "last_error": ""},
+                        "apply": {"attempted": False, "ok": False, "reason": "llm_no_patch_generated", "ts": 1},
+                        "incident": {"msg": "user request"},
+                        "evidence": {"trace_files": [], "log_tail": []},
+                    },
+                    f,
+                )
+
+            with patch.object(pt_autofix, "AUTOFIX_TICKETS_DIR", tickets_dir), patch.object(
+                pt_autofix, "AUTOFIX_PATCHES_DIR", patches_dir
+            ), patch.object(pt_autofix, "AUTOFIX_STATE_PATH", state_path), patch.object(
+                pt_autofix, "AUTOFIX_STATUS_PATH", status_path
+            ), patch.object(pt_autofix, "RUNTIME_EVENTS_PATH", events_path), patch.object(
+                pt_autofix, "INCIDENTS_PATH", incidents_path
+            ), patch.object(
+                pt_autofix, "AUTOFIX_LOG_PATH", log_path
+            ), patch.object(
+                pt_autofix, "_read_jsonl_incremental", return_value=([], 0)
+            ), patch.object(
+                pt_autofix,
+                "_load_settings",
+                return_value=(
+                    {
+                        "autofix_enabled": True,
+                        "autofix_mode": "report_only",
+                        "market_rollout_stage": "live_guarded",
+                        "autofix_allow_live_apply": False,
+                        "autofix_max_fixes_per_day": 2,
+                        "autofix_request_retry_max_attempts": 3,
+                    },
+                    os.path.join(td, "gui_settings.json"),
+                ),
+            ), patch.object(pt_autofix, "_llm_patch_proposal") as llm_mock:
+                out = pt_autofix.run_once(dry_run=False)
+
+            llm_mock.assert_not_called()
+            self.assertEqual(int(out.get("request_retry_attempted", 0) or 0), 0)
+            self.assertEqual(int(out.get("request_retry_blocked", 0) or 0), 1)
+            row = pt_autofix._safe_read_json(ticket_path)
+            self.assertEqual(str(row.get("status", "")), "blocked")
+            blocked = row.get("blocked", {}) if isinstance(row.get("blocked", {}), dict) else {}
+            self.assertEqual(str(blocked.get("reason", "")), "llm_no_patch_generated_retries_exhausted")
+            apply = row.get("apply", {}) if isinstance(row.get("apply", {}), dict) else {}
+            self.assertEqual(str(apply.get("reason", "")), "llm_no_patch_generated_retries_exhausted")
 
     def test_run_once_ticket_includes_proposal_risk(self) -> None:
         with tempfile.TemporaryDirectory() as td:

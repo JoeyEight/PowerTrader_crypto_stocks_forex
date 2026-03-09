@@ -35,6 +35,11 @@ def main() -> int:
         "scanner_cadence_drift": os.path.join(hub_dir, "scanner_cadence_drift.json"),
         "runtime_state": os.path.join(hub_dir, "runtime_state.json"),
         "market_trends": os.path.join(hub_dir, "market_trends.json"),
+        "market_regimes": os.path.join(hub_dir, "market_regimes.json"),
+        "walkforward_report": os.path.join(hub_dir, "walkforward_report.json"),
+        "confidence_calibration": os.path.join(hub_dir, "confidence_calibration.json"),
+        "shadow_deployment_scorecards": os.path.join(hub_dir, "shadow_deployment_scorecards.json"),
+        "notification_center": os.path.join(hub_dir, "notification_center.json"),
     }
 
     out: Dict[str, Any] = {"ts": int(time.time()), "ok": True, "checks": {}}
@@ -56,6 +61,11 @@ def main() -> int:
     forex_diag = normalize_scan_diagnostics(forex_raw, market="forex")
     runtime_state = _safe_json(checks["runtime_state"])
     market_trends = _safe_json(checks["market_trends"])
+    market_regimes = _safe_json(checks["market_regimes"])
+    walkforward = _safe_json(checks["walkforward_report"])
+    confidence_calibration = _safe_json(checks["confidence_calibration"])
+    shadow_scorecards = _safe_json(checks["shadow_deployment_scorecards"])
+    notification_center = _safe_json(checks["notification_center"])
 
     def _scan_diag_ok(raw: Dict[str, Any], diag: Dict[str, Any]) -> Dict[str, Any]:
         return {
@@ -71,6 +81,9 @@ def main() -> int:
         "has_scan_cadence": isinstance(runtime_state.get("scan_cadence", {}), dict),
         "has_broker_backoff": isinstance(runtime_state.get("broker_backoff", {}), dict),
         "has_market_loop_age_metric": ("market_loop_age_s" in runtime_metrics),
+        "has_notification_center": isinstance(runtime_state.get("notification_center", {}), dict),
+        "has_shadow_scorecards": isinstance(runtime_state.get("shadow_scorecards", {}), dict),
+        "has_market_regimes": isinstance(runtime_state.get("market_regimes", {}), dict),
     }
     out["checks"]["stocks_scan_diagnostics"]["details"] = _scan_diag_ok(stocks_raw, stocks_diag)
     out["checks"]["forex_scan_diagnostics"]["details"] = _scan_diag_ok(forex_raw, forex_diag)
@@ -85,6 +98,29 @@ def main() -> int:
         "forex_has_cadence_aggregates": isinstance(tr_forex.get("cadence_aggregates", {}), dict),
     }
     out["checks"]["market_trends"]["details"] = trend_details
+    rg_st = market_regimes.get("stocks", {}) if isinstance(market_regimes.get("stocks", {}), dict) else {}
+    rg_fx = market_regimes.get("forex", {}) if isinstance(market_regimes.get("forex", {}), dict) else {}
+    out["checks"]["market_regimes"]["details"] = {
+        "stocks_has_regime_field": ("dominant_regime" in rg_st),
+        "forex_has_regime_field": ("dominant_regime" in rg_fx),
+    }
+    out["checks"]["walkforward_report"]["details"] = {
+        "stocks_has_state": bool(str((walkforward.get("stocks", {}) if isinstance(walkforward.get("stocks", {}), dict) else {}).get("state", "") or "").strip()),
+        "forex_has_state": bool(str((walkforward.get("forex", {}) if isinstance(walkforward.get("forex", {}), dict) else {}).get("state", "") or "").strip()),
+    }
+    out["checks"]["confidence_calibration"]["details"] = {
+        "stocks_has_curve": isinstance((confidence_calibration.get("stocks", {}) if isinstance(confidence_calibration.get("stocks", {}), dict) else {}).get("curve", []), list),
+        "forex_has_curve": isinstance((confidence_calibration.get("forex", {}) if isinstance(confidence_calibration.get("forex", {}), dict) else {}).get("curve", []), list),
+    }
+    out["checks"]["shadow_deployment_scorecards"]["details"] = {
+        "stocks_gate": str((shadow_scorecards.get("stocks", {}) if isinstance(shadow_scorecards.get("stocks", {}), dict) else {}).get("promotion_gate", "") or ""),
+        "forex_gate": str((shadow_scorecards.get("forex", {}) if isinstance(shadow_scorecards.get("forex", {}), dict) else {}).get("promotion_gate", "") or ""),
+        "has_all_markets_pass": ("all_markets_pass" in shadow_scorecards),
+    }
+    out["checks"]["notification_center"]["details"] = {
+        "has_items_list": isinstance(notification_center.get("items", []), list),
+        "has_by_severity": isinstance(notification_center.get("by_severity", {}), dict),
+    }
 
     if int(out["checks"]["stocks_scan_diagnostics"]["details"]["schema_version"]) < 2:
         out["ok"] = False
@@ -93,6 +129,16 @@ def main() -> int:
     if not all(bool(v) for v in runtime_extras.values()):
         out["ok"] = False
     if not all(bool(v) for v in trend_details.values()):
+        out["ok"] = False
+    if not all(bool(v) for v in out["checks"]["market_regimes"]["details"].values()):
+        out["ok"] = False
+    if not all(bool(v) for v in out["checks"]["walkforward_report"]["details"].values()):
+        out["ok"] = False
+    if not all(bool(v) for v in out["checks"]["confidence_calibration"]["details"].values()):
+        out["ok"] = False
+    if not bool(out["checks"]["shadow_deployment_scorecards"]["details"]["has_all_markets_pass"]):
+        out["ok"] = False
+    if not all(bool(v) for v in out["checks"]["notification_center"]["details"].values()):
         out["ok"] = False
 
     print(json.dumps(out, indent=2))

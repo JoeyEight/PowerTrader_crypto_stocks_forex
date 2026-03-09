@@ -30,6 +30,9 @@ class TestCheckPass3Artifacts(unittest.TestCase):
                     {
                         "scan_cadence": {},
                         "broker_backoff": {},
+                        "notification_center": {},
+                        "shadow_scorecards": {},
+                        "market_regimes": {},
                         "alerts": {"metrics": {"market_loop_age_s": 0}},
                     },
                     f,
@@ -42,6 +45,16 @@ class TestCheckPass3Artifacts(unittest.TestCase):
                     },
                     f,
                 )
+            with open(os.path.join(hub, "market_regimes.json"), "w", encoding="utf-8") as f:
+                json.dump({"stocks": {"focus_symbol": "SPY", "dominant_regime": "range"}, "forex": {"focus_symbol": "EUR_USD", "dominant_regime": "trend_down"}}, f)
+            with open(os.path.join(hub, "walkforward_report.json"), "w", encoding="utf-8") as f:
+                json.dump({"stocks": {"state": "READY"}, "forex": {"state": "READY"}}, f)
+            with open(os.path.join(hub, "confidence_calibration.json"), "w", encoding="utf-8") as f:
+                json.dump({"stocks": {"curve": []}, "forex": {"curve": []}}, f)
+            with open(os.path.join(hub, "shadow_deployment_scorecards.json"), "w", encoding="utf-8") as f:
+                json.dump({"stocks": {"promotion_gate": "PASS"}, "forex": {"promotion_gate": "PASS"}, "all_markets_pass": True}, f)
+            with open(os.path.join(hub, "notification_center.json"), "w", encoding="utf-8") as f:
+                json.dump({"items": [], "by_severity": {"critical": 0, "warning": 0, "info": 0}}, f)
             with patch.object(check_pass3, "resolve_runtime_paths", return_value=(td, "", hub, {})):
                 rc = check_pass3.main()
             self.assertEqual(rc, 0)
@@ -66,6 +79,9 @@ class TestCheckPass3Artifacts(unittest.TestCase):
                     {
                         "scan_cadence": {},
                         "broker_backoff": {},
+                        "notification_center": {},
+                        "shadow_scorecards": {},
+                        "market_regimes": {},
                         "alerts": {"metrics": {"market_loop_age_s": 0}},
                     },
                     f,
@@ -78,6 +94,16 @@ class TestCheckPass3Artifacts(unittest.TestCase):
                     },
                     f,
                 )
+            with open(os.path.join(hub, "market_regimes.json"), "w", encoding="utf-8") as f:
+                json.dump({"stocks": {"focus_symbol": "SPY", "dominant_regime": "range"}, "forex": {"focus_symbol": "EUR_USD", "dominant_regime": "trend_down"}}, f)
+            with open(os.path.join(hub, "walkforward_report.json"), "w", encoding="utf-8") as f:
+                json.dump({"stocks": {"state": "READY"}, "forex": {"state": "READY"}}, f)
+            with open(os.path.join(hub, "confidence_calibration.json"), "w", encoding="utf-8") as f:
+                json.dump({"stocks": {"curve": []}, "forex": {"curve": []}}, f)
+            with open(os.path.join(hub, "shadow_deployment_scorecards.json"), "w", encoding="utf-8") as f:
+                json.dump({"stocks": {"promotion_gate": "PASS"}, "forex": {"promotion_gate": "PASS"}, "all_markets_pass": True}, f)
+            with open(os.path.join(hub, "notification_center.json"), "w", encoding="utf-8") as f:
+                json.dump({"items": [], "by_severity": {"critical": 0, "warning": 0, "info": 0}}, f)
             with patch.object(check_pass3, "resolve_runtime_paths", return_value=(td, "", hub, {})):
                 rc = check_pass3.main()
             self.assertEqual(rc, 1)

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+import time
 import urllib.error
 import urllib.request
 from typing import Any, Dict, List, Tuple
 
+from app.api_endpoint_validation import normalize_endpoint_url
 from app.backoff_policy import BackoffPolicy
 from app.http_utils import retry_after_from_urllib_http_error
 
@@ -17,7 +19,8 @@ class OandaBrokerClient:
     def __init__(self, account_id: str, api_token: str, rest_url: str) -> None:
         self.account_id = str(account_id or "").strip()
         self.api_token = str(api_token or "").strip()
-        self.rest_url = str(rest_url or "").strip().rstrip("/")
+        norm_rest, rest_ok, _ = normalize_endpoint_url(rest_url, default="https://api-fxpractice.oanda.com")
+        self.rest_url = str((norm_rest if rest_ok else "https://api-fxpractice.oanda.com") or "").strip().rstrip("/")
 
     def configured(self) -> bool:
         return bool(self.account_id and self.api_token and self.rest_url)
@@ -29,16 +32,58 @@ class OandaBrokerClient:
         except Exception:
             return float(default)
 
-    def _request_json(self, path: str, timeout: float = 8.0) -> Dict[str, Any]:
+    @staticmethod
+    def _retryable_http(code: int) -> bool:
+        return int(code or 0) in {408, 425, 429, 500, 502, 503, 504}
+
+    def _open_with_retry(self, req: urllib.request.Request, timeout: float, max_attempts: int = 3) -> str:
+        attempts = max(1, int(max_attempts or 1))
+        backoff = BackoffPolicy(base_delay_s=0.2, max_delay_s=8.0, jitter_s=0.25, max_retry_after_s=300.0)
+        last_exc: Exception | None = None
+        for att in range(1, attempts + 1):
+            retry_after_s = 0.0
+            try:
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    body = resp.read()
+                    if isinstance(body, bytes):
+                        return body.decode("utf-8")
+                    return str(body or "")
+            except urllib.error.HTTPError as exc:
+                last_exc = exc
+                retry_after_s = _retry_after_seconds_from_http_error(exc)
+                if (not self._retryable_http(int(getattr(exc, "code", 0) or 0))) or att >= attempts:
+                    raise
+            except urllib.error.URLError as exc:
+                last_exc = exc
+                if att >= attempts:
+                    raise
+            except Exception as exc:
+                last_exc = exc
+                if att >= attempts:
+                    raise
+            wait_s = backoff.wait_seconds(att, retry_after_s=retry_after_s)
+            time.sleep(wait_s)
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError("OANDA request failed")
+
+    def _request_json(self, path: str, timeout: float = 8.0, max_attempts: int = 3) -> Dict[str, Any]:
         req = urllib.request.Request(
             f"{self.rest_url}{path}",
             headers={"Authorization": f"Bearer {self.api_token}"},
         )
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            payload = json.loads(resp.read().decode("utf-8"))
+        raw = self._open_with_retry(req, timeout=timeout, max_attempts=max_attempts)
+        payload = json.loads(raw or "{}")
         return payload if isinstance(payload, dict) else {}
 
-    def _request(self, method: str, path: str, body: Dict[str, Any] | None = None, timeout: float = 8.0) -> Dict[str, Any]:
+    def _request(
+        self,
+        method: str,
+        path: str,
+        body: Dict[str, Any] | None = None,
+        timeout: float = 8.0,
+        max_attempts: int = 1,
+    ) -> Dict[str, Any]:
         raw = None
         headers = {"Authorization": f"Bearer {self.api_token}"}
         if body is not None:
@@ -50,8 +95,8 @@ class OandaBrokerClient:
             data=raw,
             method=method,
         )
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            payload = json.loads(resp.read().decode("utf-8"))
+        txt = self._open_with_retry(req, timeout=timeout, max_attempts=max_attempts)
+        payload = json.loads(txt or "{}")
         return payload if isinstance(payload, dict) else {}
 
     def test_connection(self) -> Tuple[bool, str]:

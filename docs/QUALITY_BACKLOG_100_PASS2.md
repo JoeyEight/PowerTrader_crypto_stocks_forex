@@ -52,53 +52,53 @@ Status legend: `[x] done`, `[ ] pending`
 48. [x] Add market-status snapshot export builder using hydration bundle.
 49. [x] Add runtime-summary text export from runtime state and broker health.
 50. [x] Add sanitize-settings test coverage for new retention/jitter keys.
-51. [ ] Add dedicated runtime summary panel with compact cards in UI.
-52. [ ] Add incident trend sparkline (1h/24h/7d) in dashboard.
-53. [ ] Add scanner cadence drift detector (expected vs observed cycle timing).
-54. [ ] Add forex session-aware scanner weighting.
-55. [ ] Add stock open/close cooldown policy for first/last 15 minutes.
-56. [ ] Add scanner symbol universe quality scoring report.
-57. [ ] Add daily PnL decomposition (realized/unrealized/fees/slippage).
-58. [ ] Add cross-market correlation exposure warnings.
-59. [ ] Add strategy-by-strategy attribution report.
-60. [ ] Add circuit-breaker cooldown countdown in UI badge.
-61. [ ] Add auto-resume policy after drawdown guard cooloff.
-62. [ ] Add manual safety acknowledgment flow for post-drawdown restart.
-63. [ ] Add equity curve anomaly detector for sudden spikes/drops.
-64. [ ] Add stale-history detector for frozen account-value stream.
-65. [ ] Add per-market data-source reliability score in panel.
-66. [ ] Add scanner candidate churn metric (turnover %) per cycle.
-67. [ ] Add rejected-candidate replay tool for threshold tuning.
-68. [ ] Add broker latency histogram persistence and dashboard.
-69. [ ] Add order-fill quality comparison by time-of-day.
-70. [ ] Add live-vs-paper discrepancy tracker by market.
-71. [ ] Add structured feature-flag registry for rollout toggles.
-72. [ ] Add migration test suite for settings schema upgrades.
-73. [ ] Add resilient fallback loader for partially-corrupt settings files.
-74. [ ] Add deterministic replay fixture for runner heartbeat lifecycle.
-75. [ ] Add end-to-end paper-mode scenario test for stocks.
-76. [ ] Add end-to-end practice-mode scenario test for forex.
-77. [ ] Add deterministic mock broker layer for integration tests.
-78. [ ] Add scanner throughput benchmark script.
-79. [ ] Add UI render-time benchmark for heavy chart data.
-80. [ ] Add chart panel split-layout persistence per tab.
-81. [ ] Add market panel compact mode for smaller screens.
-82. [ ] Add per-market notification center with severity filters.
-83. [ ] Add one-click “safe defaults” reset for risk settings.
-84. [ ] Add advanced settings profile import/export.
-85. [ ] Add operator role modes (basic/advanced/admin) for UI complexity.
-86. [ ] Add dashboard layout drag-and-save system.
-87. [ ] Add command palette for key hub actions.
-88. [ ] Add markdown notes editor with timestamped operator logs.
-89. [ ] Add runbook deep-links from each alert reason.
+51. [x] Add dedicated runtime summary panel with compact cards in UI.
+52. [x] Add incident trend sparkline (1h/24h/7d) in dashboard.
+53. [x] Add scanner cadence drift detector (expected vs observed cycle timing).
+54. [x] Add forex session-aware scanner weighting.
+55. [x] Add stock open/close cooldown policy for first/last 15 minutes.
+56. [x] Add scanner symbol universe quality scoring report.
+57. [x] Add daily PnL decomposition (realized/unrealized/fees/slippage).
+58. [x] Add cross-market correlation exposure warnings.
+59. [x] Add strategy-by-strategy attribution report.
+60. [x] Add circuit-breaker cooldown countdown in UI badge.
+61. [x] Add auto-resume policy after drawdown guard cooloff.
+62. [x] Add manual safety acknowledgment flow for post-drawdown restart.
+63. [x] Add equity curve anomaly detector for sudden spikes/drops.
+64. [x] Add stale-history detector for frozen account-value stream.
+65. [x] Add per-market data-source reliability score in panel.
+66. [x] Add scanner candidate churn metric (turnover %) per cycle.
+67. [x] Add rejected-candidate replay tool for threshold tuning.
+68. [x] Add broker latency histogram persistence and dashboard.
+69. [x] Add order-fill quality comparison by time-of-day.
+70. [x] Add live-vs-paper discrepancy tracker by market.
+71. [x] Add structured feature-flag registry for rollout toggles.
+72. [x] Add migration test suite for settings schema upgrades.
+73. [x] Add resilient fallback loader for partially-corrupt settings files.
+74. [x] Add deterministic replay fixture for runner heartbeat lifecycle.
+75. [x] Add end-to-end paper-mode scenario test for stocks.
+76. [x] Add end-to-end practice-mode scenario test for forex.
+77. [x] Add deterministic mock broker layer for integration tests.
+78. [x] Add scanner throughput benchmark script.
+79. [x] Add UI render-time benchmark for heavy chart data.
+80. [x] Add chart panel split-layout persistence per tab.
+81. [x] Add market panel compact mode for smaller screens.
+82. [x] Add per-market notification center with severity filters.
+83. [x] Add one-click “safe defaults” reset for risk settings.
+84. [x] Add advanced settings profile import/export.
+85. [x] Add operator role modes (basic/advanced/admin) for UI complexity.
+86. [x] Add dashboard layout drag-and-save system.
+87. [x] Add command palette for key hub actions.
+88. [x] Add markdown notes editor with timestamped operator logs.
+89. [x] Add runbook deep-links from each alert reason.
 90. [x] Add quick diagnostics checker button with pass/fail report.
-91. [ ] Add market scanner “why not traded” explainer for top candidate.
-92. [ ] Add adaptive confidence calibration retraining job.
-93. [ ] Add rolling walk-forward validation report for all markets.
-94. [ ] Add regime classifier (trend/range/high-vol) persisted by market.
-95. [ ] Add shadow deployment scorecards before live-stage promotion.
-96. [ ] Add versioned runtime-state schema with compatibility checks.
-97. [ ] Add signed release artifact metadata in diagnostics bundle.
-98. [ ] Add operator session audit trail for major UI actions.
-99. [ ] Add localized timestamp formatting controls in settings.
+91. [x] Add market scanner “why not traded” explainer for top candidate.
+92. [x] Add adaptive confidence calibration retraining job.
+93. [x] Add rolling walk-forward validation report for all markets.
+94. [x] Add regime classifier (trend/range/high-vol) persisted by market.
+95. [x] Add shadow deployment scorecards before live-stage promotion.
+96. [x] Add versioned runtime-state schema with compatibility checks.
+97. [x] Add signed release artifact metadata in diagnostics bundle.
+98. [x] Add operator session audit trail for major UI actions.
+99. [x] Add localized timestamp formatting controls in settings.
 100. [x] Add pass-2 release checklist and acceptance gates document.

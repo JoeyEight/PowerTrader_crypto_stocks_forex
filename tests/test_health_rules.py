@@ -89,6 +89,25 @@ class TestHealthRules(unittest.TestCase):
         self.assertEqual(out["severity"], "warn")
         self.assertIn("cadence_drift_pressure", out["reasons"])
 
+    def test_cadence_critical_is_not_promoted_without_other_instability(self) -> None:
+        state = {
+            "checks": {"ok": True, "warnings": []},
+            "scan_health": {"stocks": {"reject_rate_pct": 0.0}, "forex": {"reject_rate_pct": 0.0}},
+            "incidents_last_200": {"count": 0, "by_severity": {"error": 0, "warning": 0}},
+            "autopilot": {"api_unstable": False},
+            "scan_cadence": {
+                "active": [
+                    {"market": "stocks", "level": "critical"},
+                    {"market": "forex", "level": "critical"},
+                ],
+            },
+            "market_loop": {"age_s": 5},
+        }
+        out = evaluate_runtime_alerts(state, {"runtime_alert_cadence_warn_count": 1, "runtime_alert_cadence_crit_count": 2})
+        self.assertEqual(out["severity"], "warn")
+        self.assertEqual(int(out.get("metrics", {}).get("scan_cadence_critical_effective_count", -1)), 0)
+        self.assertTrue(bool(out.get("metrics", {}).get("scan_cadence_critical_suppressed", False)))
+
     def test_warn_on_market_loop_stale(self) -> None:
         state = {
             "checks": {"ok": True, "warnings": []},

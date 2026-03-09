@@ -70,6 +70,34 @@ def resolve_settings_path(base_dir: str) -> Optional[str]:
     return None
 
 
+def _best_effort_json_dict(raw_text: str) -> Dict[str, Any]:
+    txt = str(raw_text or "")
+    if not txt.strip():
+        return {}
+    # 1) Straight parse.
+    try:
+        obj = json.loads(txt)
+        return obj if isinstance(obj, dict) else {}
+    except Exception:
+        pass
+    # 2) Trim trailing garbage after the last object close.
+    last_obj = txt.rfind("}")
+    if last_obj > 0:
+        candidate = txt[: last_obj + 1]
+        try:
+            obj = json.loads(candidate)
+            return obj if isinstance(obj, dict) else {}
+        except Exception:
+            pass
+    # 3) Remove common accidental trailing commas before } or ].
+    candidate = txt.replace(",}", "}").replace(",]", "]")
+    try:
+        obj = json.loads(candidate)
+        return obj if isinstance(obj, dict) else {}
+    except Exception:
+        return {}
+
+
 def read_settings_file(path: Optional[str], module_name: str = "") -> Dict[str, Any]:
     if not path:
         if module_name:
@@ -80,6 +108,20 @@ def read_settings_file(path: Optional[str], module_name: str = "") -> Dict[str, 
             data = json.load(f)
         return data if isinstance(data, dict) else {}
     except (FileNotFoundError, PermissionError, OSError, json.JSONDecodeError, ValueError) as exc:
+        if isinstance(exc, json.JSONDecodeError):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    raw = f.read()
+                recovered = _best_effort_json_dict(raw)
+            except Exception:
+                recovered = {}
+            if recovered:
+                if module_name:
+                    log_once(
+                        f"{module_name}:settings_recovered:{path}",
+                        f"[{module_name}] read_settings_file recovered partially-corrupt settings from {path}",
+                    )
+                return recovered
         if module_name:
             log_once(
                 f"{module_name}:settings_read:{path}:{type(exc).__name__}",

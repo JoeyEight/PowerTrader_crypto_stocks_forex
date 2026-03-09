@@ -13,10 +13,11 @@ if __package__ in (None, ""):
     if _ROOT not in sys.path:
         sys.path.insert(0, _ROOT)
 
+from app.api_endpoint_validation import validate_alpaca_endpoints, validate_oanda_endpoints
 from app.credential_utils import (
     get_alpaca_creds,
-    get_openai_api_key,
     get_oanda_creds,
+    get_openai_api_key,
     get_robinhood_creds_from_env,
     get_robinhood_creds_from_files,
     key_file_permission_issues,
@@ -153,6 +154,22 @@ def build_preflight_report(project_dir: str, now_ts: int | None = None) -> Dict[
     alpaca_ok = bool(alpaca_key and alpaca_secret)
     oanda_ok = bool(oanda_account and oanda_token)
     openai_ok = bool(str(openai_api_key or "").strip())
+    alpaca_endpoint_check = validate_alpaca_endpoints(
+        settings.get("alpaca_base_url", "https://paper-api.alpaca.markets"),
+        settings.get("alpaca_data_url", "https://data.alpaca.markets"),
+        paper_mode=bool(alpaca_paper),
+    )
+    oanda_endpoint_check = validate_oanda_endpoints(
+        settings.get("oanda_rest_url", "https://api-fxpractice.oanda.com"),
+        settings.get("oanda_stream_url", ""),
+        practice_mode=bool(oanda_practice),
+    )
+    for row in list(alpaca_endpoint_check.get("issues", []) or []):
+        if isinstance(row, dict):
+            issues.append(row)
+    for row in list(oanda_endpoint_check.get("issues", []) or []):
+        if isinstance(row, dict):
+            issues.append(row)
 
     if stock_auto and (not alpaca_ok):
         issues.append(_issue("critical", "alpaca_creds_missing", "Stocks auto-trade is enabled but Alpaca credentials are missing."))
@@ -239,6 +256,53 @@ def build_preflight_report(project_dir: str, now_ts: int | None = None) -> Dict[
             )
         )
 
+    scorecards_path = os.path.join(hub_dir, "shadow_deployment_scorecards.json")
+    scorecards = _safe_read_json(scorecards_path)
+    stock_gate = str(((scorecards.get("stocks", {}) if isinstance(scorecards.get("stocks", {}), dict) else {}).get("promotion_gate", "N/A") or "N/A")).strip().upper()
+    forex_gate = str(((scorecards.get("forex", {}) if isinstance(scorecards.get("forex", {}), dict) else {}).get("promotion_gate", "N/A") or "N/A")).strip().upper()
+    if not scorecards:
+        issues.append(
+            _issue(
+                "warning",
+                "shadow_scorecards_missing",
+                "Shadow deployment scorecards are missing; wait for markets loop to generate readiness scorecards.",
+                {"path": scorecards_path},
+            )
+        )
+    elif rollout_stage in {"execution_v2", "live_guarded"}:
+        if stock_gate == "BLOCK" or forex_gate == "BLOCK":
+            issues.append(
+                _issue(
+                    "critical",
+                    "shadow_scorecard_blocked",
+                    "Shadow deployment scorecard gate is BLOCK for one or more markets.",
+                    {"stocks_gate": stock_gate, "forex_gate": forex_gate, "path": scorecards_path},
+                )
+            )
+        elif stock_gate == "WARN" or forex_gate == "WARN":
+            issues.append(
+                _issue(
+                    "warning",
+                    "shadow_scorecard_warn",
+                    "Shadow deployment scorecard gate is WARN; review scorecard blockers before live rollout.",
+                    {"stocks_gate": stock_gate, "forex_gate": forex_gate, "path": scorecards_path},
+                )
+            )
+
+    notif_path = os.path.join(hub_dir, "notification_center.json")
+    notif = _safe_read_json(notif_path)
+    notif_by_sev = notif.get("by_severity", {}) if isinstance(notif.get("by_severity", {}), dict) else {}
+    crit_notif = int(notif_by_sev.get("critical", 0) or 0)
+    if crit_notif > 0 and rollout_stage in {"execution_v2", "live_guarded"}:
+        issues.append(
+            _issue(
+                "warning",
+                "notification_center_critical_items",
+                "Notification center currently has active critical items.",
+                {"critical_items": int(crit_notif), "path": notif_path},
+            )
+        )
+
     if rollout_stage == "live_guarded" and alpaca_paper:
         issues.append(_issue("warning", "alpaca_still_paper", "Rollout is `live_guarded` but Alpaca is still in paper mode."))
     if rollout_stage == "live_guarded" and oanda_practice:
@@ -313,6 +377,12 @@ def build_preflight_report(project_dir: str, now_ts: int | None = None) -> Dict[
     summary_lines.append(f"stage={rollout_stage} | stock_auto={stock_auto} | forex_auto={forex_auto}")
     summary_lines.append(f"alpaca={'OK' if alpaca_ok else 'MISSING'} | oanda={'OK' if oanda_ok else 'MISSING'} | crypto_keys={'OK' if rh_ok else 'MISSING'}")
     summary_lines.append(f"ai_assist_key={'OK' if openai_ok else 'MISSING'}")
+    summary_lines.append(
+        "alpaca_endpoint="
+        + str(alpaca_endpoint_check.get("normalized_base_url", "") or "")
+        + " | oanda_endpoint="
+        + str(oanda_endpoint_check.get("normalized_rest_url", "") or "")
+    )
     summary_lines.append(f"hub_dir={hub_dir}")
     summary_lines.append(
         f"runner={'ACTIVE' if runner_alive else 'INACTIVE'}"
@@ -322,6 +392,7 @@ def build_preflight_report(project_dir: str, now_ts: int | None = None) -> Dict[
             else " | market_loop_age_s=N/A"
         )
     )
+    summary_lines.append(f"shadow_scorecards: stocks={stock_gate} forex={forex_gate}")
     summary_lines.append(f"issues: critical={critical_count} warning={warning_count}")
 
     return {
@@ -359,6 +430,10 @@ def build_preflight_report(project_dir: str, now_ts: int | None = None) -> Dict[
             "ai_assist_openai_ok": bool(openai_ok),
             "key_permission_issues": list(perm_issues),
             "key_rotation_issues": list(rotation_issues),
+        },
+        "endpoint_validation": {
+            "alpaca": alpaca_endpoint_check,
+            "oanda": oanda_endpoint_check,
         },
         "issues": issues,
         "counts": {"critical": int(critical_count), "warning": int(warning_count)},

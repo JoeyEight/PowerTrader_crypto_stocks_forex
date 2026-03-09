@@ -327,7 +327,9 @@ def _build_ticket(row: Dict[str, Any], settings: Dict[str, Any], seq: int) -> Di
             "ts": int(now),
         },
     }
-    _attach_proposal_meta(ticket, ticket.get("proposal", {}) if isinstance(ticket.get("proposal", {}), dict) else {})
+    proposal = ticket.get("proposal", {})
+    proposal_meta = proposal if isinstance(proposal, dict) else {}
+    _attach_proposal_meta(ticket, proposal_meta)
     return ticket
 
 
@@ -551,7 +553,7 @@ def _iter_repo_files(max_files: int = 500) -> List[str]:
 
 
 def _file_snippet_hits(rel_path: str, keywords: List[str], max_snips: int = 3) -> Dict[str, Any]:
-    out = {"path": rel_path, "keyword_hits": [], "snippets": []}
+    out: Dict[str, Any] = {"path": rel_path, "keyword_hits": [], "snippets": []}
     if not rel_path:
         return out
     abs_path = os.path.join(BASE_DIR, rel_path)
@@ -778,18 +780,44 @@ def _llm_apply_block_reason(llm: Dict[str, Any]) -> str:
     return ""
 
 
+def _llm_no_patch_reason(llm: Dict[str, Any]) -> str:
+    reason = _llm_apply_block_reason(llm if isinstance(llm, dict) else {})
+    if reason:
+        return reason
+    row = llm if isinstance(llm, dict) else {}
+    err = str(row.get("error", "") or "").strip().lower()
+    detail = str(row.get("detail", "") or "").strip().lower()
+    used = bool(row.get("used", False))
+    ok = bool(row.get("ok", False))
+    if ("model_output_not_json" in err) or ("invalid_json_response" in err):
+        return "llm_output_invalid"
+    if ("http_5" in err) or ("service unavailable" in detail):
+        return "llm_service_unavailable"
+    if ("timeout" in err) or ("timed out" in err) or ("timed out" in detail):
+        return "llm_timeout"
+    if used and (not ok):
+        return "llm_no_patch_generated"
+    return ""
+
+
 def _terminal_request_block_reason(llm: Dict[str, Any], settings: Dict[str, Any]) -> str:
-    reason = _llm_apply_block_reason(llm)
+    reason = _llm_no_patch_reason(llm)
     if not reason:
         return ""
     block_quota = bool(settings.get("autofix_request_block_on_quota", True))
     block_missing_key = bool(settings.get("autofix_request_block_on_missing_key", True))
     block_bad_request = bool(settings.get("autofix_request_block_on_bad_request", True))
+    block_invalid_output = bool(settings.get("autofix_request_block_on_invalid_output", True))
+    block_no_patch = bool(settings.get("autofix_request_block_on_no_patch", True))
     if reason == "llm_quota_blocked" and block_quota:
         return reason
     if reason == "missing_openai_api_key" and block_missing_key:
         return reason
     if reason == "llm_request_rejected" and block_bad_request:
+        return reason
+    if reason == "llm_output_invalid" and block_invalid_output:
+        return reason
+    if reason == "llm_no_patch_generated" and block_no_patch:
         return reason
     return ""
 
@@ -816,12 +844,20 @@ def _request_retry_terminal_block_reason(row: Dict[str, Any], settings: Dict[str
             fallback_reason = "missing_openai_api_key"
         elif "llm_request_rejected" in base_reason:
             fallback_reason = "llm_request_rejected"
+        elif "llm_output_invalid" in base_reason:
+            fallback_reason = "llm_output_invalid"
+        elif ("llm_no_patch_generated" in base_reason) or ("missing_patch_file" in base_reason):
+            fallback_reason = "llm_no_patch_generated"
         if fallback_reason == "llm_quota_blocked":
             llm_reason = _terminal_request_block_reason({"error": "http_429", "detail": "insufficient_quota"}, settings)
         elif fallback_reason == "missing_openai_api_key":
             llm_reason = _terminal_request_block_reason({"error": "missing_openai_api_key", "detail": ""}, settings)
         elif fallback_reason == "llm_request_rejected":
             llm_reason = _terminal_request_block_reason({"error": "http_400", "detail": ""}, settings)
+        elif fallback_reason == "llm_output_invalid":
+            llm_reason = _terminal_request_block_reason({"error": "model_output_not_json", "detail": ""}, settings)
+        elif fallback_reason == "llm_no_patch_generated":
+            llm_reason = _terminal_request_block_reason({"used": True, "ok": False, "error": "", "detail": ""}, settings)
     if llm_reason:
         return f"{llm_reason}_retries_exhausted"
     return ""
@@ -1044,6 +1080,229 @@ def apply_ticket_once(ticket_id: str, force: bool = False, dry_run: bool = False
     return out
 
 
+def retry_ticket_once(ticket_id: str, auto_apply: bool = False, force: bool = False, dry_run: bool = False) -> Dict[str, Any]:
+    tid = str(ticket_id or "").strip()
+    now = int(time.time())
+    settings, settings_path = _load_settings()
+    out: Dict[str, Any] = {
+        "ticket_id": tid,
+        "ok": False,
+        "reason": "",
+        "status": "open",
+        "proposal_ok": False,
+        "applied": False,
+        "apply_reason": "",
+        "settings_path": settings_path,
+        "ts": now,
+    }
+    if not tid:
+        out["reason"] = "missing_ticket_id"
+        return out
+
+    ticket, ticket_path = _load_ticket(tid)
+    if not ticket:
+        out["reason"] = "ticket_not_found"
+        out["ticket_path"] = ticket_path
+        return out
+    out["ticket_path"] = ticket_path
+
+    cls = ticket.get("classifier", {}) if isinstance(ticket.get("classifier", {}), dict) else {}
+    if str(cls.get("kind", "") or "").strip().lower() != "user_request":
+        out["reason"] = "retry_supported_only_user_request"
+        out["status"] = str(ticket.get("status", "open") or "open")
+        return out
+
+    current_status = str(ticket.get("status", "open") or "open").strip().lower()
+    if current_status == "applied" and (not bool(force)):
+        out["ok"] = True
+        out["reason"] = "already_applied"
+        out["status"] = "applied"
+        out["applied"] = True
+        out["apply_reason"] = "already_applied"
+        return out
+
+    proposal = ticket.get("proposal", {}) if isinstance(ticket.get("proposal", {}), dict) else {}
+    llm = _llm_patch_proposal(ticket, settings)
+    proposal["llm"] = llm
+    if bool(llm.get("ok", False)):
+        patch_path_new = _write_patch(tid, str(llm.get("diff", "") or ""))
+        proposal["patch_diff_path"] = patch_path_new
+        if isinstance(llm.get("target_files", []), list) and llm.get("target_files", []):
+            proposal["target_files"] = list(llm.get("target_files", []))
+        if isinstance(llm.get("tests", []), list) and llm.get("tests", []):
+            proposal["recommended_tests"] = list(llm.get("tests", []))
+        if str(llm.get("summary", "") or "").strip():
+            proposal["summary"] = str(llm.get("summary", "") or "").strip()
+    ticket["proposal"] = proposal
+    _attach_proposal_meta(
+        ticket,
+        {
+            "target_files": proposal.get("target_files", []) if isinstance(proposal.get("target_files", []), list) else [],
+            "diff": str(llm.get("diff", "") or ""),
+        },
+    )
+
+    state = _safe_read_json(AUTOFIX_STATE_PATH)
+    day_key = time.strftime("%Y-%m-%d", time.localtime(now))
+    state_day = str(state.get("applied_day", "") or "")
+    applied_count_day = int(state.get("applied_count_day", 0) or 0) if state_day == day_key else 0
+
+    req = ticket.get("request", {}) if isinstance(ticket.get("request", {}), dict) else {}
+    auto_apply_requested = bool(auto_apply) or bool(req.get("auto_apply_requested", False))
+    force_apply_requested = bool(force) or bool(req.get("force_apply_requested", False)) or bool(auto_apply_requested)
+    patch_path = _resolve_patch_path(ticket, tid)
+    llm_no_patch_reason = _llm_no_patch_reason(llm)
+
+    applied_ok = False
+    apply_attempted = False
+    apply_reason = "awaiting_manual_approval"
+    if auto_apply_requested:
+        can_apply, gate_reason = _can_apply(settings, applied_count_day=applied_count_day, manual_override=True)
+        if bool(dry_run):
+            apply_reason = "dry_run"
+        elif not patch_path:
+            apply_reason = str(llm_no_patch_reason or "missing_patch_file")
+        elif (not can_apply) and (not force_apply_requested):
+            apply_reason = str(gate_reason)
+        else:
+            apply_out = _apply_patch(tid, patch_path, settings)
+            apply_attempted = bool(apply_out.get("attempted", False))
+            ticket["apply"] = dict(apply_out if isinstance(apply_out, dict) else {})
+            ticket["apply"]["approved_manual"] = False
+            ticket["apply"]["requested_auto_apply"] = True
+            ticket["apply"]["ts"] = int(time.time())
+            if bool(ticket["apply"].get("ok", False)):
+                ticket["status"] = "applied"
+                applied_ok = True
+                applied_count_day = int(applied_count_day) + 1
+                apply_reason = str(ticket["apply"].get("reason", "") or "applied")
+            else:
+                ticket["status"] = "open"
+                apply_reason = str(ticket["apply"].get("reason", "") or "apply_failed")
+    elif not patch_path:
+        apply_reason = str(llm_no_patch_reason or "missing_patch_file")
+
+    apply_row = ticket.get("apply", {}) if isinstance(ticket.get("apply", {}), dict) else {}
+    apply_row["attempted"] = bool(apply_attempted)
+    apply_row["ok"] = bool(applied_ok)
+    apply_row["reason"] = str(apply_reason)
+    apply_row["ts"] = int(now)
+    apply_row["approved_manual"] = False
+    apply_row["requested_auto_apply"] = bool(auto_apply_requested)
+    ticket["apply"] = apply_row
+
+    retry_max_attempts = _request_retry_max_attempts_from_settings(settings)
+    retry_row = ticket.get("request_retry", {}) if isinstance(ticket.get("request_retry", {}), dict) else {}
+    try:
+        retry_attempts_prev = int(float(retry_row.get("attempts", 0) or 0))
+    except Exception:
+        retry_attempts_prev = 0
+    retry_attempts_now = max(1, int(retry_attempts_prev + 1))
+    try:
+        retry_cooldown_s = max(15, int(float(settings.get("autofix_request_retry_cooldown_s", 90) or 90)))
+    except Exception:
+        retry_cooldown_s = 90
+    retry_delay_s = _retry_delay_for_llm_error(llm, retry_cooldown_s)
+    ticket["request_retry"] = {
+        "attempts": int(retry_attempts_now),
+        "last_ts": int(now),
+        "last_error": str(llm.get("error", "") or ""),
+        "next_retry_ts": int(now + retry_delay_s),
+    }
+
+    terminal_block_reason = ""
+    if not applied_ok:
+        terminal_block_reason = _terminal_request_block_reason(llm, settings)
+    if terminal_block_reason and (terminal_block_reason not in {"llm_output_invalid", "llm_no_patch_generated"}):
+        ticket = _mark_request_ticket_blocked(
+            ticket,
+            terminal_block_reason,
+            now_ts=now,
+            retry_max_attempts=retry_max_attempts,
+        )
+        apply_reason = str(terminal_block_reason)
+    elif terminal_block_reason and (retry_attempts_now >= retry_max_attempts):
+        ticket = _mark_request_ticket_blocked(
+            ticket,
+            f"{terminal_block_reason}_retries_exhausted",
+            now_ts=now,
+            retry_max_attempts=retry_max_attempts,
+        )
+        apply_reason = str((ticket.get("blocked", {}) if isinstance(ticket.get("blocked", {}), dict) else {}).get("reason", ""))
+    elif not applied_ok:
+        ticket["status"] = "open"
+
+    apply_row = ticket.get("apply", {}) if isinstance(ticket.get("apply", {}), dict) else {}
+    apply_row["reason"] = str(apply_reason)
+    apply_row["ok"] = bool(applied_ok)
+    apply_row["attempted"] = bool(apply_attempted)
+    apply_row["ts"] = int(now)
+    apply_row["approved_manual"] = False
+    apply_row["requested_auto_apply"] = bool(auto_apply_requested)
+    ticket["apply"] = apply_row
+
+    if not bool(dry_run):
+        _atomic_write_json(ticket_path, ticket)
+        runtime_event(
+            RUNTIME_EVENTS_PATH,
+            component="autofix",
+            event="autofix_ticket_retry",
+            level=("warning" if bool(applied_ok) else "info"),
+            msg=f"ticket {tid} retry requested",
+            details={
+                "ticket_id": tid,
+                "proposal_ok": bool(llm.get("ok", False)),
+                "applied": bool(applied_ok),
+                "apply_reason": str(apply_reason),
+                "llm_error": str(llm.get("error", "") or ""),
+            },
+        )
+
+        state_out = {
+            "ts": int(time.time()),
+            "settings_path": settings_path,
+            "incidents_offset": int(state.get("incidents_offset", 0) or 0),
+            "recent_fingerprints": list(state.get("recent_fingerprints", []) or [])[-MAX_RECENT_FINGERPRINTS:],
+            "applied_day": day_key,
+            "applied_count_day": int(applied_count_day),
+            "last_ticket_id": tid,
+            "enabled": bool(settings.get("autofix_enabled", True)),
+            "mode": str(settings.get("autofix_mode", "report_only") or "report_only"),
+            "created_count_total": int(state.get("created_count_total", 0) or 0),
+        }
+        _atomic_write_json(AUTOFIX_STATE_PATH, state_out)
+
+        status_prev = _safe_read_json(AUTOFIX_STATUS_PATH)
+        if not isinstance(status_prev, dict):
+            status_prev = {}
+        status_prev["ts"] = int(time.time())
+        status_prev["settings_path"] = settings_path
+        status_prev["enabled"] = bool(settings.get("autofix_enabled", True))
+        status_prev["mode"] = str(settings.get("autofix_mode", "report_only") or "report_only")
+        status_prev["last_ticket_id"] = tid
+        status_prev["applied_count_day"] = int(applied_count_day)
+        status_prev["ticket_counts"] = _ticket_counts()
+        status_prev["api_key_configured"] = bool(_resolve_openai_api_key(settings))
+        _atomic_write_json(AUTOFIX_STATUS_PATH, status_prev)
+
+    out["ok"] = True
+    out["reason"] = "retry_completed"
+    out["status"] = str(ticket.get("status", "open") or "open")
+    out["proposal_ok"] = bool(llm.get("ok", False))
+    out["llm_error"] = str(llm.get("error", "") or "")
+    out["llm_detail"] = str(llm.get("detail", "") or "")[:600]
+    out["apply_reason"] = str(apply_reason)
+    out["applied"] = bool(applied_ok)
+    out["auto_apply_requested"] = bool(auto_apply_requested)
+    out["force_apply_requested"] = bool(force_apply_requested)
+    out["dry_run"] = bool(dry_run)
+    out["patch_path"] = str(_resolve_patch_path(ticket, tid) or "")
+    out["blocked_reason"] = str(
+        ((ticket.get("blocked", {}) if isinstance(ticket.get("blocked", {}), dict) else {}).get("reason", "") or "")
+    )
+    return out
+
+
 def _apply_patch(ticket_id: str, patch_path: str, settings: Dict[str, Any]) -> Dict[str, Any]:
     out: Dict[str, Any] = {"attempted": True, "ok": False, "reason": "unknown", "ts": int(time.time())}
     if not os.path.isfile(patch_path):
@@ -1244,11 +1503,11 @@ def _retry_open_user_request_tickets(
         apply_reason = "awaiting_manual_approval"
         apply_attempted = False
         applied_ok = False
+        llm_no_patch_reason = _llm_no_patch_reason(llm)
         if auto_apply_requested:
             can_apply, gate_reason = _can_apply(settings, applied_count_day=applied_count_day, manual_override=True)
-            llm_block_reason = _llm_apply_block_reason(llm)
             if not patch_path:
-                apply_reason = (llm_block_reason or "missing_patch_file")
+                apply_reason = (llm_no_patch_reason or "missing_patch_file")
             elif (not can_apply) and (not force_apply_requested):
                 apply_reason = gate_reason
             else:
@@ -1267,6 +1526,8 @@ def _retry_open_user_request_tickets(
                 else:
                     row["status"] = "open"
                     apply_reason = str(row["apply"].get("reason", "") or "apply_failed")
+        elif not patch_path:
+            apply_reason = str(llm_no_patch_reason or "missing_patch_file")
         apply_row = row.get("apply", {}) if isinstance(row.get("apply", {}), dict) else {}
         apply_row["attempted"] = bool(apply_attempted)
         apply_row["ok"] = bool(applied_ok)
@@ -1425,7 +1686,7 @@ def create_request_ticket(
     applied_count_day = int(state.get("applied_count_day", 0) or 0) if state_day == day_key else 0
     can_apply, gate_reason = _can_apply(settings, applied_count_day=applied_count_day, manual_override=True)
     patch_path = _resolve_patch_path(ticket, str(ticket.get("id", "") or ""))
-    llm_block_reason = _llm_apply_block_reason(llm)
+    llm_no_patch_reason = _llm_no_patch_reason(llm)
 
     applied_ok = False
     apply_reason = "awaiting_manual_approval"
@@ -1434,7 +1695,7 @@ def create_request_ticket(
         if bool(dry_run):
             apply_reason = "dry_run"
         elif (not patch_path):
-            apply_reason = (llm_block_reason or "missing_patch_file")
+            apply_reason = (llm_no_patch_reason or "missing_patch_file")
         elif (not can_apply) and (not bool(force_apply)):
             apply_reason = gate_reason
         else:
@@ -1452,12 +1713,12 @@ def create_request_ticket(
             else:
                 ticket["status"] = "open"
                 apply_reason = str(ticket["apply"].get("reason", "") or "apply_failed")
-    elif (not patch_path) and llm_block_reason:
-        apply_reason = str(llm_block_reason)
+    elif (not patch_path):
+        apply_reason = str(llm_no_patch_reason or "missing_patch_file")
     current_apply = ticket.get("apply", {}) if isinstance(ticket.get("apply", {}), dict) else {}
     if (not bool(current_apply.get("attempted", False))) and str(current_apply.get("reason", "") or "").strip():
         # Preserve existing explicit reasons only when this request did not run auto-apply.
-        if (not bool(auto_apply)) and (not llm_block_reason):
+        if (not bool(auto_apply)) and (not llm_no_patch_reason):
             apply_reason = str(current_apply.get("reason", "") or apply_reason)
     ticket["apply"] = {
         "attempted": bool(apply_attempted),
@@ -1471,8 +1732,9 @@ def create_request_ticket(
     terminal_block_reason = ""
     if not applied_ok:
         terminal_block_reason = _terminal_request_block_reason(llm, settings)
-    if terminal_block_reason:
-        retry_max_attempts = _request_retry_max_attempts_from_settings(settings)
+    retry_max_attempts = _request_retry_max_attempts_from_settings(settings)
+    retry_needs_backoff = bool(not applied_ok) and bool(not patch_path) and bool(llm_no_patch_reason) and (not bool(dry_run))
+    if terminal_block_reason and (terminal_block_reason not in {"llm_output_invalid", "llm_no_patch_generated"}):
         ticket["request_retry"] = {
             "attempts": 1,
             "last_ts": int(now),
@@ -1486,6 +1748,23 @@ def create_request_ticket(
             retry_max_attempts=retry_max_attempts,
         )
         apply_reason = str(terminal_block_reason)
+    elif retry_needs_backoff:
+        try:
+            retry_cooldown_s = max(15, int(float(settings.get("autofix_request_retry_cooldown_s", 90) or 90)))
+        except Exception:
+            retry_cooldown_s = 90
+        retry_delay_s = _retry_delay_for_llm_error(llm, retry_cooldown_s)
+        ticket["request_retry"] = {
+            "attempts": 1,
+            "last_ts": int(now),
+            "last_error": str(llm.get("error", "") or ""),
+            "next_retry_ts": int(now + retry_delay_s),
+        }
+        apply_reason = str(llm_no_patch_reason or apply_reason)
+        apply_row = ticket.get("apply", {}) if isinstance(ticket.get("apply", {}), dict) else {}
+        apply_row["reason"] = str(apply_reason)
+        apply_row["ts"] = int(now)
+        ticket["apply"] = apply_row
 
     ticket_path = os.path.join(AUTOFIX_TICKETS_DIR, f"{str(ticket.get('id', '') or '').strip()}.json")
     if not dry_run:
@@ -1726,9 +2005,11 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="PowerTrader runtime autofix overseer.")
     ap.add_argument("--once", action="store_true")
     ap.add_argument("--apply-ticket", default="")
+    ap.add_argument("--retry-ticket", default="")
     ap.add_argument("--request-text", default="")
     ap.add_argument("--request-file", default="")
     ap.add_argument("--request-auto-apply", action="store_true")
+    ap.add_argument("--retry-auto-apply", action="store_true")
     ap.add_argument("--force-apply", action="store_true")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
@@ -1789,6 +2070,25 @@ def main() -> int:
             return 0
         return 1
 
+    if str(args.retry_ticket or "").strip():
+        out = retry_ticket_once(
+            str(args.retry_ticket or "").strip(),
+            auto_apply=bool(args.retry_auto_apply),
+            force=bool(args.force_apply),
+            dry_run=bool(args.dry_run),
+        )
+        print(json.dumps(out, indent=2))
+        _log(
+            "retry-ticket "
+            f"ticket={out.get('ticket_id')} "
+            f"status={out.get('status')} "
+            f"proposal_ok={out.get('proposal_ok')} "
+            f"applied={out.get('applied')} "
+            f"apply_reason={out.get('apply_reason')} "
+            f"llm_error={out.get('llm_error')}"
+        )
+        return 0 if bool(out.get("ok", False)) else 1
+
     if args.once:
         out = run_once(dry_run=bool(args.dry_run))
         _log(
@@ -1807,7 +2107,12 @@ def main() -> int:
             break
         try:
             out = run_once(dry_run=bool(args.dry_run))
-            sleep_s = max(5.0, float(out.get("poll_interval_s", 45.0) or 45.0))
+            try:
+                poll_raw = out.get("poll_interval_s", 45.0) if isinstance(out, dict) else 45.0
+                poll_interval_s = float(str(poll_raw or 45.0))
+            except Exception:
+                poll_interval_s = 45.0
+            sleep_s = max(5.0, poll_interval_s)
             _log(
                 "tick "
                 f"enabled={out.get('enabled')} "

@@ -16,6 +16,7 @@ from app.credential_utils import get_oanda_creds
 from app.http_utils import retry_after_from_urllib_http_error
 from app.market_awareness import forex_session_bias
 from app.path_utils import resolve_runtime_paths
+from app.rejection_replay import recommend_threshold_from_scores, replay_target_entries_for_market
 from app.scan_diagnostics_schema import with_scan_schema
 from app.scanner_quality import build_universe_quality_report, quality_hints, turnover_pct
 from brokers.broker_oanda import OandaBrokerClient
@@ -604,6 +605,7 @@ def _cached_scan_fallback(
         if sh and sh not in hints:
             hints.append(sh)
 
+    prev_adaptive = float(prev.get("adaptive_threshold", 0.2) or 0.2)
     return {
         "state": "READY",
         "ai_state": "Scan degraded (cached)",
@@ -614,7 +616,15 @@ def _cached_scan_fallback(
         "top_pick": (top_pick if top_pick else (leaders[0] if leaders and isinstance(leaders[0], dict) else None)),
         "top_chart": top_chart[-120:],
         "top_chart_map": top_chart_map,
-        "adaptive_threshold": float(prev.get("adaptive_threshold", 0.2) or 0.2),
+        "adaptive_threshold": float(prev_adaptive),
+        "adaptive_threshold_base": float(prev.get("adaptive_threshold_base", prev_adaptive) or prev_adaptive),
+        "adaptive_threshold_volatility": float(prev.get("adaptive_threshold_volatility", prev_adaptive) or prev_adaptive),
+        "adaptive_threshold_replay_recommended": float(prev.get("adaptive_threshold_replay_recommended", prev_adaptive) or prev_adaptive),
+        "adaptive_threshold_replay_clamped": float(prev.get("adaptive_threshold_replay_clamped", prev_adaptive) or prev_adaptive),
+        "adaptive_threshold_replay_weight": float(prev.get("adaptive_threshold_replay_weight", 0.0) or 0.0),
+        "adaptive_threshold_replay_target_entries": int(prev.get("adaptive_threshold_replay_target_entries", 0) or 0),
+        "adaptive_threshold_replay_reason": str(prev.get("adaptive_threshold_replay_reason", "") or ""),
+        "adaptive_threshold_replay_enabled": bool(prev.get("adaptive_threshold_replay_enabled", False)),
         "updated_at": int(ts_now),
         "rejected": list(prev.get("rejected", []) or [])[:30],
         "reject_summary": (dict(prev.get("reject_summary", {})) if isinstance(prev.get("reject_summary", {}), dict) else {}),
@@ -1235,7 +1245,36 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
         vols = [float(r.get("volatility_pct", 0.0) or 0.0) for r in scored if float(r.get("volatility_pct", 0.0) or 0.0) > 0]
         vol_med = (sorted(vols)[len(vols) // 2] if vols else 0.0)
         base_thr = max(0.02, float(settings.get("forex_score_threshold", 0.2) or 0.2))
-        adaptive_threshold = round(base_thr * (1.20 if vol_med >= 0.12 else 1.0), 4)
+        volatility_threshold = float(round(base_thr * (1.20 if vol_med >= 0.12 else 1.0), 6))
+        replay_enabled = bool(settings.get("forex_replay_adaptive_enabled", True))
+        replay_weight = max(0.0, min(1.0, float(settings.get("forex_replay_adaptive_weight", 0.35) or 0.35)))
+        replay_step_cap_pct = max(5.0, min(90.0, float(settings.get("forex_replay_adaptive_step_cap_pct", 40.0) or 40.0)))
+        replay_target_entries = replay_target_entries_for_market(settings, "forex")
+        replay_recommended = float(volatility_threshold)
+        replay_clamped = float(volatility_threshold)
+        replay_reason = ""
+        if replay_enabled and scored:
+            replay_payload = recommend_threshold_from_scores(
+                scored,
+                market="forex",
+                current_threshold=volatility_threshold,
+                target_entries=replay_target_entries,
+            )
+            replay_rec = replay_payload.get("recommendation", {}) if isinstance(replay_payload.get("recommendation", {}), dict) else {}
+            replay_recommended = max(0.01, float(replay_rec.get("recommended_threshold", volatility_threshold) or volatility_threshold))
+            replay_reason = str(replay_rec.get("reason", "") or "")
+            max_step = max(base_thr * 0.05, volatility_threshold * (replay_step_cap_pct / 100.0))
+            replay_min = max(0.01, volatility_threshold - max_step)
+            replay_max = volatility_threshold + max_step
+            replay_clamped = min(replay_max, max(replay_min, replay_recommended))
+        effective_weight = replay_weight if replay_enabled else 0.0
+        adaptive_threshold = round(
+            max(
+                0.01,
+                ((1.0 - effective_weight) * volatility_threshold) + (effective_weight * replay_clamped),
+            ),
+            4,
+        )
         top_pair = str((top_pick or {}).get("pair", "") or "").strip().upper()
         chart_seed: List[Dict[str, Any]] = []
         if isinstance(top_pick, dict):
@@ -1308,6 +1347,14 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
                 "session_weighted_candidates": int(session_weighted_candidates),
                 "quality_summary": str(quality_report.get("summary", "") or ""),
                 "event_context": dict(event_context),
+                "adaptive_threshold_base": float(base_thr),
+                "adaptive_threshold_volatility": float(round(volatility_threshold, 6)),
+                "adaptive_threshold_replay_recommended": float(round(replay_recommended, 6)),
+                "adaptive_threshold_replay_clamped": float(round(replay_clamped, 6)),
+                "adaptive_threshold_replay_weight": float(round(effective_weight, 4)),
+                "adaptive_threshold_replay_target_entries": int(replay_target_entries),
+                "adaptive_threshold_replay_reason": str(replay_reason),
+                "adaptive_threshold_replay_enabled": bool(replay_enabled),
             },
         )
         _save_json_map(_pair_cooldown_path(hub_dir), {"ts": int(time.time()), "pairs": cooldown_map})
@@ -1321,6 +1368,11 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
         for h in quality_hints(quality_report):
             if h not in hints:
                 hints.append(h)
+        if replay_enabled:
+            hints.append(
+                f"Adaptive threshold {volatility_threshold:.3f} -> {adaptive_threshold:.3f} "
+                f"(replay target {int(replay_target_entries)})."
+            )
         if event_risk_active_count > 0:
             hints.append(f"Macro-event risk filter active on {event_risk_active_count} pair(s).")
         if str(event_context.get("state", "") or "") in {"unavailable", "cooldown"}:
@@ -1336,6 +1388,14 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
             "top_chart": top_chart,
             "top_chart_map": top_chart_map,
             "adaptive_threshold": adaptive_threshold,
+            "adaptive_threshold_base": float(base_thr),
+            "adaptive_threshold_volatility": float(round(volatility_threshold, 6)),
+            "adaptive_threshold_replay_recommended": float(round(replay_recommended, 6)),
+            "adaptive_threshold_replay_clamped": float(round(replay_clamped, 6)),
+            "adaptive_threshold_replay_weight": float(round(effective_weight, 4)),
+            "adaptive_threshold_replay_target_entries": int(replay_target_entries),
+            "adaptive_threshold_replay_reason": str(replay_reason),
+            "adaptive_threshold_replay_enabled": bool(replay_enabled),
             "updated_at": ts_now,
             "rejected": rejected[:30],
             "reject_summary": reject_summary,

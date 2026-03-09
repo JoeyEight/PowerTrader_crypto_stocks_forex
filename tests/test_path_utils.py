@@ -84,6 +84,16 @@ class TestPathUtils(unittest.TestCase):
             path_utils.log_throttled(key, "hello", cooldown_s=1.0)
         self.assertEqual(mock_print.call_count, 2)
 
+    def test_read_settings_file_recovers_partial_json(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "gui_settings.json")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write('{\"coins\":[\"BTC\"],\"stock_auto_trade_enabled\":true}\\ngarbage-tail')
+            out = path_utils.read_settings_file(path, module_name="unit_test")
+            self.assertTrue(isinstance(out, dict))
+            self.assertEqual(list(out.get("coins", []) or []), ["BTC"])
+            self.assertTrue(bool(out.get("stock_auto_trade_enabled", False)))
+
 
 if __name__ == "__main__":
     unittest.main()

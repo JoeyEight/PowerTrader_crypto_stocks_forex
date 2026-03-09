@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from typing import Any, Dict, List, Tuple
 
+from app.api_endpoint_validation import normalize_endpoint_url
 from app.backoff_policy import BackoffPolicy
 from app.http_utils import retry_after_from_urllib_http_error
 
@@ -18,8 +20,10 @@ class AlpacaBrokerClient:
     def __init__(self, api_key_id: str, secret_key: str, base_url: str, data_url: str = "https://data.alpaca.markets") -> None:
         self.api_key_id = str(api_key_id or "").strip()
         self.secret_key = str(secret_key or "").strip()
-        self.base_url = str(base_url or "").strip().rstrip("/")
-        self.data_url = str(data_url or "").strip().rstrip("/")
+        norm_base, base_ok, _ = normalize_endpoint_url(base_url, default="https://paper-api.alpaca.markets")
+        norm_data, data_ok, _ = normalize_endpoint_url(data_url, default="https://data.alpaca.markets")
+        self.base_url = str((norm_base if base_ok else "https://paper-api.alpaca.markets") or "").strip().rstrip("/")
+        self.data_url = str((norm_data if data_ok else "https://data.alpaca.markets") or "").strip().rstrip("/")
 
     def configured(self) -> bool:
         return bool(self.api_key_id and self.secret_key and self.base_url)
@@ -30,23 +34,89 @@ class AlpacaBrokerClient:
             "APCA-API-SECRET-KEY": self.secret_key,
         }
 
-    def _request_json(self, path: str, timeout: float = 8.0) -> Any:
+    @staticmethod
+    def _retryable_http(code: int) -> bool:
+        return int(code or 0) in {408, 425, 429, 500, 502, 503, 504}
+
+    @staticmethod
+    def _feed_candidates(feed: str) -> List[str]:
+        f = str(feed or "iex").strip().lower() or "iex"
+        out: List[str] = []
+        for candidate in (f, "iex"):
+            name = str(candidate or "").strip().lower()
+            if name and name not in out:
+                out.append(name)
+        return out or ["iex"]
+
+    @staticmethod
+    def _is_feed_permission_error(exc: urllib.error.HTTPError) -> bool:
+        try:
+            code = int(getattr(exc, "code", 0) or 0)
+        except Exception:
+            code = 0
+        if code not in {400, 401, 403, 422}:
+            return False
+        parts = [str(exc or "")]
+        try:
+            reader = getattr(exc, "read", None)
+            if callable(reader):
+                raw = reader()
+                if isinstance(raw, bytes):
+                    parts.append(raw.decode("utf-8", errors="ignore")[:2000])
+                elif isinstance(raw, str):
+                    parts.append(raw[:2000])
+        except Exception:
+            pass
+        txt = " ".join(parts).lower()
+        needles = ("subscription", "entitlement", "forbidden", "not allowed", "unauthorized", "permission", "feed")
+        return any(tok in txt for tok in needles)
+
+    def _open_with_retry(self, req: urllib.request.Request, timeout: float, max_attempts: int = 3) -> str:
+        attempts = max(1, int(max_attempts or 1))
+        backoff = BackoffPolicy(base_delay_s=0.2, max_delay_s=8.0, jitter_s=0.25, max_retry_after_s=300.0)
+        last_exc: Exception | None = None
+        for att in range(1, attempts + 1):
+            retry_after_s = 0.0
+            try:
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    body = resp.read()
+                    if isinstance(body, bytes):
+                        return body.decode("utf-8")
+                    return str(body or "")
+            except urllib.error.HTTPError as exc:
+                last_exc = exc
+                retry_after_s = _retry_after_seconds_from_http_error(exc)
+                if (not self._retryable_http(int(getattr(exc, "code", 0) or 0))) or att >= attempts:
+                    raise
+            except urllib.error.URLError as exc:
+                last_exc = exc
+                if att >= attempts:
+                    raise
+            except Exception as exc:
+                last_exc = exc
+                if att >= attempts:
+                    raise
+            wait_s = backoff.wait_seconds(att, retry_after_s=retry_after_s)
+            time.sleep(wait_s)
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError("Alpaca request failed")
+
+    def _request_json(self, path: str, timeout: float = 8.0, max_attempts: int = 3) -> Any:
         req = urllib.request.Request(f"{self.base_url}{path}", headers=self._headers())
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            raw = resp.read().decode("utf-8")
+        raw = self._open_with_retry(req, timeout=timeout, max_attempts=max_attempts)
         if not raw:
             return {}
         return json.loads(raw)
 
-    def _request(self, path: str, method: str = "GET", payload: Any = None, timeout: float = 8.0) -> Any:
+    def _request(self, path: str, method: str = "GET", payload: Any = None, timeout: float = 8.0, max_attempts: int = 1) -> Any:
         body = None
         headers = self._headers()
         if payload is not None:
             headers["Content-Type"] = "application/json"
             body = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(f"{self.base_url}{path}", data=body, headers=headers, method=method.upper())
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            raw = resp.read().decode("utf-8")
+        raw = self._open_with_retry(req, timeout=timeout, max_attempts=max_attempts)
         if not raw:
             return {}
         try:
@@ -54,10 +124,10 @@ class AlpacaBrokerClient:
         except Exception:
             return {}
 
-    def _request_data_json(self, path: str, timeout: float = 8.0) -> Dict[str, Any]:
+    def _request_data_json(self, path: str, timeout: float = 8.0, max_attempts: int = 3) -> Dict[str, Any]:
         req = urllib.request.Request(f"{self.data_url}{path}", headers=self._headers())
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            payload = json.loads(resp.read().decode("utf-8"))
+        raw = self._open_with_retry(req, timeout=timeout, max_attempts=max_attempts)
+        payload = json.loads(raw or "{}")
         return payload if isinstance(payload, dict) else {}
 
     def _latest_quotes(self, symbols: List[str], feed: str = "iex") -> Dict[str, Dict[str, Any]]:
@@ -65,17 +135,23 @@ class AlpacaBrokerClient:
         norm = [str(s or "").strip().upper() for s in symbols if str(s or "").strip()]
         if not norm:
             return out
-        try:
-            params = urllib.parse.urlencode({"symbols": ",".join(norm), "feed": feed})
-            payload = self._request_data_json(f"/v2/stocks/quotes/latest?{params}", timeout=10.0)
-            rows = payload.get("quotes", {}) or {}
-            if isinstance(rows, dict):
-                for sym, row in rows.items():
-                    key = str(sym or "").strip().upper()
-                    if key and isinstance(row, dict):
-                        out[key] = row
-        except Exception:
-            pass
+        for feed_name in self._feed_candidates(feed):
+            try:
+                params = urllib.parse.urlencode({"symbols": ",".join(norm), "feed": feed_name})
+                payload = self._request_data_json(f"/v2/stocks/quotes/latest?{params}", timeout=10.0)
+                rows = payload.get("quotes", {}) or {}
+                if isinstance(rows, dict):
+                    for sym, row in rows.items():
+                        key = str(sym or "").strip().upper()
+                        if key and isinstance(row, dict):
+                            out[key] = row
+                if out:
+                    return out
+            except urllib.error.HTTPError as exc:
+                if feed_name != "iex" and self._is_feed_permission_error(exc):
+                    continue
+            except Exception:
+                continue
         return out
 
     def _latest_trades(self, symbols: List[str], feed: str = "iex") -> Dict[str, Dict[str, Any]]:
@@ -83,17 +159,23 @@ class AlpacaBrokerClient:
         norm = [str(s or "").strip().upper() for s in symbols if str(s or "").strip()]
         if not norm:
             return out
-        try:
-            params = urllib.parse.urlencode({"symbols": ",".join(norm), "feed": feed})
-            payload = self._request_data_json(f"/v2/stocks/trades/latest?{params}", timeout=10.0)
-            rows = payload.get("trades", {}) or {}
-            if isinstance(rows, dict):
-                for sym, row in rows.items():
-                    key = str(sym or "").strip().upper()
-                    if key and isinstance(row, dict):
-                        out[key] = row
-        except Exception:
-            pass
+        for feed_name in self._feed_candidates(feed):
+            try:
+                params = urllib.parse.urlencode({"symbols": ",".join(norm), "feed": feed_name})
+                payload = self._request_data_json(f"/v2/stocks/trades/latest?{params}", timeout=10.0)
+                rows = payload.get("trades", {}) or {}
+                if isinstance(rows, dict):
+                    for sym, row in rows.items():
+                        key = str(sym or "").strip().upper()
+                        if key and isinstance(row, dict):
+                            out[key] = row
+                if out:
+                    return out
+            except urllib.error.HTTPError as exc:
+                if feed_name != "iex" and self._is_feed_permission_error(exc):
+                    continue
+            except Exception:
+                continue
         return out
 
     def test_connection(self) -> Tuple[bool, str]:
@@ -120,7 +202,7 @@ class AlpacaBrokerClient:
 
     def list_positions(self) -> List[Dict[str, Any]]:
         try:
-            rows = self._request("/v2/positions", method="GET")
+            rows = self._request("/v2/positions", method="GET", max_attempts=3)
             if isinstance(rows, list):
                 return [row for row in rows if isinstance(row, dict)]
         except Exception:
@@ -129,7 +211,12 @@ class AlpacaBrokerClient:
 
     def list_tradable_assets(self) -> List[Dict[str, Any]]:
         try:
-            rows = self._request("/v2/assets?status=active&asset_class=us_equity", method="GET", timeout=15.0)
+            rows = self._request(
+                "/v2/assets?status=active&asset_class=us_equity",
+                method="GET",
+                timeout=15.0,
+                max_attempts=3,
+            )
             if isinstance(rows, list):
                 return [row for row in rows if isinstance(row, dict)]
         except Exception:
@@ -144,8 +231,16 @@ class AlpacaBrokerClient:
         latest_quotes: Dict[str, Dict[str, Any]] = {}
         latest_trades: Dict[str, Dict[str, Any]] = {}
         try:
-            params = urllib.parse.urlencode({"symbols": ",".join(norm), "feed": feed})
-            payload = self._request_data_json(f"/v2/stocks/snapshots?{params}", timeout=12.0)
+            payload: Dict[str, Any] = {}
+            for feed_name in self._feed_candidates(feed):
+                try:
+                    params = urllib.parse.urlencode({"symbols": ",".join(norm), "feed": feed_name})
+                    payload = self._request_data_json(f"/v2/stocks/snapshots?{params}", timeout=12.0)
+                    break
+                except urllib.error.HTTPError as exc:
+                    if feed_name != "iex" and self._is_feed_permission_error(exc):
+                        continue
+                    raise
             snaps = payload.get("snapshots", {}) or {}
             if not isinstance(snaps, dict):
                 snaps = {}
@@ -229,30 +324,37 @@ class AlpacaBrokerClient:
             return []
         tf = str(timeframe or "1Hour").strip()
         lim = max(10, min(1000, int(limit or 120)))
-        try:
-            params_dict: Dict[str, str] = {
-                "symbols": sym,
-                "timeframe": tf,
-                "limit": str(lim),
-                "adjustment": "raw",
-                "feed": feed,
-                # Prefer latest bars for scanning; we normalize to chronological below.
-                "sort": "desc",
-            }
-            s = str(start_iso or "").strip()
-            e = str(end_iso or "").strip()
-            if s:
-                params_dict["start"] = s
-            if e:
-                params_dict["end"] = e
-            params = urllib.parse.urlencode(params_dict)
-            payload = self._request_data_json(f"/v2/stocks/bars?{params}", timeout=12.0)
-            bars = ((payload.get("bars", {}) or {}).get(sym, []) or [])
-            out = [row for row in bars if isinstance(row, dict)]
-            out.sort(key=lambda row: str(row.get("t", "") or ""))
-            return out
-        except Exception:
-            return []
+        s = str(start_iso or "").strip()
+        e = str(end_iso or "").strip()
+        for feed_name in self._feed_candidates(feed):
+            try:
+                params_dict: Dict[str, str] = {
+                    "symbols": sym,
+                    "timeframe": tf,
+                    "limit": str(lim),
+                    "adjustment": "raw",
+                    "feed": feed_name,
+                    # Prefer latest bars for scanning; we normalize to chronological below.
+                    "sort": "desc",
+                }
+                if s:
+                    params_dict["start"] = s
+                if e:
+                    params_dict["end"] = e
+                params = urllib.parse.urlencode(params_dict)
+                payload = self._request_data_json(f"/v2/stocks/bars?{params}", timeout=12.0)
+                bars = ((payload.get("bars", {}) or {}).get(sym, []) or [])
+                out = [row for row in bars if isinstance(row, dict)]
+                out.sort(key=lambda row: str(row.get("t", "") or ""))
+                if out:
+                    return out
+            except urllib.error.HTTPError as exc:
+                if feed_name != "iex" and self._is_feed_permission_error(exc):
+                    continue
+                return []
+            except Exception:
+                continue
+        return []
 
     def fetch_snapshot(self) -> Dict[str, Any]:
         if not self.configured():
@@ -343,40 +445,47 @@ class AlpacaBrokerClient:
         norm = [str(s or "").strip().upper() for s in symbols if str(s or "").strip()]
         if not norm:
             return out
-        try:
-            params = urllib.parse.urlencode({"symbols": ",".join(norm), "feed": feed})
-            payload = self._request_data_json(f"/v2/stocks/snapshots?{params}", timeout=10.0)
-            snaps = payload.get("snapshots", {}) or {}
-            if not isinstance(snaps, dict):
-                snaps = {}
-            for sym in norm:
-                row = snaps.get(sym, {}) or {}
-                trade = row.get("latestTrade", {}) or {}
-                quote = row.get("latestQuote", {}) or {}
-                px = 0.0
-                try:
-                    px = float(trade.get("p", 0.0) or 0.0)
-                except Exception:
+        for feed_name in self._feed_candidates(feed):
+            try:
+                params = urllib.parse.urlencode({"symbols": ",".join(norm), "feed": feed_name})
+                payload = self._request_data_json(f"/v2/stocks/snapshots?{params}", timeout=10.0)
+                snaps = payload.get("snapshots", {}) or {}
+                if not isinstance(snaps, dict):
+                    snaps = {}
+                for sym in norm:
+                    row = snaps.get(sym, {}) or {}
+                    trade = row.get("latestTrade", {}) or {}
+                    quote = row.get("latestQuote", {}) or {}
                     px = 0.0
-                if px <= 0:
                     try:
-                        bid = float(quote.get("bp", 0.0) or 0.0)
+                        px = float(trade.get("p", 0.0) or 0.0)
                     except Exception:
-                        bid = 0.0
-                    try:
-                        ask = float(quote.get("ap", 0.0) or 0.0)
-                    except Exception:
-                        ask = 0.0
-                    if bid > 0 and ask > 0:
-                        px = (bid + ask) * 0.5
-                    elif ask > 0:
-                        px = ask
-                    elif bid > 0:
-                        px = bid
-                if px > 0:
-                    out[sym] = px
-        except Exception:
-            pass
+                        px = 0.0
+                    if px <= 0:
+                        try:
+                            bid = float(quote.get("bp", 0.0) or 0.0)
+                        except Exception:
+                            bid = 0.0
+                        try:
+                            ask = float(quote.get("ap", 0.0) or 0.0)
+                        except Exception:
+                            ask = 0.0
+                        if bid > 0 and ask > 0:
+                            px = (bid + ask) * 0.5
+                        elif ask > 0:
+                            px = ask
+                        elif bid > 0:
+                            px = bid
+                    if px > 0:
+                        out[sym] = px
+                if out:
+                    return out
+            except urllib.error.HTTPError as exc:
+                if feed_name != "iex" and self._is_feed_permission_error(exc):
+                    continue
+                break
+            except Exception:
+                continue
         return out
 
     def place_market_order(

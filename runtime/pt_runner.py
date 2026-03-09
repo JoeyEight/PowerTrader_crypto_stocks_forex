@@ -17,9 +17,18 @@ from app.credential_utils import (
     key_rotation_reminder_issues,
 )
 from app.exposure_analytics import build_exposure_payload
+from app.feature_flags import build_feature_flag_snapshot
 from app.health_rules import evaluate_runtime_alerts
 from app.http_utils import parse_retry_after_value
+from app.notification_center import build_notification_center_payload
 from app.path_utils import read_settings_file, resolve_runtime_paths, resolve_settings_path
+from app.runtime_insights import (
+    build_broker_latency_histogram,
+    build_incident_trend,
+    build_pnl_decomposition,
+    detect_equity_anomaly,
+    detect_stale_history,
+)
 from app.runtime_logging import append_jsonl, atomic_write_json, cleanup_logs, runtime_event, trim_jsonl_max_lines
 from app.scan_diagnostics_schema import normalize_scan_diagnostics
 from app.settings_utils import sanitize_settings
@@ -43,6 +52,11 @@ KEY_ROTATION_STATUS_PATH = os.path.join(HUB_DATA_DIR, "key_rotation_status.json"
 INCIDENTS_PATH = os.path.join(HUB_DATA_DIR, "incidents.jsonl")
 RUNTIME_EVENTS_PATH = os.path.join(HUB_DATA_DIR, "runtime_events.jsonl")
 RUNTIME_STATE_PATH = os.path.join(HUB_DATA_DIR, "runtime_state.json")
+NOTIFICATION_CENTER_PATH = os.path.join(HUB_DATA_DIR, "notification_center.json")
+MARKET_REGIMES_PATH = os.path.join(HUB_DATA_DIR, "market_regimes.json")
+WALKFORWARD_REPORT_PATH = os.path.join(HUB_DATA_DIR, "walkforward_report.json")
+CONFIDENCE_CALIBRATION_PATH = os.path.join(HUB_DATA_DIR, "confidence_calibration.json")
+SHADOW_SCORECARDS_PATH = os.path.join(HUB_DATA_DIR, "shadow_deployment_scorecards.json")
 MARKET_LOOP_STATUS_PATH = os.path.join(HUB_DATA_DIR, "market_loop_status.json")
 CADENCE_DRIFT_PATH = os.path.join(HUB_DATA_DIR, "scanner_cadence_drift.json")
 
@@ -60,7 +74,14 @@ WATCHDOG_INTERVAL_S = 15.0
 MARKETS_STALE_MULT = 4.0
 AUTOPILOT_STALE_MULT = 6.0
 MARKET_LOOP_RESTART_COOLDOWN_S = 180.0
+SCRIPT_WATCH_INTERVAL_S = 3.0
+SCRIPT_CHANGE_MIN_UPTIME_S = 3.0
+SCRIPT_CHANGE_RESTART_COOLDOWN_S = 10.0
 DRAWDOWN_GUARD_PATH = os.path.join(HUB_DATA_DIR, "global_drawdown_guard.json")
+SAFETY_ACK_PATH = os.path.join(HUB_DATA_DIR, "safety_ack.json")
+
+RUNTIME_STATE_SCHEMA_VERSION = 3
+RUNTIME_STATE_MIN_READER_VERSION = 1
 
 
 def _rotate_log_file(path: str, max_bytes: int = LOG_ROTATE_MAX_BYTES, keep: int = LOG_ROTATE_KEEP) -> None:
@@ -246,12 +267,21 @@ def _summarize_broker_backoff_events(rows: list[Dict[str, Any]], now_ts_value: f
 
 def _stop_flag_payload(path: str) -> Dict[str, Any]:
     if not os.path.exists(path):
-        return {"active": False, "ts": 0, "age_s": 0}
+        return {"active": False, "ts": 0, "age_s": 0, "reason": "", "details": {}}
     ts = 0
+    reason = ""
+    details: Dict[str, Any] = {}
+    raw = ""
     try:
         with open(path, "r", encoding="utf-8") as f:
             raw = str(f.read() or "").strip()
-        if raw:
+        if raw.startswith("{"):
+            obj = json.loads(raw)
+            if isinstance(obj, dict):
+                ts = int(float(obj.get("ts", 0) or 0))
+                reason = str(obj.get("reason", "") or "").strip().lower()
+                details = obj.get("details", {}) if isinstance(obj.get("details", {}), dict) else {}
+        elif raw:
             ts = int(float(raw))
     except Exception:
         ts = 0
@@ -262,7 +292,32 @@ def _stop_flag_payload(path: str) -> Dict[str, Any]:
     if ts <= 0:
         ts = mtime
     age_s = max(0, int(time.time()) - int(ts))
-    return {"active": True, "ts": int(ts), "age_s": int(age_s)}
+    return {"active": True, "ts": int(ts), "age_s": int(age_s), "reason": reason, "details": details}
+
+
+def _write_stop_flag(path: str, ts_value: int, reason: str = "", details: Dict[str, Any] | None = None) -> None:
+    payload = {
+        "ts": int(ts_value),
+        "reason": str(reason or "").strip().lower(),
+        "details": (details if isinstance(details, dict) else {}),
+    }
+    try:
+        _atomic_write_json(path, payload)
+    except Exception:
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(str(int(ts_value)))
+        except Exception:
+            pass
+
+
+def _clear_stop_flag(path: str) -> bool:
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+        return True
+    except Exception:
+        return False
 
 
 def _run_startup_checks(scripts: Dict[str, str], settings: Dict[str, Any], stale_pid_removed: bool) -> Dict[str, Any]:
@@ -413,6 +468,8 @@ class ChildSpec:
         self.crash_times: list[float] = []
         self.last_exit: Dict[str, Any] = {}
         self.started_at = 0.0
+        self.loaded_script_mtime = 0.0
+        self.last_script_change_restart_at = 0.0
 
     def pid(self) -> Optional[int]:
         if self.proc and self.proc.poll() is None:
@@ -445,6 +502,7 @@ class Runner:
         self._last_watchdog_at = 0.0
         self._last_market_loop_stale_note_at = 0.0
         self._last_market_loop_restart_at = 0.0
+        self._last_script_watch_at = 0.0
 
     def write_heartbeat(self) -> None:
         payload = {
@@ -484,7 +542,10 @@ class Runner:
 
     def _incident_summary(self, limit: int = 200) -> Dict[str, Any]:
         sev_counts: Dict[str, int] = {}
+        sev_counts_1h: Dict[str, int] = {}
         event_counts: Dict[str, int] = {}
+        event_sev_counts: Dict[str, Dict[str, int]] = {}
+        event_sev_counts_1h: Dict[str, Dict[str, int]] = {}
         lines: list[str] = []
         now_ts = int(time.time())
         count_1h = 0
@@ -505,18 +566,33 @@ class Runner:
             sev_counts[sev] = int(sev_counts.get(sev, 0)) + 1
             if evt:
                 event_counts[evt] = int(event_counts.get(evt, 0)) + 1
+                evt_sev = event_sev_counts.get(evt, {})
+                if not isinstance(evt_sev, dict):
+                    evt_sev = {}
+                evt_sev[sev] = int(evt_sev.get(sev, 0) or 0) + 1
+                event_sev_counts[evt] = evt_sev
             try:
                 ts = int(float(row.get("ts", 0) or 0))
             except Exception:
                 ts = 0
             if ts > 0 and (now_ts - ts) <= 3600:
                 count_1h += 1
+                sev_counts_1h[sev] = int(sev_counts_1h.get(sev, 0) or 0) + 1
+                if evt:
+                    evt_sev_1h = event_sev_counts_1h.get(evt, {})
+                    if not isinstance(evt_sev_1h, dict):
+                        evt_sev_1h = {}
+                    evt_sev_1h[sev] = int(evt_sev_1h.get(sev, 0) or 0) + 1
+                    event_sev_counts_1h[evt] = evt_sev_1h
             if ts > 0 and (now_ts - ts) <= 86400:
                 count_24h += 1
         top_events = sorted(event_counts.items(), key=lambda x: x[1], reverse=True)[:6]
         return {
             "count": int(len(lines[-max(1, int(limit)):])),
             "by_severity": sev_counts,
+            "by_severity_1h": sev_counts_1h,
+            "by_event_severity": event_sev_counts,
+            "by_event_severity_1h": event_sev_counts_1h,
             "top_events": [{"event": k, "count": int(v)} for k, v in top_events],
             "count_1h": int(count_1h),
             "count_24h": int(count_24h),
@@ -538,6 +614,10 @@ class Runner:
         scan_drift = _safe_read_json(os.path.join(HUB_DATA_DIR, "scan_drift_alerts.json"))
         scan_cadence = _safe_read_json(CADENCE_DRIFT_PATH)
         trends = _safe_read_json(os.path.join(HUB_DATA_DIR, "market_trends.json"))
+        regimes = _safe_read_json(MARKET_REGIMES_PATH)
+        walkforward = _safe_read_json(WALKFORWARD_REPORT_PATH)
+        confidence_calibration = _safe_read_json(CONFIDENCE_CALIBRATION_PATH)
+        shadow_scorecards = _safe_read_json(SHADOW_SCORECARDS_PATH)
         exec_guard = _safe_read_json(os.path.join(HUB_DATA_DIR, "broker_execution_guard.json"))
         drawdown_guard = _safe_read_json(DRAWDOWN_GUARD_PATH)
         market_loop = _safe_read_json(MARKET_LOOP_STATUS_PATH)
@@ -555,6 +635,9 @@ class Runner:
         status = _safe_read_json(TRADER_STATUS_PATH)
         incidents_rows = _read_jsonl_tail(INCIDENTS_PATH, limit=800)
         runtime_event_rows = _read_jsonl_tail(RUNTIME_EVENTS_PATH, limit=2000)
+        account_history_rows = _read_jsonl_tail(os.path.join(HUB_DATA_DIR, "account_value_history.jsonl"), limit=5000)
+        stock_audit_rows = _read_jsonl_tail(os.path.join(HUB_DATA_DIR, "stocks", "execution_audit.jsonl"), limit=3000)
+        forex_audit_rows = _read_jsonl_tail(os.path.join(HUB_DATA_DIR, "forex", "execution_audit.jsonl"), limit=3000)
         try:
             quota_warn = max(1, int(float(settings.get("runtime_api_quota_warn_15m", 4) or 4)))
         except Exception:
@@ -571,6 +654,24 @@ class Runner:
         )
         api_quota["thresholds"] = {"warn_15m": int(quota_warn), "crit_15m": int(quota_crit)}
         broker_backoff = _summarize_broker_backoff_events(runtime_event_rows, now_ts_value=time.time())
+        latency_hist = build_broker_latency_histogram(
+            runtime_event_rows,
+            market_audit_rows={"stocks": stock_audit_rows, "forex": forex_audit_rows},
+            now_ts_value=time.time(),
+        )
+        incident_trend = build_incident_trend(incidents_rows, now_ts_value=time.time())
+        pnl_decomposition = build_pnl_decomposition(HUB_DATA_DIR)
+        equity_anomaly = detect_equity_anomaly(
+            account_history_rows,
+            now_ts_value=time.time(),
+            spike_pct=max(1.0, float(settings.get("equity_curve_anomaly_spike_pct", 3.0) or 3.0)),
+        )
+        stale_history = detect_stale_history(
+            account_history_rows,
+            now_ts_value=time.time(),
+            stale_after_s=max(60, int(float(settings.get("runtime_alert_history_stale_s", 900) or 900))),
+        )
+        feature_flags = build_feature_flag_snapshot(settings)
 
         def _broker_state(name: str, payload: Dict[str, Any], quota_row: Dict[str, Any]) -> Dict[str, Any]:
             st = str(payload.get("state", "") or "").upper().strip()
@@ -605,6 +706,10 @@ class Runner:
         }
 
         payload = {
+            "runtime_state_schema": {
+                "version": int(RUNTIME_STATE_SCHEMA_VERSION),
+                "min_reader_version": int(RUNTIME_STATE_MIN_READER_VERSION),
+            },
             "ts": int(time.time()),
             "runner": {
                 "state": str(heartbeat_payload.get("state", "") or ""),
@@ -702,6 +807,31 @@ class Runner:
                 "forex": dict(trends.get("forex", {}) or {}) if isinstance(trends.get("forex", {}), dict) else {},
                 "ts": int(trends.get("ts", 0) or 0),
             },
+            "market_regimes": {
+                "stocks": dict(regimes.get("stocks", {}) or {}) if isinstance(regimes.get("stocks", {}), dict) else {},
+                "forex": dict(regimes.get("forex", {}) or {}) if isinstance(regimes.get("forex", {}), dict) else {},
+                "ts": int(regimes.get("ts", 0) or 0),
+            },
+            "walkforward_report": {
+                "stocks": dict(walkforward.get("stocks", {}) or {}) if isinstance(walkforward.get("stocks", {}), dict) else {},
+                "forex": dict(walkforward.get("forex", {}) or {}) if isinstance(walkforward.get("forex", {}), dict) else {},
+                "ts": int(walkforward.get("ts", 0) or 0),
+            },
+            "confidence_calibration": {
+                "stocks": dict(confidence_calibration.get("stocks", {}) or {})
+                if isinstance(confidence_calibration.get("stocks", {}), dict)
+                else {},
+                "forex": dict(confidence_calibration.get("forex", {}) or {})
+                if isinstance(confidence_calibration.get("forex", {}), dict)
+                else {},
+                "ts": int(confidence_calibration.get("ts", 0) or 0),
+            },
+            "shadow_scorecards": {
+                "stocks": dict(shadow_scorecards.get("stocks", {}) or {}) if isinstance(shadow_scorecards.get("stocks", {}), dict) else {},
+                "forex": dict(shadow_scorecards.get("forex", {}) or {}) if isinstance(shadow_scorecards.get("forex", {}), dict) else {},
+                "all_markets_pass": bool(shadow_scorecards.get("all_markets_pass", False)),
+                "ts": int(shadow_scorecards.get("ts", 0) or 0),
+            },
             "exposure_map": build_exposure_payload(HUB_DATA_DIR),
             "autopilot": {
                 "stable_cycles": int(autopilot.get("stable_cycles", 0) or 0),
@@ -720,10 +850,19 @@ class Runner:
             },
             "api_quota": api_quota,
             "broker_backoff": broker_backoff,
+            "broker_latency_histogram": latency_hist,
             "broker_health": broker_health,
             "incidents_last_200": self._incident_summary(limit=200),
+            "incident_trend": incident_trend,
+            "pnl_decomposition": pnl_decomposition,
+            "equity_curve_anomaly": equity_anomaly,
+            "stale_history": stale_history,
+            "feature_flags": feature_flags,
         }
         payload["alerts"] = evaluate_runtime_alerts(payload, settings)
+        notifications = build_notification_center_payload(payload, incidents_rows=incidents_rows, max_items=240)
+        payload["notification_center"] = notifications
+        _atomic_write_json(NOTIFICATION_CENTER_PATH, notifications)
         _atomic_write_json(RUNTIME_STATE_PATH, payload)
 
     def _status_file_stale(self, path: str, max_age_s: float) -> bool:
@@ -950,11 +1089,137 @@ class Runner:
             f"Global drawdown guard triggered ({dd_pct:.2f}% <= -{max_dd:.2f}%). Stopping trading.",
             payload,
         )
+        _write_stop_flag(
+            STOP_FLAG_PATH,
+            ts_value=int(now),
+            reason="drawdown_guard",
+            details={
+                "drawdown_pct": float(round(dd_pct, 6)),
+                "limit_pct": float(max_dd),
+                "lookback_hours": int(lookback_h),
+            },
+        )
+
+    def _safety_ack_payload(self) -> Dict[str, Any]:
+        data = _safe_read_json(SAFETY_ACK_PATH)
+        return data if isinstance(data, dict) else {}
+
+    def _maybe_resume_drawdown_stop_flag(self, now: float) -> bool:
+        stop_row = _stop_flag_payload(STOP_FLAG_PATH)
+        if not bool(stop_row.get("active", False)):
+            return False
+        reason = str(stop_row.get("reason", "") or "").strip().lower()
+        if reason != "drawdown_guard":
+            return False
+
+        settings_path = resolve_settings_path(BASE_DIR) or _SETTINGS_PATH or os.path.join(BASE_DIR, "gui_settings.json")
+        settings = sanitize_settings(read_settings_file(settings_path, module_name="pt_runner") or {})
+        if not bool(settings.get("global_drawdown_auto_resume_enabled", True)):
+            return False
+
+        guard = _safe_read_json(DRAWDOWN_GUARD_PATH)
+        triggered_ts = int(guard.get("triggered_ts", stop_row.get("ts", 0)) or 0)
+        max_dd = float(settings.get("global_max_drawdown_pct", 0.0) or 0.0)
+        if max_dd <= 0.0:
+            return False
+
+        cooloff_s = max(60, int(float(settings.get("global_drawdown_resume_cooloff_s", 14400) or 14400)))
+        if triggered_ts > 0 and (int(now) - int(triggered_ts)) < cooloff_s:
+            return False
+
+        ack_required = bool(settings.get("global_drawdown_require_manual_ack", True))
+        if ack_required:
+            ack = self._safety_ack_payload()
+            ack_ts = int(ack.get("drawdown_ack_ts", 0) or 0)
+            if ack_ts <= 0 or ack_ts < triggered_ts:
+                return False
+
+        lookback_h = int(float(settings.get("global_drawdown_lookback_hours", 24) or 24))
+        dd_pct = _intraday_drawdown_pct(os.path.join(HUB_DATA_DIR, "account_value_history.jsonl"), lookback_hours=lookback_h)
+        recovery_buffer = max(0.0, float(settings.get("global_drawdown_resume_recovery_buffer_pct", 0.25) or 0.25))
+        resume_threshold = -max(0.0, max_dd - recovery_buffer)
+        if dd_pct <= resume_threshold:
+            return False
+
+        if not _clear_stop_flag(STOP_FLAG_PATH):
+            return False
+        _append_incident(
+            "info",
+            "drawdown_guard_auto_resume",
+            "Drawdown stop flag auto-cleared after cooldown/recovery checks.",
+            {
+                "triggered_ts": int(triggered_ts),
+                "dd_pct_now": float(round(dd_pct, 6)),
+                "resume_threshold_pct": float(round(resume_threshold, 6)),
+                "cooloff_s": int(cooloff_s),
+                "ack_required": bool(ack_required),
+            },
+        )
+        _runner_log("drawdown stop flag cleared automatically; resuming runner loop")
+        return True
+
+    def _script_watch_tick(self, now: float) -> None:
+        if (now - self._last_script_watch_at) < float(SCRIPT_WATCH_INTERVAL_S):
+            return
+        self._last_script_watch_at = float(now)
+
         try:
-            with open(STOP_FLAG_PATH, "w", encoding="utf-8") as f:
-                f.write(str(int(now)))
+            scripts = _settings_scripts()
         except Exception:
-            pass
+            scripts = {}
+
+        for key, child in self.children.items():
+            configured_path = os.path.abspath(str(scripts.get(key, child.script_path) or child.script_path))
+            old_path = os.path.abspath(str(child.script_path or ""))
+            if configured_path != old_path:
+                child.script_path = configured_path
+                child.loaded_script_mtime = 0.0
+                if child.proc and child.proc.poll() is None:
+                    msg = f"{key} script path changed; restarting child"
+                    self.msg = msg
+                    _runner_log(msg)
+                    _append_incident(
+                        "warning",
+                        "runner_script_path_changed",
+                        msg,
+                        {"child": key, "old_path": old_path, "new_path": configured_path},
+                    )
+                    _terminate_process(child.proc, key, force=False)
+                continue
+
+            if not (child.proc and child.proc.poll() is None):
+                continue
+            if self._child_uptime_s(child, now) < float(SCRIPT_CHANGE_MIN_UPTIME_S):
+                continue
+
+            try:
+                current_mtime = float(os.path.getmtime(child.script_path))
+            except Exception:
+                continue
+
+            loaded_mtime = float(getattr(child, "loaded_script_mtime", 0.0) or 0.0)
+            if loaded_mtime <= 0.0:
+                child.loaded_script_mtime = current_mtime
+                continue
+            if current_mtime <= (loaded_mtime + 1e-6):
+                continue
+            if (now - float(getattr(child, "last_script_change_restart_at", 0.0) or 0.0)) < float(
+                SCRIPT_CHANGE_RESTART_COOLDOWN_S
+            ):
+                continue
+
+            child.last_script_change_restart_at = float(now)
+            child.loaded_script_mtime = current_mtime
+            msg = f"{key} script updated on disk; restarting child"
+            self.msg = msg
+            _runner_log(msg)
+            _append_incident(
+                "warning",
+                "runner_script_hot_reload",
+                msg,
+                {"child": key, "script_path": child.script_path, "old_mtime": loaded_mtime, "new_mtime": current_mtime},
+            )
+            _terminate_process(child.proc, key, force=False)
 
     def start_child(self, key: str) -> None:
         child = self.children[key]
@@ -992,11 +1257,16 @@ class Runner:
             child.proc = proc
             child.next_restart_at = 0.0
             child.started_at = float(time.time())
+            try:
+                child.loaded_script_mtime = float(os.path.getmtime(child.script_path))
+            except Exception:
+                child.loaded_script_mtime = 0.0
             self.msg = f"Started {key} pid={proc.pid}"
             _runner_log(self.msg)
         except Exception as exc:
             child.proc = None
             child.started_at = 0.0
+            child.loaded_script_mtime = 0.0
             child.next_restart_at = time.time() + min(MAX_BACKOFF_S, child.backoff_s)
             self.state = "ERROR"
             self.msg = f"Failed to start {key}: {type(exc).__name__}: {exc}"
@@ -1090,6 +1360,9 @@ class Runner:
         last_heartbeat = 0.0
         while self.running:
             if os.path.exists(STOP_FLAG_PATH):
+                if self._maybe_resume_drawdown_stop_flag(time.time()):
+                    time.sleep(0.2)
+                    continue
                 self.state = "STOPPING"
                 self.msg = "Stop flag detected"
                 self.graceful_shutdown()
@@ -1106,6 +1379,7 @@ class Runner:
                     continue
                 if (not child.proc) and now >= float(child.next_restart_at):
                     self.start_child(key)
+            self._script_watch_tick(now)
             self._drawdown_guard_tick(now)
             self._watchdog_tick(now)
             self._retention_tick(now)

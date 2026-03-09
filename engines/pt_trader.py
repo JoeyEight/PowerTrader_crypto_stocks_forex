@@ -4,7 +4,7 @@ import json
 import uuid
 import time
 import math
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 import requests
 from nacl.signing import SigningKey
 import os
@@ -33,6 +33,9 @@ PNL_LEDGER_PATH = os.path.join(HUB_DATA_DIR, "pnl_ledger.json")
 ACCOUNT_VALUE_HISTORY_PATH = os.path.join(HUB_DATA_DIR, "account_value_history.jsonl")
 CURRENT_PRICE_DIR = os.path.join(HUB_DATA_DIR, "current_prices")
 os.makedirs(CURRENT_PRICE_DIR, exist_ok=True)
+MANUAL_CRYPTO_ORDERS_DIR = os.path.join(HUB_DATA_DIR, "crypto_manual_orders")
+MANUAL_CRYPTO_ORDER_RESULTS_PATH = os.path.join(HUB_DATA_DIR, "crypto_manual_order_results.jsonl")
+os.makedirs(MANUAL_CRYPTO_ORDERS_DIR, exist_ok=True)
 
 
 
@@ -1783,6 +1786,203 @@ class CryptoAPITrading:
 
         return response
 
+    def _append_manual_order_result(self, row: Dict[str, Any]) -> None:
+        try:
+            payload = dict(row or {})
+            payload.setdefault("ts", time.time())
+            self._append_jsonl(MANUAL_CRYPTO_ORDER_RESULTS_PATH, payload)
+        except Exception:
+            pass
+
+    def _process_manual_sell_requests(
+        self,
+        holdings_results: List[Dict[str, Any]],
+        current_sell_prices: Dict[str, float],
+        valid_symbols: List[str],
+    ) -> bool:
+        trades_made = False
+        try:
+            req_files = sorted(glob.glob(os.path.join(MANUAL_CRYPTO_ORDERS_DIR, "*.json")))
+        except Exception:
+            req_files = []
+        if not req_files:
+            return False
+
+        valid_set = {str(s or "").strip().upper() for s in (valid_symbols or [])}
+        qty_by_coin: Dict[str, float] = {}
+        for row in list(holdings_results or []):
+            try:
+                coin = str(row.get("asset_code", "") or "").strip().upper()
+                qty = float(row.get("total_quantity", 0.0) or 0.0)
+                if coin and qty > 0.0:
+                    qty_by_coin[coin] = float(qty)
+            except Exception:
+                continue
+
+        for req_path in req_files:
+            req: Dict[str, Any] = {}
+            req_id = os.path.basename(req_path)
+            result: Dict[str, Any] = {"request_id": req_id, "ok": False, "path": req_path}
+            try:
+                try:
+                    with open(req_path, "r", encoding="utf-8") as f:
+                        req = json.load(f) or {}
+                except Exception as exc:
+                    result["error"] = f"invalid_request_json:{type(exc).__name__}"
+                    self._append_manual_order_result(result)
+                    continue
+
+                req_id = str(req.get("id", req_id) or req_id).strip()
+                action = str(req.get("action", "sell_usd") or "sell_usd").strip().lower()
+                coin = str(req.get("coin", "") or "").strip().upper()
+                try:
+                    amount_usd = float(req.get("amount_usd", 0.0) or 0.0)
+                except Exception:
+                    amount_usd = 0.0
+
+                result.update(
+                    {
+                        "request_id": req_id,
+                        "action": action,
+                        "coin": coin,
+                        "requested_amount_usd": amount_usd,
+                    }
+                )
+
+                if action not in {"sell_usd", "manual_sell_usd"}:
+                    result["error"] = f"unsupported_action:{action}"
+                    self._append_manual_order_result(result)
+                    continue
+                if (not coin) or amount_usd <= 0.0:
+                    result["error"] = "invalid_request_fields"
+                    self._append_manual_order_result(result)
+                    continue
+
+                qty_avail = float(qty_by_coin.get(coin, 0.0) or 0.0)
+                full_symbol = f"{coin}-USD"
+                try:
+                    sell_px = float(current_sell_prices.get(full_symbol, 0.0) or 0.0)
+                except Exception:
+                    sell_px = 0.0
+                if qty_avail <= 0.0:
+                    result["error"] = "coin_not_held"
+                    self._append_manual_order_result(result)
+                    continue
+                if full_symbol not in valid_set or sell_px <= 0.0:
+                    result["error"] = "sell_price_unavailable"
+                    self._append_manual_order_result(result)
+                    continue
+
+                max_notional = qty_avail * sell_px
+                sell_notional = min(float(amount_usd), float(max_notional))
+                sell_qty = sell_notional / sell_px if sell_px > 0.0 else 0.0
+                sell_qty = float(max(0.0, round(sell_qty, 8)))
+                if sell_qty <= 0.0:
+                    result["error"] = "sell_quantity_zero"
+                    self._append_manual_order_result(result)
+                    continue
+
+                # If a partial sell would leave sub-minimum dust, sell the full coin instead.
+                # This avoids broker rejections for tiny residual quantities/notional.
+                remainder_notional = max(0.0, float(max_notional - (sell_qty * sell_px)))
+                if 0.0 < remainder_notional < 1.0:
+                    sell_qty = float(max(0.0, round(qty_avail, 8)))
+
+                def _extract_order_error_text(resp: Any) -> str:
+                    if not (resp and isinstance(resp, dict)):
+                        return ""
+                    errs = resp.get("errors", [])
+                    if not isinstance(errs, list):
+                        return ""
+                    chunks = []
+                    for e in errs:
+                        if isinstance(e, dict):
+                            part = str(e.get("detail", "") or e.get("message", "") or "").strip()
+                        else:
+                            part = str(e or "").strip()
+                        if part:
+                            chunks.append(part)
+                    return " | ".join(chunks)[:320]
+
+                try:
+                    avg_cost_basis = float(self.cost_basis.get(coin, 0.0) or 0.0)
+                except Exception:
+                    avg_cost_basis = 0.0
+                pnl_pct = ((sell_px - avg_cost_basis) / avg_cost_basis) * 100.0 if avg_cost_basis > 0.0 else None
+
+                # Retry with progressively coarser precision to satisfy broker increment rules.
+                sell_qty_attempts: List[float] = []
+                seen_qty = set()
+
+                def _push_qty(q: float) -> None:
+                    try:
+                        qf = float(max(0.0, min(qty_avail, q)))
+                    except Exception:
+                        return
+                    qf = float(round(qf, 8))
+                    if qf <= 0.0:
+                        return
+                    key = round(qf, 8)
+                    if key in seen_qty:
+                        return
+                    seen_qty.add(key)
+                    sell_qty_attempts.append(qf)
+
+                _push_qty(sell_qty)
+                for dec in (7, 6, 5, 4, 3, 2, 1, 0):
+                    _push_qty(round(sell_qty, dec))
+                _push_qty(qty_avail)  # final fallback: full position
+
+                response = None
+                ok = False
+                used_sell_qty = sell_qty
+                broker_error_txt = ""
+                for q_try in sell_qty_attempts:
+                    used_sell_qty = q_try
+                    response = self.place_sell_order(
+                        str(uuid.uuid4()),
+                        "sell",
+                        "market",
+                        full_symbol,
+                        q_try,
+                        expected_price=sell_px,
+                        avg_cost_basis=avg_cost_basis if avg_cost_basis > 0.0 else None,
+                        pnl_pct=pnl_pct,
+                        tag="MANUAL_SELL_USD",
+                    )
+                    ok = bool(response and isinstance(response, dict) and ("errors" not in response))
+                    if ok:
+                        break
+                    broker_error_txt = _extract_order_error_text(response)
+
+                if ok:
+                    trades_made = True
+                    qty_by_coin[coin] = max(0.0, float(qty_avail - used_sell_qty))
+                    self.trailing_pm.pop(coin, None)
+                    self._reset_dca_window_for_trade(coin, sold=True)
+                    self._last_exit_ts[coin] = time.time()
+                    result["ok"] = True
+                else:
+                    result["error"] = "broker_sell_failed"
+                    if broker_error_txt:
+                        result["broker_error"] = broker_error_txt
+
+                result.update(
+                    {
+                        "sell_qty": float(used_sell_qty),
+                        "sell_price": float(sell_px),
+                        "executed_notional_usd": round(float(used_sell_qty * sell_px), 6),
+                        "max_notional_usd": round(float(max_notional), 6),
+                    }
+                )
+                self._append_manual_order_result(result)
+            finally:
+                try:
+                    os.remove(req_path)
+                except Exception:
+                    pass
+
+        return bool(trades_made)
 
 
 
@@ -1860,6 +2060,29 @@ class CryptoAPITrading:
                 symbols.append(full)
 
         current_buy_prices, current_sell_prices, valid_symbols = self.get_price(symbols)
+        manual_trades_made = self._process_manual_sell_requests(holdings_results, current_sell_prices, valid_symbols)
+        if manual_trades_made:
+            trades_made = True
+            time.sleep(2)
+            account = self.get_account()
+            holdings = self.get_holdings()
+            trading_pairs = self.get_trading_pairs()
+            if not isinstance(account, dict):
+                account = {}
+            holdings_results = []
+            if isinstance(holdings, dict):
+                raw_results = holdings.get("results", [])
+                if isinstance(raw_results, list):
+                    holdings_results = raw_results
+            holdings = {"results": holdings_results}
+            if not isinstance(trading_pairs, list):
+                trading_pairs = []
+            symbols = [holding["asset_code"] + "-USD" for holding in holdings.get("results", [])]
+            for s in crypto_symbols:
+                full = f"{s}-USD"
+                if full not in symbols:
+                    symbols.append(full)
+            current_buy_prices, current_sell_prices, valid_symbols = self.get_price(symbols)
 
         # Calculate total account value (robust: never drop a held coin to $0 on transient API misses)
         snapshot_ok = True

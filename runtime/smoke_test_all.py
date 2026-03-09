@@ -11,15 +11,17 @@ if __package__ in (None, ""):
     if _ROOT not in sys.path:
         sys.path.insert(0, _ROOT)
 
+from app.operator_notes import ensure_operator_notes_files
 from app.path_utils import read_settings_file, resolve_runtime_paths, resolve_settings_path
+from app.rejection_replay import build_rejection_replay_report
 from app.scan_diagnostics_schema import normalize_scan_diagnostics
 from app.settings_utils import sanitize_settings
 from engines.forex_thinker import run_scan as run_forex_scan
 from engines.forex_trader import run_step as run_forex_step
 from engines.stock_thinker import run_scan as run_stock_scan
 from engines.stock_trader import run_step as run_stock_step
-from runtime.pt_autopilot import run_once as run_autopilot_once
 from runtime.pt_autofix import run_once as run_autofix_once
+from runtime.pt_autopilot import run_once as run_autopilot_once
 
 
 def _safe_json(path: str) -> Dict[str, Any]:
@@ -107,6 +109,33 @@ def main() -> int:
         out["ok"] = False
         out["steps"]["autofix"] = {"error": f"{type(exc).__name__}: {exc}"}
 
+    # 7) rejection replay report
+    try:
+        replay_payload = build_rejection_replay_report(hub_dir, settings)
+        replay_path = os.path.join(hub_dir, "rejection_replay.json")
+        tmp_replay = f"{replay_path}.tmp"
+        with open(tmp_replay, "w", encoding="utf-8") as f:
+            json.dump(replay_payload if isinstance(replay_payload, dict) else {}, f, indent=2)
+        os.replace(tmp_replay, replay_path)
+        out["steps"]["rejection_replay"] = {
+            "stocks_state": str((replay_payload.get("stocks", {}) if isinstance(replay_payload.get("stocks", {}), dict) else {}).get("state", "")),
+            "forex_state": str((replay_payload.get("forex", {}) if isinstance(replay_payload.get("forex", {}), dict) else {}).get("state", "")),
+        }
+    except Exception as exc:
+        out["ok"] = False
+        out["steps"]["rejection_replay"] = {"error": f"{type(exc).__name__}: {exc}"}
+
+    # 8) operator notes bootstrap
+    try:
+        md_path, log_path = ensure_operator_notes_files(hub_dir)
+        out["steps"]["operator_notes"] = {
+            "markdown_exists": bool(os.path.isfile(md_path)),
+            "log_exists": bool(os.path.isfile(log_path)),
+        }
+    except Exception as exc:
+        out["ok"] = False
+        out["steps"]["operator_notes"] = {"error": f"{type(exc).__name__}: {exc}"}
+
     out["files"] = {
         "stock_status": _safe_json(os.path.join(hub_dir, "stocks", "stock_trader_status.json")),
         "forex_status": _safe_json(os.path.join(hub_dir, "forex", "forex_trader_status.json")),
@@ -121,6 +150,12 @@ def main() -> int:
         "scanner_cadence_drift": _safe_json(os.path.join(hub_dir, "scanner_cadence_drift.json")),
         "market_sla_metrics": _safe_json(os.path.join(hub_dir, "market_sla_metrics.json")),
         "market_trends": _safe_json(os.path.join(hub_dir, "market_trends.json")),
+        "market_regimes": _safe_json(os.path.join(hub_dir, "market_regimes.json")),
+        "walkforward_report": _safe_json(os.path.join(hub_dir, "walkforward_report.json")),
+        "confidence_calibration": _safe_json(os.path.join(hub_dir, "confidence_calibration.json")),
+        "shadow_deployment_scorecards": _safe_json(os.path.join(hub_dir, "shadow_deployment_scorecards.json")),
+        "notification_center": _safe_json(os.path.join(hub_dir, "notification_center.json")),
+        "rejection_replay": _safe_json(os.path.join(hub_dir, "rejection_replay.json")),
         "recent_incidents": {},
     }
     out["files"]["stock_status"] = {
@@ -247,6 +282,58 @@ def main() -> int:
         "forex_quality_reject_pct": float(f_quality.get("reject_rate_pct", 0.0) or 0.0),
         "stocks_cadence_level": str(s_cadence.get("level", "")),
         "forex_cadence_level": str(f_cadence.get("level", "")),
+    }
+    mr = out["files"]["market_regimes"] if isinstance(out["files"]["market_regimes"], dict) else {}
+    out["files"]["market_regimes"] = {
+        "stocks_regime": str((mr.get("stocks", {}) if isinstance(mr.get("stocks", {}), dict) else {}).get("dominant_regime", "")),
+        "forex_regime": str((mr.get("forex", {}) if isinstance(mr.get("forex", {}), dict) else {}).get("dominant_regime", "")),
+    }
+    wf = out["files"]["walkforward_report"] if isinstance(out["files"]["walkforward_report"], dict) else {}
+    out["files"]["walkforward_report"] = {
+        "stocks_stability": str((wf.get("stocks", {}) if isinstance(wf.get("stocks", {}), dict) else {}).get("stability", "")),
+        "forex_stability": str((wf.get("forex", {}) if isinstance(wf.get("forex", {}), dict) else {}).get("stability", "")),
+    }
+    cc = out["files"]["confidence_calibration"] if isinstance(out["files"]["confidence_calibration"], dict) else {}
+    out["files"]["confidence_calibration"] = {
+        "stocks_samples": int((cc.get("stocks", {}) if isinstance(cc.get("stocks", {}), dict) else {}).get("samples", 0) or 0),
+        "forex_samples": int((cc.get("forex", {}) if isinstance(cc.get("forex", {}), dict) else {}).get("samples", 0) or 0),
+    }
+    sc = out["files"]["shadow_deployment_scorecards"] if isinstance(out["files"]["shadow_deployment_scorecards"], dict) else {}
+    out["files"]["shadow_deployment_scorecards"] = {
+        "stocks_gate": str((sc.get("stocks", {}) if isinstance(sc.get("stocks", {}), dict) else {}).get("promotion_gate", "")),
+        "forex_gate": str((sc.get("forex", {}) if isinstance(sc.get("forex", {}), dict) else {}).get("promotion_gate", "")),
+        "all_markets_pass": bool(sc.get("all_markets_pass", False)),
+    }
+    nc = out["files"]["notification_center"] if isinstance(out["files"]["notification_center"], dict) else {}
+    by_sev = nc.get("by_severity", {}) if isinstance(nc.get("by_severity", {}), dict) else {}
+    out["files"]["notification_center"] = {
+        "total": int(nc.get("total", 0) or 0),
+        "critical": int(by_sev.get("critical", 0) or 0),
+        "warning": int(by_sev.get("warning", 0) or 0),
+    }
+    rp = out["files"]["rejection_replay"] if isinstance(out["files"]["rejection_replay"], dict) else {}
+    rp_stocks = rp.get("stocks", {}) if isinstance(rp.get("stocks", {}), dict) else {}
+    rp_forex = rp.get("forex", {}) if isinstance(rp.get("forex", {}), dict) else {}
+    rp_stocks_rec = rp_stocks.get("recommendation", {}) if isinstance(rp_stocks.get("recommendation", {}), dict) else {}
+    rp_forex_rec = rp_forex.get("recommendation", {}) if isinstance(rp_forex.get("recommendation", {}), dict) else {}
+    out["files"]["rejection_replay"] = {
+        "stocks_state": str(rp_stocks.get("state", "")),
+        "forex_state": str(rp_forex.get("state", "")),
+        "stocks_recommended_threshold": float(rp_stocks_rec.get("recommended_threshold", 0.0) or 0.0),
+        "forex_recommended_threshold": float(rp_forex_rec.get("recommended_threshold", 0.0) or 0.0),
+    }
+    notes_md = os.path.join(hub_dir, "operator_notes.md")
+    notes_log = os.path.join(hub_dir, "operator_notes_log.jsonl")
+    notes_entries = 0
+    try:
+        with open(notes_log, "r", encoding="utf-8") as f:
+            notes_entries = sum(1 for ln in f if ln.strip())
+    except Exception:
+        notes_entries = 0
+    out["files"]["operator_notes"] = {
+        "markdown_exists": bool(os.path.isfile(notes_md)),
+        "log_exists": bool(os.path.isfile(notes_log)),
+        "log_entries": int(notes_entries),
     }
     try:
         sev_counts: Dict[str, int] = {}

@@ -12,4 +12,4 @@
   - [ ] diagnostics bundle ZIP
 - [ ] Stop-flag recovery runbook validated in paper/practice modes.
 - [ ] Drawdown-guard trigger path validated in simulation.
-- [ ] Changelog and backlog pass-2 docs updated before tagging release.
+- [x] Changelog and backlog pass-2 docs updated before tagging release.

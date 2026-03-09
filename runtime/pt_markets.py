@@ -8,13 +8,18 @@ import statistics
 import time
 from typing import Any, Dict
 
+from app.api_endpoint_validation import validate_alpaca_endpoints, validate_oanda_endpoints
+from app.confidence_calibration import build_confidence_calibration_payload
 from app.credential_utils import get_alpaca_creds, get_oanda_creds
 from app.execution_guard import market_guard_status, update_market_guard
 from app.market_trends import build_trends_payload
 from app.path_utils import read_settings_file, resolve_runtime_paths, resolve_settings_path
+from app.regime_classifier import build_all_market_regimes
 from app.runtime_logging import append_jsonl, atomic_write_json, runtime_event
 from app.settings_utils import sanitize_settings
+from app.shadow_scorecard import build_shadow_scorecards
 from app.time_utils import now_date_local
+from app.walkforward_report import build_walkforward_report
 from brokers.broker_alpaca import AlpacaBrokerClient
 from brokers.broker_oanda import OandaBrokerClient
 from engines.forex_thinker import run_scan as run_forex_scan
@@ -30,6 +35,10 @@ SLA_METRICS_PATH = os.path.join(HUB_DATA_DIR, "market_sla_metrics.json")
 SCAN_DRIFT_PATH = os.path.join(HUB_DATA_DIR, "scan_drift_alerts.json")
 CADENCE_DRIFT_PATH = os.path.join(HUB_DATA_DIR, "scanner_cadence_drift.json")
 MARKET_TRENDS_PATH = os.path.join(HUB_DATA_DIR, "market_trends.json")
+MARKET_REGIMES_PATH = os.path.join(HUB_DATA_DIR, "market_regimes.json")
+WALKFORWARD_PATH = os.path.join(HUB_DATA_DIR, "walkforward_report.json")
+CONFIDENCE_CALIBRATION_PATH = os.path.join(HUB_DATA_DIR, "confidence_calibration.json")
+SHADOW_SCORECARDS_PATH = os.path.join(HUB_DATA_DIR, "shadow_deployment_scorecards.json")
 EXEC_GUARD_PATH = os.path.join(HUB_DATA_DIR, "broker_execution_guard.json")
 MARKET_LOOP_STATUS_PATH = os.path.join(HUB_DATA_DIR, "market_loop_status.json")
 INCIDENT_COOLDOWN_S = 120.0
@@ -476,16 +485,56 @@ def _write_snapshots(settings: Dict[str, Any]) -> Dict[str, Any]:
 
     alpaca_key, alpaca_secret = get_alpaca_creds(settings, base_dir=BASE_DIR)
     oanda_account, oanda_token = get_oanda_creds(settings, base_dir=BASE_DIR)
+    alpaca_endpoint = validate_alpaca_endpoints(
+        settings.get("alpaca_base_url", "https://paper-api.alpaca.markets"),
+        settings.get("alpaca_data_url", "https://data.alpaca.markets"),
+        paper_mode=bool(settings.get("alpaca_paper_mode", True)),
+    )
+    oanda_endpoint = validate_oanda_endpoints(
+        settings.get("oanda_rest_url", "https://api-fxpractice.oanda.com"),
+        settings.get("oanda_stream_url", ""),
+        practice_mode=bool(settings.get("oanda_practice_mode", True)),
+    )
+    out["endpoint_validation"] = {
+        "alpaca_valid": bool(alpaca_endpoint.get("valid", False)),
+        "oanda_valid": bool(oanda_endpoint.get("valid", False)),
+        "alpaca_issues": int(len(list(alpaca_endpoint.get("issues", []) or []))),
+        "oanda_issues": int(len(list(oanda_endpoint.get("issues", []) or []))),
+    }
+    for row in list(alpaca_endpoint.get("issues", []) or []):
+        if not isinstance(row, dict):
+            continue
+        lvl = str(row.get("level", "warning") or "warning").strip().lower()
+        msg = str(row.get("message", "alpaca endpoint warning") or "alpaca endpoint warning")
+        _incident(
+            "error" if lvl == "critical" else "warning",
+            str(row.get("code", "alpaca_endpoint_warning") or "alpaca_endpoint_warning"),
+            msg,
+            {"service": "alpaca", "details": row.get("details", {}) if isinstance(row.get("details", {}), dict) else {}},
+            cooldown_key=f"endpoint:alpaca:{str(row.get('code', '') or '')}",
+        )
+    for row in list(oanda_endpoint.get("issues", []) or []):
+        if not isinstance(row, dict):
+            continue
+        lvl = str(row.get("level", "warning") or "warning").strip().lower()
+        msg = str(row.get("message", "oanda endpoint warning") or "oanda endpoint warning")
+        _incident(
+            "error" if lvl == "critical" else "warning",
+            str(row.get("code", "oanda_endpoint_warning") or "oanda_endpoint_warning"),
+            msg,
+            {"service": "oanda", "details": row.get("details", {}) if isinstance(row.get("details", {}), dict) else {}},
+            cooldown_key=f"endpoint:oanda:{str(row.get('code', '') or '')}",
+        )
     alpaca = AlpacaBrokerClient(
         api_key_id=alpaca_key,
         secret_key=alpaca_secret,
-        base_url=str(settings.get("alpaca_base_url", "https://paper-api.alpaca.markets") or ""),
-        data_url=str(settings.get("alpaca_data_url", "https://data.alpaca.markets") or ""),
+        base_url=str(alpaca_endpoint.get("normalized_base_url", "") or "https://paper-api.alpaca.markets"),
+        data_url=str(alpaca_endpoint.get("normalized_data_url", "") or "https://data.alpaca.markets"),
     )
     oanda = OandaBrokerClient(
         account_id=oanda_account,
         api_token=oanda_token,
-        rest_url=str(settings.get("oanda_rest_url", "https://api-fxpractice.oanda.com") or ""),
+        rest_url=str(oanda_endpoint.get("normalized_rest_url", "") or "https://api-fxpractice.oanda.com"),
     )
 
     try:
@@ -849,6 +898,53 @@ def _write_market_trends() -> None:
         _atomic_write_json(MARKET_TRENDS_PATH, payload)
     except Exception as exc:
         _incident("warning", "market_trends_update_failed", f"{type(exc).__name__}: {exc}", {"component": "trends"}, cooldown_key="market_trends_update_failed")
+    try:
+        regimes = build_all_market_regimes(HUB_DATA_DIR)
+        _atomic_write_json(MARKET_REGIMES_PATH, regimes)
+    except Exception as exc:
+        _incident(
+            "warning",
+            "market_regimes_update_failed",
+            f"{type(exc).__name__}: {exc}",
+            {"component": "regimes"},
+            cooldown_key="market_regimes_update_failed",
+        )
+
+
+def _write_market_intelligence(settings: Dict[str, Any]) -> None:
+    try:
+        walk = build_walkforward_report(HUB_DATA_DIR)
+        _atomic_write_json(WALKFORWARD_PATH, walk)
+    except Exception as exc:
+        _incident(
+            "warning",
+            "walkforward_report_update_failed",
+            f"{type(exc).__name__}: {exc}",
+            {"component": "walkforward"},
+            cooldown_key="walkforward_report_update_failed",
+        )
+    try:
+        calibration = build_confidence_calibration_payload(HUB_DATA_DIR, settings)
+        _atomic_write_json(CONFIDENCE_CALIBRATION_PATH, calibration)
+    except Exception as exc:
+        _incident(
+            "warning",
+            "confidence_calibration_update_failed",
+            f"{type(exc).__name__}: {exc}",
+            {"component": "confidence_calibration"},
+            cooldown_key="confidence_calibration_update_failed",
+        )
+    try:
+        scorecards = build_shadow_scorecards(HUB_DATA_DIR)
+        _atomic_write_json(SHADOW_SCORECARDS_PATH, scorecards)
+    except Exception as exc:
+        _incident(
+            "warning",
+            "shadow_scorecard_update_failed",
+            f"{type(exc).__name__}: {exc}",
+            {"component": "shadow_scorecards"},
+            cooldown_key="shadow_scorecard_update_failed",
+        )
 
 
 def main() -> int:
@@ -865,6 +961,7 @@ def main() -> int:
     next_snap = now
     next_stock = now
     next_fx = now
+    next_intel = now
     last_settings_load = now
     loop_status: Dict[str, Any] = {
         "ts": int(now),
@@ -898,9 +995,11 @@ def main() -> int:
             stock_every = max(8.0, float(settings.get("market_bg_stocks_interval_s", 18.0) or 18.0))
             fx_every = max(6.0, float(settings.get("market_bg_forex_interval_s", 12.0) or 12.0))
             jitter_pct = max(0.0, min(0.5, float(settings.get("market_loop_jitter_pct", 0.10) or 0.10)))
+            intelligence_every = max(30.0, float(settings.get("market_intelligence_interval_s", 180.0) or 180.0))
         except Exception:
             snap_every, stock_every, fx_every = 15.0, 18.0, 12.0
             jitter_pct = 0.10
+            intelligence_every = 180.0
         loop_status["settings_reload_s"] = float(reload_every)
         loop_status["jitter_pct"] = float(jitter_pct)
         loop_status["intervals"] = {
@@ -931,11 +1030,15 @@ def main() -> int:
                 loop_status["forex_last_step_ts"] = int(now)
             next_fx = now + _jittered_interval(fx_every, jitter_pct)
             _write_market_trends()
+        if now >= next_intel:
+            _write_market_intelligence(settings)
+            next_intel = now + _jittered_interval(intelligence_every, jitter_pct)
 
         loop_status["ts"] = int(now)
         loop_status["next_snapshot_ts"] = int(next_snap)
         loop_status["next_stocks_scan_ts"] = int(next_stock)
         loop_status["next_forex_scan_ts"] = int(next_fx)
+        loop_status["next_intelligence_ts"] = int(next_intel)
         _write_loop_status(loop_status)
         time.sleep(1.0)
 

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import io
 import tempfile
 import unittest
+import urllib.error
+from email.message import Message
 from unittest.mock import patch
 
 from brokers.broker_alpaca import AlpacaBrokerClient
@@ -54,7 +57,7 @@ class TestStockScanApiAlignment(unittest.TestCase):
         client = AlpacaBrokerClient(api_key_id="k", secret_key="s", base_url="https://paper-api.alpaca.markets", data_url="https://data.alpaca.markets")
         calls: list[str] = []
 
-        def _fake_request(path: str, timeout: float = 8.0) -> dict:
+        def _fake_request(path: str, timeout: float = 8.0, max_attempts: int = 3) -> dict:
             calls.append(path)
             return {
                 "bars": {
@@ -70,6 +73,35 @@ class TestStockScanApiAlignment(unittest.TestCase):
         rows = client.get_stock_bars("AAPL", timeframe="1Hour", limit=120, feed="iex")
         self.assertEqual([str(r.get("t", "")) for r in rows], ["2026-03-06T13:00:00Z", "2026-03-06T14:00:00Z", "2026-03-06T15:00:00Z"])
         self.assertTrue(any("sort=desc" in call for call in calls))
+
+    def test_stock_bars_feed_fallback_from_sip_to_iex(self) -> None:
+        client = AlpacaBrokerClient(api_key_id="k", secret_key="s", base_url="https://paper-api.alpaca.markets", data_url="https://data.alpaca.markets")
+        calls: list[str] = []
+
+        def _fake_request(path: str, timeout: float = 8.0, max_attempts: int = 3) -> dict:
+            calls.append(path)
+            if "feed=sip" in path:
+                raise urllib.error.HTTPError(
+                    url="https://data.alpaca.markets",
+                    code=403,
+                    msg="Forbidden",
+                    hdrs=Message(),
+                    fp=io.BytesIO(b'{"message":"subscription does not permit requested feed"}'),
+                )
+            return {
+                "bars": {
+                    "AAPL": [
+                        {"t": "2026-03-06T15:00:00Z", "c": 110.0},
+                        {"t": "2026-03-06T14:00:00Z", "c": 109.0},
+                    ]
+                }
+            }
+
+        client._request_data_json = _fake_request  # type: ignore[method-assign]
+        rows = client.get_stock_bars("AAPL", timeframe="1Hour", limit=120, feed="sip")
+        self.assertEqual(len(rows), 2)
+        self.assertTrue(any("feed=sip" in call for call in calls))
+        self.assertTrue(any("feed=iex" in call for call in calls))
 
 
 if __name__ == "__main__":
