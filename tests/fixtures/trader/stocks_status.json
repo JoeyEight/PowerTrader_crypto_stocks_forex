@@ -1,0 +1,18 @@
+{
+  "state": "READY",
+  "msg": "Broker OK",
+  "buying_power": "125000.25",
+  "open_positions": "1",
+  "realized_pnl": "+42.11",
+  "positions_preview": [
+    "AAPL qty=2.4 value=485.70 uPnL=+4.22"
+  ],
+  "raw_positions": [
+    {
+      "symbol": "AAPL",
+      "qty": 2.4,
+      "market_value": 485.7,
+      "unrealized_pl": 4.22
+    }
+  ]
+}

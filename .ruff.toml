@@ -1,0 +1,21 @@
+target-version = "py310"
+line-length = 120
+extend-exclude = [
+  "references",
+  "hub_data",
+  "venv",
+  "engines/pt_thinker.py",
+  "engines/pt_trader.py",
+  "engines/pt_trainer.py",
+]
+
+[lint]
+select = ["E", "F", "I", "W"]
+ignore = ["E501"]
+
+[lint.per-file-ignores]
+"ui/pt_hub.py" = ["E402"]
+"runtime/tools/check_pass3_artifacts.py" = ["E402"]
+"runtime/tools/stability_audit.py" = ["E402"]
+"runtime/smoke_test_all.py" = ["E402"]
+"runtime/pt_autopilot.py" = ["E402"]

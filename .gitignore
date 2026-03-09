@@ -1,0 +1,54 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+
+# Virtualenvs
+venv/
+.venv/
+
+# OS/editor
+.DS_Store
+.idea/
+.vscode/
+
+# Runtime artifacts
+hub_data/logs/
+hub_data/cache/
+hub_data/history_cache/
+hub_data/current_prices/
+hub_data/*_history.jsonl
+hub_data/*_status.json
+hub_data/*_state.json
+hub_data/*.pid
+hub_data/*.flag
+hub_data/smoke_test_report.json
+
+# Market artifacts
+hub_data/stocks/*.jsonl
+hub_data/forex/*.jsonl
+hub_data/stocks/*_status.json
+hub_data/forex/*_status.json
+hub_data/stocks/scan_diagnostics.json
+hub_data/forex/scan_diagnostics.json
+
+# Secrets
+keys/
+
+# Generated coin artifacts
+BTC/
+ETH/
+XRP/
+BNB/
+DOGE/
+SOL/
+ADA/
+PAXG/
+AVAX/
+LINK/
+LTC/
+UNI/
+AAVE/
+DOT/
+ATOM/
+MATIC/

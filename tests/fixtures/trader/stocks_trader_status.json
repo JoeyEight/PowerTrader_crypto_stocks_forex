@@ -1,0 +1,19 @@
+{
+  "state": "READY",
+  "trader_state": "Paper auto-run",
+  "msg": "No top symbol from thinker",
+  "updated_at": 1772671635,
+  "account_value_usd": 100523.91,
+  "exposure_usd": 485.7,
+  "open_positions": 1,
+  "actions": [
+    "[10:10:15] scan cycle complete",
+    "[10:10:17] no order placed; confidence below threshold"
+  ],
+  "health": {
+    "data_ok": true,
+    "broker_ok": true,
+    "orders_ok": true,
+    "drift_warning": false
+  }
+}

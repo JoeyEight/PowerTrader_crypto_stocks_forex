@@ -1,0 +1,52 @@
+{
+  "state": "READY",
+  "ai_state": "Scan ready",
+  "updated_at": 1772671625,
+  "msg": "top symbol ready",
+  "leaders": [
+    {
+      "symbol": "AAPL",
+      "side": "LONG",
+      "score": 0.4211,
+      "confidence": "HIGH",
+      "reason": "momentum + volume"
+    },
+    {
+      "symbol": "MSFT",
+      "side": "LONG",
+      "score": 0.3382,
+      "confidence": "MED",
+      "reason": "trend continuation"
+    }
+  ],
+  "top_pick": {
+    "symbol": "AAPL",
+    "side": "LONG",
+    "score": 0.4211,
+    "confidence": "HIGH",
+    "reason": "momentum + volume"
+  },
+  "top_chart": [
+    {
+      "t": "2026-03-05T10:00:00",
+      "o": 201.1,
+      "h": 201.8,
+      "l": 200.9,
+      "c": 201.6
+    },
+    {
+      "t": "2026-03-05T10:05:00",
+      "o": 201.6,
+      "h": 202.1,
+      "l": 201.4,
+      "c": 201.9
+    },
+    {
+      "t": "2026-03-05T10:10:00",
+      "o": 201.9,
+      "h": 202.4,
+      "l": 201.7,
+      "c": 202.3
+    }
+  ]
+}

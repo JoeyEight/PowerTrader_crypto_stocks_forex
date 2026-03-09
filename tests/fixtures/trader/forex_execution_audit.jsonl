@@ -1,0 +1,3 @@
+{"ts":1772671601,"instrument":"EUR_USD","event":"entry_check","side":"sell","ok":true,"msg":"spread acceptable"}
+{"ts":1772671610,"instrument":"USD_JPY","event":"entry_check","side":"buy","ok":false,"msg":"score below threshold"}
+{"ts":1772671618,"instrument":"EUR_USD","event":"position_limit","side":"sell","ok":false,"msg":"max positions reached"}

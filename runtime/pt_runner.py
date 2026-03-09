@@ -1,0 +1,1182 @@
+from __future__ import annotations
+
+import json
+import os
+import signal
+import subprocess
+import sys
+import time
+from typing import Any, Dict, Optional, TextIO
+
+from app.api_quota import summarize_quota_events
+from app.cache_maintenance import prune_data_cache, prune_scanner_quality_artifacts
+from app.credential_utils import (
+    get_alpaca_creds,
+    get_oanda_creds,
+    key_file_permission_issues,
+    key_rotation_reminder_issues,
+)
+from app.exposure_analytics import build_exposure_payload
+from app.health_rules import evaluate_runtime_alerts
+from app.http_utils import parse_retry_after_value
+from app.path_utils import read_settings_file, resolve_runtime_paths, resolve_settings_path
+from app.runtime_logging import append_jsonl, atomic_write_json, cleanup_logs, runtime_event, trim_jsonl_max_lines
+from app.scan_diagnostics_schema import normalize_scan_diagnostics
+from app.settings_utils import sanitize_settings
+from app.time_utils import now_date_local, now_datetime_local, now_ts
+
+BASE_DIR, _SETTINGS_PATH, HUB_DATA_DIR, _BOOT_SETTINGS = resolve_runtime_paths(__file__, "pt_runner")
+RUNNER_PID_PATH = os.path.join(HUB_DATA_DIR, "runner.pid")
+STOP_FLAG_PATH = os.path.join(HUB_DATA_DIR, "stop_trading.flag")
+TRADER_STATUS_PATH = os.path.join(HUB_DATA_DIR, "trader_status.json")
+LOG_DIR = os.path.join(HUB_DATA_DIR, "logs")
+os.makedirs(LOG_DIR, exist_ok=True)
+
+RUNNER_LOG_PATH = os.path.join(LOG_DIR, "runner.log")
+THINKER_LOG_PATH = os.path.join(LOG_DIR, "thinker.log")
+TRADER_LOG_PATH = os.path.join(LOG_DIR, "trader.log")
+MARKETS_LOG_PATH = os.path.join(LOG_DIR, "markets.log")
+AUTOPILOT_LOG_PATH = os.path.join(LOG_DIR, "autopilot.log")
+AUTOFIX_LOG_PATH = os.path.join(LOG_DIR, "autofix.log")
+RUNTIME_CHECKS_PATH = os.path.join(HUB_DATA_DIR, "runtime_startup_checks.json")
+KEY_ROTATION_STATUS_PATH = os.path.join(HUB_DATA_DIR, "key_rotation_status.json")
+INCIDENTS_PATH = os.path.join(HUB_DATA_DIR, "incidents.jsonl")
+RUNTIME_EVENTS_PATH = os.path.join(HUB_DATA_DIR, "runtime_events.jsonl")
+RUNTIME_STATE_PATH = os.path.join(HUB_DATA_DIR, "runtime_state.json")
+MARKET_LOOP_STATUS_PATH = os.path.join(HUB_DATA_DIR, "market_loop_status.json")
+CADENCE_DRIFT_PATH = os.path.join(HUB_DATA_DIR, "scanner_cadence_drift.json")
+
+HEARTBEAT_INTERVAL_S = 2.0
+MAX_BACKOFF_S = 30.0
+CRASH_WINDOW_S = 600.0
+CRASH_THRESHOLD = 10
+CRASH_LOCKOUT_S = 180.0
+LOG_ROTATE_MAX_BYTES = 25 * 1024 * 1024
+LOG_ROTATE_KEEP = 8
+LOG_RETENTION_AGE_DAYS = 14.0
+LOG_RETENTION_MAX_TOTAL_BYTES = 200 * 1024 * 1024
+LOG_RETENTION_INTERVAL_S = 600.0
+WATCHDOG_INTERVAL_S = 15.0
+MARKETS_STALE_MULT = 4.0
+AUTOPILOT_STALE_MULT = 6.0
+MARKET_LOOP_RESTART_COOLDOWN_S = 180.0
+DRAWDOWN_GUARD_PATH = os.path.join(HUB_DATA_DIR, "global_drawdown_guard.json")
+
+
+def _rotate_log_file(path: str, max_bytes: int = LOG_ROTATE_MAX_BYTES, keep: int = LOG_ROTATE_KEEP) -> None:
+    try:
+        if not os.path.isfile(path):
+            return
+        if os.path.getsize(path) <= int(max_bytes):
+            return
+        ts = time.strftime("%Y%m%d_%H%M%S", time.localtime())
+        rotated = f"{path}.{ts}"
+        os.replace(path, rotated)
+        prefix = os.path.basename(path) + "."
+        base_dir = os.path.dirname(path)
+        olds = sorted([os.path.join(base_dir, n) for n in os.listdir(base_dir) if n.startswith(prefix)])
+        if len(olds) > int(keep):
+            for old in olds[:-keep]:
+                try:
+                    os.remove(old)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+
+def _runner_log(msg: str) -> None:
+    line = f"{now_datetime_local()} {msg}\n"
+    try:
+        _rotate_log_file(RUNNER_LOG_PATH)
+        with open(RUNNER_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(line)
+    except Exception:
+        pass
+    try:
+        print(msg)
+    except Exception:
+        pass
+    runtime_event(RUNTIME_EVENTS_PATH, component="runner", event="log", level="info", msg=msg)
+
+
+def _append_incident(severity: str, event: str, msg: str, details: Optional[Dict[str, Any]] = None) -> None:
+    append_jsonl(
+        INCIDENTS_PATH,
+        {
+            "ts": now_ts(),
+            "date": now_date_local(),
+            "severity": str(severity or "info").lower(),
+            "event": str(event or "").strip() or "runtime_event",
+            "msg": str(msg or "").strip(),
+            "details": (details or {}),
+        },
+    )
+    runtime_event(
+        RUNTIME_EVENTS_PATH,
+        component="runner",
+        event=str(event or "incident"),
+        level=str(severity or "info"),
+        msg=str(msg or ""),
+        details=details or {},
+    )
+
+
+def _atomic_write_json(path: str, data: Dict[str, Any]) -> None:
+    atomic_write_json(path, data)
+
+
+def _check_writable_dir(path: str) -> Optional[str]:
+    try:
+        os.makedirs(path, exist_ok=True)
+        probe = os.path.join(path, ".write_probe.tmp")
+        with open(probe, "w", encoding="utf-8") as f:
+            f.write("ok")
+        os.remove(probe)
+        return None
+    except Exception as exc:
+        return f"{type(exc).__name__}: {exc}"
+
+
+def _safe_read_json(path: str) -> Dict[str, Any]:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _intraday_drawdown_pct(history_path: str, lookback_hours: int = 24) -> float:
+    now = time.time()
+    cutoff = now - (max(1, int(lookback_hours)) * 3600.0)
+    vals: list[float] = []
+    try:
+        with open(history_path, "r", encoding="utf-8") as f:
+            for ln in f:
+                ln = ln.strip()
+                if not ln:
+                    continue
+                try:
+                    row = json.loads(ln)
+                except Exception:
+                    continue
+                try:
+                    ts = float(row.get("ts", 0.0) or 0.0)
+                    v = float(row.get("total_account_value", 0.0) or 0.0)
+                except Exception:
+                    ts = 0.0
+                    v = 0.0
+                if ts < cutoff or v <= 0.0:
+                    continue
+                vals.append(v)
+    except Exception:
+        return 0.0
+    if len(vals) < 2:
+        return 0.0
+    peak = max(vals)
+    cur = vals[-1]
+    if peak <= 0.0:
+        return 0.0
+    return ((cur - peak) / peak) * 100.0
+
+
+def _read_jsonl_tail(path: str, limit: int = 600) -> list[Dict[str, Any]]:
+    lines: list[str] = []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            lines = [ln.strip() for ln in f if ln.strip()]
+    except Exception:
+        return []
+    out: list[Dict[str, Any]] = []
+    for ln in lines[-max(1, int(limit)):]:
+        try:
+            row = json.loads(ln)
+            if isinstance(row, dict):
+                out.append(row)
+        except Exception:
+            continue
+    return out
+
+
+def _summarize_broker_backoff_events(rows: list[Dict[str, Any]], now_ts_value: float | None = None) -> Dict[str, Any]:
+    now_val = float(time.time() if now_ts_value is None else now_ts_value)
+    cutoff_24h = now_val - 86400.0
+    waits: list[float] = []
+    by_component: Dict[str, int] = {}
+    last_wait_s = 0.0
+    last_wait_ts = 0
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        evt = str(row.get("event", "") or "").strip().lower()
+        if evt != "broker_retry_after_wait":
+            continue
+        try:
+            ts = float(row.get("ts", 0.0) or 0.0)
+        except Exception:
+            ts = 0.0
+        if ts < cutoff_24h:
+            continue
+        details = row.get("details", {}) if isinstance(row.get("details", {}), dict) else {}
+        wait_s = 0.0
+        try:
+            wait_s = float(details.get("wait_s", 0.0) or 0.0)
+        except Exception:
+            wait_s = 0.0
+        if wait_s <= 0.0:
+            wait_s = parse_retry_after_value(str(row.get("msg", "") or ""), max_wait_s=3600.0)
+        if wait_s <= 0.0:
+            continue
+        waits.append(wait_s)
+        comp = str(row.get("component", "runtime") or "runtime").strip().lower()
+        by_component[comp] = int(by_component.get(comp, 0)) + 1
+        if int(ts) >= int(last_wait_ts):
+            last_wait_ts = int(ts)
+            last_wait_s = float(wait_s)
+    return {
+        "count_24h": int(len(waits)),
+        "avg_wait_s": round((sum(waits) / max(1, len(waits))), 3) if waits else 0.0,
+        "max_wait_s": round((max(waits) if waits else 0.0), 3),
+        "last_wait_s": round(float(last_wait_s), 3),
+        "last_wait_ts": int(last_wait_ts),
+        "by_component": by_component,
+    }
+
+
+def _stop_flag_payload(path: str) -> Dict[str, Any]:
+    if not os.path.exists(path):
+        return {"active": False, "ts": 0, "age_s": 0}
+    ts = 0
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            raw = str(f.read() or "").strip()
+        if raw:
+            ts = int(float(raw))
+    except Exception:
+        ts = 0
+    try:
+        mtime = int(os.path.getmtime(path))
+    except Exception:
+        mtime = int(time.time())
+    if ts <= 0:
+        ts = mtime
+    age_s = max(0, int(time.time()) - int(ts))
+    return {"active": True, "ts": int(ts), "age_s": int(age_s)}
+
+
+def _run_startup_checks(scripts: Dict[str, str], settings: Dict[str, Any], stale_pid_removed: bool) -> Dict[str, Any]:
+    errors = []
+    warnings = []
+
+    for key, path in scripts.items():
+        if not os.path.isfile(path):
+            errors.append(f"missing_script:{key}:{path}")
+
+    hub_write = _check_writable_dir(HUB_DATA_DIR)
+    if hub_write:
+        errors.append(f"hub_data_not_writable:{hub_write}")
+    log_write = _check_writable_dir(LOG_DIR)
+    if log_write:
+        errors.append(f"log_dir_not_writable:{log_write}")
+
+    try:
+        a_key, a_secret = get_alpaca_creds(settings, base_dir=BASE_DIR)
+        if not (str(a_key or "").strip() and str(a_secret or "").strip()):
+            warnings.append("alpaca_credentials_missing")
+    except Exception:
+        warnings.append("alpaca_credentials_check_failed")
+    try:
+        o_id, o_tok = get_oanda_creds(settings, base_dir=BASE_DIR)
+        if not (str(o_id or "").strip() and str(o_tok or "").strip()):
+            warnings.append("oanda_credentials_missing")
+    except Exception:
+        warnings.append("oanda_credentials_check_failed")
+
+    if stale_pid_removed:
+        warnings.append("stale_pid_file_removed")
+    try:
+        warnings.extend(list(key_file_permission_issues(BASE_DIR)))
+    except Exception:
+        warnings.append("key_permission_check_failed")
+    try:
+        max_age_days = int(float(settings.get("key_rotation_warn_days", 90) or 90))
+        key_rot = list(key_rotation_reminder_issues(BASE_DIR, max_age_days=max_age_days))
+        warnings.extend(key_rot)
+        _atomic_write_json(
+            KEY_ROTATION_STATUS_PATH,
+            {
+                "ts": now_ts(),
+                "warn_days": int(max_age_days),
+                "due": key_rot,
+                "due_count": int(len(key_rot)),
+            },
+        )
+    except Exception:
+        warnings.append("key_rotation_check_failed")
+
+    payload = {
+        "ts": now_ts(),
+        "ok": bool((not errors)),
+        "errors": list(errors),
+        "warnings": list(warnings),
+        "scripts": {k: os.path.abspath(v) for k, v in scripts.items()},
+    }
+    try:
+        _atomic_write_json(RUNTIME_CHECKS_PATH, payload)
+    except Exception:
+        pass
+
+    for msg in errors:
+        _append_incident("error", "runner_startup_check", msg, {"component": "runner"})
+    for msg in warnings:
+        _append_incident("warning", "runner_startup_check", msg, {"component": "runner"})
+    return payload
+
+
+def _pid_is_alive(pid: Optional[int]) -> bool:
+    try:
+        if not pid or int(pid) <= 0:
+            return False
+        os.kill(int(pid), 0)
+        return True
+    except OSError:
+        return False
+
+
+def _read_pid_file(path: str) -> Optional[int]:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            raw = (f.read() or "").strip()
+        pid = int(raw)
+        return pid if pid > 0 else None
+    except Exception:
+        return None
+
+
+def _write_pid_file(path: str, pid: int) -> None:
+    tmp = f"{path}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(str(int(pid)))
+    os.replace(tmp, path)
+
+
+def _remove_file(path: str) -> None:
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+    except OSError:
+        pass
+
+
+def _settings_scripts() -> Dict[str, str]:
+    settings_path = resolve_settings_path(BASE_DIR) or _SETTINGS_PATH or os.path.join(BASE_DIR, "gui_settings.json")
+    data = read_settings_file(settings_path, module_name="pt_runner") or {}
+    data = sanitize_settings(data if isinstance(data, dict) else {})
+    thinker_name = str(data.get("script_neural_runner2", "engines/pt_thinker.py") or "engines/pt_thinker.py").strip()
+    trader_name = str(data.get("script_trader", "engines/pt_trader.py") or "engines/pt_trader.py").strip()
+    markets_name = str(data.get("script_markets_runner", "runtime/pt_markets.py") or "runtime/pt_markets.py").strip()
+    autopilot_name = str(data.get("script_autopilot", "runtime/pt_autopilot.py") or "runtime/pt_autopilot.py").strip()
+    autofix_name = str(data.get("script_autofix", "runtime/pt_autofix.py") or "runtime/pt_autofix.py").strip()
+    return {
+        "thinker": os.path.abspath(os.path.join(BASE_DIR, thinker_name)),
+        "trader": os.path.abspath(os.path.join(BASE_DIR, trader_name)),
+        "markets": os.path.abspath(os.path.join(BASE_DIR, markets_name)),
+        "autopilot": os.path.abspath(os.path.join(BASE_DIR, autopilot_name)),
+        "autofix": os.path.abspath(os.path.join(BASE_DIR, autofix_name)),
+    }
+
+
+def _terminate_process(proc: Optional[subprocess.Popen], name: str, force: bool = False) -> None:
+    if not proc or proc.poll() is not None:
+        return
+    try:
+        if force:
+            proc.kill()
+        else:
+            proc.terminate()
+    except Exception as exc:
+        _runner_log(f"{name}: terminate error {type(exc).__name__}: {exc}")
+
+
+class ChildSpec:
+    def __init__(self, name: str, script_path: str, log_path: str) -> None:
+        self.name = name
+        self.script_path = script_path
+        self.log_path = log_path
+        self.log_handle: Optional[TextIO] = None
+        self.proc: Optional[subprocess.Popen] = None
+        self.restarts = 0
+        self.backoff_s = 1.0
+        self.next_restart_at = 0.0
+        self.lockout_until = 0.0
+        self.crash_times: list[float] = []
+        self.last_exit: Dict[str, Any] = {}
+        self.started_at = 0.0
+
+    def pid(self) -> Optional[int]:
+        if self.proc and self.proc.poll() is None:
+            return int(self.proc.pid)
+        return None
+
+
+class Runner:
+    def __init__(self) -> None:
+        scripts = _settings_scripts()
+        settings_path = resolve_settings_path(BASE_DIR) or _SETTINGS_PATH or os.path.join(BASE_DIR, "gui_settings.json")
+        sdata = read_settings_file(settings_path, module_name="pt_runner") or {}
+        sdata = sanitize_settings(sdata if isinstance(sdata, dict) else {})
+        try:
+            self.crash_lockout_s = max(30.0, float(sdata.get("runner_crash_lockout_s", CRASH_LOCKOUT_S) or CRASH_LOCKOUT_S))
+        except Exception:
+            self.crash_lockout_s = float(CRASH_LOCKOUT_S)
+        self.children = {
+            "thinker": ChildSpec("thinker", scripts["thinker"], THINKER_LOG_PATH),
+            "trader": ChildSpec("trader", scripts["trader"], TRADER_LOG_PATH),
+            "markets": ChildSpec("markets", scripts["markets"], MARKETS_LOG_PATH),
+            "autopilot": ChildSpec("autopilot", scripts["autopilot"], AUTOPILOT_LOG_PATH),
+            "autofix": ChildSpec("autofix", scripts["autofix"], AUTOFIX_LOG_PATH),
+        }
+        self.state = "RUNNING"
+        self.msg = "Supervisor starting"
+        self.running = True
+        self.current_backoff_s = 0.0
+        self._last_log_cleanup_at = 0.0
+        self._last_watchdog_at = 0.0
+        self._last_market_loop_stale_note_at = 0.0
+        self._last_market_loop_restart_at = 0.0
+
+    def write_heartbeat(self) -> None:
+        payload = {
+            "state": self.state,
+            "ts": int(time.time()),
+            "runner_pid": int(os.getpid()),
+            "thinker_pid": self.children["thinker"].pid(),
+            "trader_pid": self.children["trader"].pid(),
+            "markets_pid": self.children["markets"].pid(),
+            "autopilot_pid": self.children["autopilot"].pid(),
+            "autofix_pid": self.children["autofix"].pid(),
+            "restarts": {
+                "thinker": int(self.children["thinker"].restarts),
+                "trader": int(self.children["trader"].restarts),
+                "markets": int(self.children["markets"].restarts),
+                "autopilot": int(self.children["autopilot"].restarts),
+                "autofix": int(self.children["autofix"].restarts),
+            },
+            "last_exit": {
+                "thinker": self.children["thinker"].last_exit or None,
+                "trader": self.children["trader"].last_exit or None,
+                "markets": self.children["markets"].last_exit or None,
+                "autopilot": self.children["autopilot"].last_exit or None,
+                "autofix": self.children["autofix"].last_exit or None,
+            },
+            "backoff_s": float(self.current_backoff_s),
+            "msg": self.msg,
+        }
+        try:
+            _atomic_write_json(TRADER_STATUS_PATH, payload)
+        except Exception as exc:
+            _runner_log(f"heartbeat write failed {type(exc).__name__}: {exc}")
+        try:
+            self._write_runtime_state(payload)
+        except Exception:
+            pass
+
+    def _incident_summary(self, limit: int = 200) -> Dict[str, Any]:
+        sev_counts: Dict[str, int] = {}
+        event_counts: Dict[str, int] = {}
+        lines: list[str] = []
+        now_ts = int(time.time())
+        count_1h = 0
+        count_24h = 0
+        try:
+            with open(INCIDENTS_PATH, "r", encoding="utf-8") as f:
+                lines = [ln.strip() for ln in f if ln.strip()]
+        except Exception:
+            return {"count": 0, "by_severity": {}, "top_events": []}
+
+        for ln in lines[-max(1, int(limit)):]:
+            try:
+                row = json.loads(ln)
+            except Exception:
+                continue
+            sev = str(row.get("severity", "info") or "info").strip().lower()
+            evt = str(row.get("event", "") or "").strip().lower()
+            sev_counts[sev] = int(sev_counts.get(sev, 0)) + 1
+            if evt:
+                event_counts[evt] = int(event_counts.get(evt, 0)) + 1
+            try:
+                ts = int(float(row.get("ts", 0) or 0))
+            except Exception:
+                ts = 0
+            if ts > 0 and (now_ts - ts) <= 3600:
+                count_1h += 1
+            if ts > 0 and (now_ts - ts) <= 86400:
+                count_24h += 1
+        top_events = sorted(event_counts.items(), key=lambda x: x[1], reverse=True)[:6]
+        return {
+            "count": int(len(lines[-max(1, int(limit)):])),
+            "by_severity": sev_counts,
+            "top_events": [{"event": k, "count": int(v)} for k, v in top_events],
+            "count_1h": int(count_1h),
+            "count_24h": int(count_24h),
+        }
+
+    def _write_runtime_state(self, heartbeat_payload: Dict[str, Any]) -> None:
+        settings_path = resolve_settings_path(BASE_DIR) or _SETTINGS_PATH or os.path.join(BASE_DIR, "gui_settings.json")
+        settings = sanitize_settings(read_settings_file(settings_path, module_name="pt_runner") or {})
+        checks = _safe_read_json(RUNTIME_CHECKS_PATH)
+        stock_diag = normalize_scan_diagnostics(
+            _safe_read_json(os.path.join(HUB_DATA_DIR, "stocks", "scan_diagnostics.json")),
+            market="stocks",
+        )
+        forex_diag = normalize_scan_diagnostics(
+            _safe_read_json(os.path.join(HUB_DATA_DIR, "forex", "scan_diagnostics.json")),
+            market="forex",
+        )
+        sla = _safe_read_json(os.path.join(HUB_DATA_DIR, "market_sla_metrics.json"))
+        scan_drift = _safe_read_json(os.path.join(HUB_DATA_DIR, "scan_drift_alerts.json"))
+        scan_cadence = _safe_read_json(CADENCE_DRIFT_PATH)
+        trends = _safe_read_json(os.path.join(HUB_DATA_DIR, "market_trends.json"))
+        exec_guard = _safe_read_json(os.path.join(HUB_DATA_DIR, "broker_execution_guard.json"))
+        drawdown_guard = _safe_read_json(DRAWDOWN_GUARD_PATH)
+        market_loop = _safe_read_json(MARKET_LOOP_STATUS_PATH)
+        key_rotation = _safe_read_json(KEY_ROTATION_STATUS_PATH)
+        if not isinstance(key_rotation, dict) or (not key_rotation):
+            key_rotation = {"ts": now_ts(), "warn_days": int(settings.get("key_rotation_warn_days", 90) or 90), "due": [], "due_count": 0}
+            try:
+                _atomic_write_json(KEY_ROTATION_STATUS_PATH, key_rotation)
+            except Exception:
+                pass
+        autopilot = _safe_read_json(os.path.join(HUB_DATA_DIR, "autopilot_status.json"))
+        autofix = _safe_read_json(os.path.join(HUB_DATA_DIR, "autofix_status.json"))
+        stock_broker = _safe_read_json(os.path.join(HUB_DATA_DIR, "stocks", "alpaca_status.json"))
+        forex_broker = _safe_read_json(os.path.join(HUB_DATA_DIR, "forex", "oanda_status.json"))
+        status = _safe_read_json(TRADER_STATUS_PATH)
+        incidents_rows = _read_jsonl_tail(INCIDENTS_PATH, limit=800)
+        runtime_event_rows = _read_jsonl_tail(RUNTIME_EVENTS_PATH, limit=2000)
+        try:
+            quota_warn = max(1, int(float(settings.get("runtime_api_quota_warn_15m", 4) or 4)))
+        except Exception:
+            quota_warn = 4
+        try:
+            quota_crit = max(quota_warn, int(float(settings.get("runtime_api_quota_crit_15m", 10) or 10)))
+        except Exception:
+            quota_crit = 10
+        api_quota = summarize_quota_events(
+            incidents_rows,
+            now_ts=time.time(),
+            warn_15m=quota_warn,
+            crit_15m=quota_crit,
+        )
+        api_quota["thresholds"] = {"warn_15m": int(quota_warn), "crit_15m": int(quota_crit)}
+        broker_backoff = _summarize_broker_backoff_events(runtime_event_rows, now_ts_value=time.time())
+
+        def _broker_state(name: str, payload: Dict[str, Any], quota_row: Dict[str, Any]) -> Dict[str, Any]:
+            st = str(payload.get("state", "") or "").upper().strip()
+            msg = str(payload.get("msg", "") or "").strip()
+            quota_state = str(quota_row.get("status", "ok") or "ok").strip().lower()
+            state = "ok"
+            if st in {"ERROR", "NOT CONFIGURED"}:
+                state = "error"
+            elif quota_state == "critical":
+                state = "error"
+            elif quota_state == "warning":
+                state = "warning"
+            return {
+                "name": name,
+                "state": state,
+                "status_text": st or "UNKNOWN",
+                "quota_15m": int(quota_row.get("count_15m", 0) or 0),
+                "quota_60m": int(quota_row.get("count_60m", 0) or 0),
+                "quota_last_ts": int(quota_row.get("last_ts", 0) or 0),
+                "msg": msg[:240],
+            }
+
+        qmap = api_quota.get("by_component", {}) if isinstance(api_quota.get("by_component", {}), dict) else {}
+        broker_health = {
+            "alpaca": _broker_state("Alpaca", stock_broker, qmap.get("alpaca", {}) if isinstance(qmap.get("alpaca", {}), dict) else {}),
+            "oanda": _broker_state("OANDA", forex_broker, qmap.get("oanda", {}) if isinstance(qmap.get("oanda", {}), dict) else {}),
+            "kucoin": _broker_state(
+                "KuCoin",
+                {"state": ("ERROR" if bool(autopilot.get("api_unstable", False)) else "READY"), "msg": ""},
+                qmap.get("kucoin", {}) if isinstance(qmap.get("kucoin", {}), dict) else {},
+            ),
+        }
+
+        payload = {
+            "ts": int(time.time()),
+            "runner": {
+                "state": str(heartbeat_payload.get("state", "") or ""),
+                "msg": str(heartbeat_payload.get("msg", "") or ""),
+                "pid": int(os.getpid()),
+                "children": {
+                    "thinker": status.get("thinker_pid"),
+                    "trader": status.get("trader_pid"),
+                    "markets": status.get("markets_pid"),
+                    "autopilot": status.get("autopilot_pid"),
+                    "autofix": status.get("autofix_pid"),
+                },
+                "restarts": dict(heartbeat_payload.get("restarts", {}) or {}),
+                "last_exit": dict(heartbeat_payload.get("last_exit", {}) or {}),
+            },
+            "checks": {
+                "ok": bool(checks.get("ok", False)),
+                "errors": list(checks.get("errors", []) or []),
+                "warnings": list(checks.get("warnings", []) or []),
+            },
+            "scan_health": {
+                "stocks": {
+                    "state": str(stock_diag.get("state", "") or ""),
+                    "leaders_total": int(stock_diag.get("leaders_total", 0) or 0),
+                    "scores_total": int(stock_diag.get("scores_total", 0) or 0),
+                    "reject_rate_pct": float(((stock_diag.get("reject_summary", {}) or {}).get("reject_rate_pct", 0.0) or 0.0)),
+                    "reject_dominant_reason": str(((stock_diag.get("reject_summary", {}) or {}).get("dominant_reason", "") or "")),
+                    "reject_dominant_ratio_pct": float(((stock_diag.get("reject_summary", {}) or {}).get("dominant_ratio_pct", 0.0) or 0.0)),
+                },
+                "forex": {
+                    "state": str(forex_diag.get("state", "") or ""),
+                    "leaders_total": int(forex_diag.get("leaders_total", 0) or 0),
+                    "scores_total": int(forex_diag.get("scores_total", 0) or 0),
+                    "reject_rate_pct": float(((forex_diag.get("reject_summary", {}) or {}).get("reject_rate_pct", 0.0) or 0.0)),
+                    "reject_dominant_reason": str(((forex_diag.get("reject_summary", {}) or {}).get("dominant_reason", "") or "")),
+                    "reject_dominant_ratio_pct": float(((forex_diag.get("reject_summary", {}) or {}).get("dominant_ratio_pct", 0.0) or 0.0)),
+                },
+            },
+            "sla_metrics": dict((sla.get("metrics", {}) if isinstance(sla.get("metrics", {}), dict) else {})),
+            "scan_drift": {
+                "active": list(scan_drift.get("active", []) or []) if isinstance(scan_drift.get("active", []), list) else [],
+                "markets": dict(scan_drift.get("markets", {}) or {}) if isinstance(scan_drift.get("markets", {}), dict) else {},
+                "ts": int(scan_drift.get("ts", 0) or 0),
+            },
+            "scan_cadence": {
+                "active": list(scan_cadence.get("active", []) or []) if isinstance(scan_cadence.get("active", []), list) else [],
+                "markets": dict(scan_cadence.get("markets", {}) or {}) if isinstance(scan_cadence.get("markets", {}), dict) else {},
+                "ts": int(scan_cadence.get("ts", 0) or 0),
+            },
+            "execution_guard": {
+                "markets": dict(exec_guard.get("markets", {}) or {}) if isinstance(exec_guard.get("markets", {}), dict) else {},
+                "ts": int(exec_guard.get("ts", 0) or 0),
+            },
+            "drawdown_guard": {
+                "triggered_ts": int(drawdown_guard.get("triggered_ts", 0) or 0),
+                "drawdown_pct": float(drawdown_guard.get("drawdown_pct", 0.0) or 0.0),
+                "limit_pct": float(drawdown_guard.get("limit_pct", 0.0) or 0.0),
+                "lookback_hours": int(drawdown_guard.get("lookback_hours", 0) or 0),
+                "triggered_recent": bool(
+                    int(drawdown_guard.get("triggered_ts", 0) or 0) > 0
+                    and (int(time.time()) - int(drawdown_guard.get("triggered_ts", 0) or 0)) <= 86400
+                ),
+            },
+            "stop_flag": _stop_flag_payload(STOP_FLAG_PATH),
+            "key_rotation": {
+                "warn_days": int(key_rotation.get("warn_days", 0) or 0),
+                "due": list(key_rotation.get("due", []) or []) if isinstance(key_rotation.get("due", []), list) else [],
+                "due_count": int(key_rotation.get("due_count", 0) or 0),
+                "ts": int(key_rotation.get("ts", 0) or 0),
+            },
+            "market_loop": {
+                "ts": int(market_loop.get("ts", 0) or 0),
+                "age_s": (
+                    max(0, int(time.time()) - int(market_loop.get("ts", 0) or 0))
+                    if int(market_loop.get("ts", 0) or 0) > 0
+                    else -1
+                ),
+                "stocks_last_scan_ts": int(market_loop.get("stocks_last_scan_ts", 0) or 0),
+                "forex_last_scan_ts": int(market_loop.get("forex_last_scan_ts", 0) or 0),
+                "stocks_last_step_ts": int(market_loop.get("stocks_last_step_ts", 0) or 0),
+                "forex_last_step_ts": int(market_loop.get("forex_last_step_ts", 0) or 0),
+                "stocks_cadence": dict(
+                    ((market_loop.get("stocks_cycle", {}) if isinstance(market_loop.get("stocks_cycle", {}), dict) else {}).get("cadence", {}) or {})
+                    if isinstance((market_loop.get("stocks_cycle", {}) if isinstance(market_loop.get("stocks_cycle", {}), dict) else {}).get("cadence", {}), dict)
+                    else {}
+                ),
+                "forex_cadence": dict(
+                    ((market_loop.get("forex_cycle", {}) if isinstance(market_loop.get("forex_cycle", {}), dict) else {}).get("cadence", {}) or {})
+                    if isinstance((market_loop.get("forex_cycle", {}) if isinstance(market_loop.get("forex_cycle", {}), dict) else {}).get("cadence", {}), dict)
+                    else {}
+                ),
+            },
+            "market_trends": {
+                "stocks": dict(trends.get("stocks", {}) or {}) if isinstance(trends.get("stocks", {}), dict) else {},
+                "forex": dict(trends.get("forex", {}) or {}) if isinstance(trends.get("forex", {}), dict) else {},
+                "ts": int(trends.get("ts", 0) or 0),
+            },
+            "exposure_map": build_exposure_payload(HUB_DATA_DIR),
+            "autopilot": {
+                "stable_cycles": int(autopilot.get("stable_cycles", 0) or 0),
+                "api_unstable": bool(autopilot.get("api_unstable", False)),
+                "markets_healthy": bool(autopilot.get("markets_healthy", False)),
+                "issue_open": bool(autopilot.get("issue_open", False)),
+            },
+            "autofix": {
+                "enabled": bool(autofix.get("enabled", False)),
+                "mode": str(autofix.get("mode", "") or ""),
+                "tickets_created": int(autofix.get("tickets_created", 0) or 0),
+                "applied_ok": int(autofix.get("applied_ok", 0) or 0),
+                "applied_count_day": int(autofix.get("applied_count_day", 0) or 0),
+                "last_ticket_id": str(autofix.get("last_ticket_id", "") or ""),
+                "api_key_configured": bool(autofix.get("api_key_configured", False)),
+            },
+            "api_quota": api_quota,
+            "broker_backoff": broker_backoff,
+            "broker_health": broker_health,
+            "incidents_last_200": self._incident_summary(limit=200),
+        }
+        payload["alerts"] = evaluate_runtime_alerts(payload, settings)
+        _atomic_write_json(RUNTIME_STATE_PATH, payload)
+
+    def _status_file_stale(self, path: str, max_age_s: float) -> bool:
+        try:
+            st = os.stat(path)
+            age = time.time() - float(st.st_mtime)
+            return age > float(max_age_s)
+        except Exception:
+            return True
+
+    def _child_uptime_s(self, child: Optional[ChildSpec], now: float) -> float:
+        if child is None or child.proc is None or child.proc.poll() is not None:
+            return 0.0
+        started_at = float(getattr(child, "started_at", 0.0) or 0.0)
+        if started_at <= 0.0:
+            return 1e9
+        return max(0.0, float(now) - started_at)
+
+    def _watchdog_tick(self, now: float) -> None:
+        if (now - self._last_watchdog_at) < WATCHDOG_INTERVAL_S:
+            return
+        self._last_watchdog_at = now
+
+        settings_path = resolve_settings_path(BASE_DIR) or _SETTINGS_PATH or os.path.join(BASE_DIR, "gui_settings.json")
+        settings = sanitize_settings(read_settings_file(settings_path, module_name="pt_runner") or {})
+        market_interval = max(6.0, float(settings.get("market_bg_forex_interval_s", 12.0) or 12.0))
+        autopilot_interval = 30.0
+        try:
+            market_startup_grace_s = max(
+                20.0,
+                float(settings.get("runner_market_watchdog_startup_grace_s", 90.0) or 90.0),
+            )
+        except Exception:
+            market_startup_grace_s = 90.0
+        try:
+            autopilot_startup_grace_s = max(
+                20.0,
+                float(settings.get("runner_autopilot_watchdog_startup_grace_s", 60.0) or 60.0),
+            )
+        except Exception:
+            autopilot_startup_grace_s = 60.0
+        try:
+            market_loop_startup_grace_s = max(
+                market_startup_grace_s,
+                float(settings.get("runner_market_loop_startup_grace_s", 150.0) or 150.0),
+            )
+        except Exception:
+            market_loop_startup_grace_s = max(market_startup_grace_s, 150.0)
+
+        targets = [
+            (
+                "markets",
+                os.path.join(HUB_DATA_DIR, "stocks", "stock_trader_status.json"),
+                market_interval * MARKETS_STALE_MULT,
+            ),
+            (
+                "autopilot",
+                os.path.join(HUB_DATA_DIR, "autopilot_status.json"),
+                autopilot_interval * AUTOPILOT_STALE_MULT,
+            ),
+        ]
+
+        for key, path, stale_after in targets:
+            child = self.children.get(key)
+            if not child or not child.proc or child.proc.poll() is not None:
+                continue
+            startup_grace_s = market_startup_grace_s if key == "markets" else autopilot_startup_grace_s
+            if self._child_uptime_s(child, now) < startup_grace_s:
+                continue
+            if not self._status_file_stale(path, stale_after):
+                continue
+            msg = f"{key} appears hung (stale status>{int(stale_after)}s); restarting"
+            self.msg = msg
+            _runner_log(msg)
+            _append_incident("warning", "runner_watchdog_restart", msg, {"child": key, "status_path": path})
+            _terminate_process(child.proc, key, force=False)
+
+        # Extra signal: markets loop heartbeat is stale even if process has not yet been restarted.
+        markets_child = self.children.get("markets")
+        if markets_child and markets_child.proc and markets_child.proc.poll() is None:
+            loop_stale_after = market_interval * MARKETS_STALE_MULT
+            if self._child_uptime_s(markets_child, now) < market_loop_startup_grace_s:
+                return
+            if (not os.path.isfile(MARKET_LOOP_STATUS_PATH)) and self._child_uptime_s(markets_child, now) < (
+                market_loop_startup_grace_s + loop_stale_after
+            ):
+                return
+            if self._status_file_stale(MARKET_LOOP_STATUS_PATH, loop_stale_after):
+                stale_msg = f"market loop status stale>{int(loop_stale_after)}s (markets child alive)"
+                if (now - self._last_market_loop_stale_note_at) >= 60.0:
+                    self._last_market_loop_stale_note_at = now
+                    _runner_log(stale_msg)
+                    _append_incident(
+                        "warning",
+                        "runner_market_loop_status_stale",
+                        stale_msg,
+                        {"status_path": MARKET_LOOP_STATUS_PATH, "stale_after_s": int(loop_stale_after)},
+                    )
+                restart_cooldown_s = max(float(MARKET_LOOP_RESTART_COOLDOWN_S), float(market_interval) * 3.0)
+                if (now - self._last_market_loop_restart_at) >= restart_cooldown_s:
+                    self._last_market_loop_restart_at = now
+                    restart_msg = (
+                        f"market loop stale>{int(loop_stale_after)}s; restarting markets child "
+                        f"(cooldown {int(restart_cooldown_s)}s)"
+                    )
+                    self.msg = restart_msg
+                    _runner_log(restart_msg)
+                    _append_incident(
+                        "warning",
+                        "runner_market_loop_restart",
+                        restart_msg,
+                        {
+                            "status_path": MARKET_LOOP_STATUS_PATH,
+                            "stale_after_s": int(loop_stale_after),
+                            "cooldown_s": int(restart_cooldown_s),
+                        },
+                    )
+                    _terminate_process(markets_child.proc, "markets", force=False)
+
+    def _retention_tick(self, now: float) -> None:
+        if (now - self._last_log_cleanup_at) < LOG_RETENTION_INTERVAL_S:
+            return
+        self._last_log_cleanup_at = now
+        settings_path = resolve_settings_path(BASE_DIR) or _SETTINGS_PATH or os.path.join(BASE_DIR, "gui_settings.json")
+        settings = sanitize_settings(read_settings_file(settings_path, module_name="pt_runner") or {})
+        stats = cleanup_logs(
+            LOG_DIR,
+            keep_patterns=("runner.log", "thinker.log", "trader.log", "markets.log", "autopilot.log", "autofix.log"),
+            max_age_days=LOG_RETENTION_AGE_DAYS,
+            max_total_bytes=LOG_RETENTION_MAX_TOTAL_BYTES,
+        )
+        try:
+            cache_stats = prune_data_cache(
+                HUB_DATA_DIR,
+                max_age_days=float(settings.get("data_cache_max_age_days", 14.0) or 14.0),
+                max_total_bytes=int(float(settings.get("data_cache_max_total_mb", 300) or 300) * 1024 * 1024),
+            )
+        except Exception:
+            cache_stats = {"removed": 0, "removed_bytes": 0}
+        try:
+            quality_stats = prune_scanner_quality_artifacts(
+                HUB_DATA_DIR,
+                max_age_days=float(settings.get("scanner_quality_max_age_days", 14.0) or 14.0),
+            )
+        except Exception:
+            quality_stats = {"removed": 0, "removed_bytes": 0}
+        try:
+            incidents_limit = int(float(settings.get("runtime_incidents_max_lines", 25000) or 25000))
+        except Exception:
+            incidents_limit = 25000
+        try:
+            events_limit = int(float(settings.get("runtime_events_max_lines", 50000) or 50000))
+        except Exception:
+            events_limit = 50000
+        incidents_trim = trim_jsonl_max_lines(INCIDENTS_PATH, max_lines=incidents_limit)
+        events_trim = trim_jsonl_max_lines(RUNTIME_EVENTS_PATH, max_lines=events_limit)
+        if int(stats.get("removed", 0) or 0) > 0:
+            _runner_log(
+                f"log cleanup removed={int(stats.get('removed', 0))} removed_bytes={int(stats.get('removed_bytes', 0))}"
+            )
+            runtime_event(
+                RUNTIME_EVENTS_PATH,
+                component="runner",
+                event="log_cleanup",
+                level="info",
+                msg="log cleanup completed",
+                details=stats,
+            )
+        if int(cache_stats.get("removed", 0) or 0) > 0:
+            runtime_event(
+                RUNTIME_EVENTS_PATH,
+                component="runner",
+                event="cache_cleanup",
+                level="info",
+                msg="data cache cleanup completed",
+                details=cache_stats,
+            )
+        if int(quality_stats.get("removed", 0) or 0) > 0:
+            runtime_event(
+                RUNTIME_EVENTS_PATH,
+                component="runner",
+                event="quality_cleanup",
+                level="info",
+                msg="scanner quality artifact cleanup completed",
+                details=quality_stats,
+            )
+        if bool(incidents_trim.get("trimmed", False)) or bool(events_trim.get("trimmed", False)):
+            runtime_event(
+                RUNTIME_EVENTS_PATH,
+                component="runner",
+                event="jsonl_trim",
+                level="info",
+                msg="runtime jsonl retention trim completed",
+                details={
+                    "incidents": incidents_trim,
+                    "events": events_trim,
+                },
+            )
+
+    def _drawdown_guard_tick(self, now: float) -> None:
+        settings_path = resolve_settings_path(BASE_DIR) or _SETTINGS_PATH or os.path.join(BASE_DIR, "gui_settings.json")
+        settings = sanitize_settings(read_settings_file(settings_path, module_name="pt_runner") or {})
+        max_dd = float(settings.get("global_max_drawdown_pct", 0.0) or 0.0)
+        if max_dd <= 0.0:
+            return
+        lookback_h = int(float(settings.get("global_drawdown_lookback_hours", 24) or 24))
+        dd_pct = _intraday_drawdown_pct(os.path.join(HUB_DATA_DIR, "account_value_history.jsonl"), lookback_hours=lookback_h)
+        if dd_pct > (-max_dd):
+            return
+        guard = _safe_read_json(DRAWDOWN_GUARD_PATH)
+        last_ts = int(guard.get("triggered_ts", 0) or 0) if isinstance(guard, dict) else 0
+        if (now - float(last_ts)) < 300.0:
+            return
+        payload = {
+            "triggered_ts": int(now),
+            "drawdown_pct": float(round(dd_pct, 6)),
+            "limit_pct": float(max_dd),
+            "lookback_hours": int(lookback_h),
+        }
+        _atomic_write_json(DRAWDOWN_GUARD_PATH, payload)
+        _append_incident(
+            "critical",
+            "global_drawdown_guard",
+            f"Global drawdown guard triggered ({dd_pct:.2f}% <= -{max_dd:.2f}%). Stopping trading.",
+            payload,
+        )
+        try:
+            with open(STOP_FLAG_PATH, "w", encoding="utf-8") as f:
+                f.write(str(int(now)))
+        except Exception:
+            pass
+
+    def start_child(self, key: str) -> None:
+        child = self.children[key]
+        if child.proc and child.proc.poll() is None:
+            return
+        if not os.path.isfile(child.script_path):
+            self.state = "ERROR"
+            self.msg = f"Missing script: {child.script_path}"
+            _runner_log(self.msg)
+            _append_incident("error", "runner_missing_script", self.msg, {"child": key, "path": child.script_path})
+            return
+        try:
+            if child.log_handle is not None:
+                try:
+                    child.log_handle.close()
+                except Exception:
+                    pass
+            _rotate_log_file(child.log_path)
+            log_f = open(child.log_path, "a", encoding="utf-8")
+            child.log_handle = log_f
+            env = os.environ.copy()
+            env["POWERTRADER_HUB_DIR"] = HUB_DATA_DIR
+            env["POWERTRADER_PROJECT_DIR"] = BASE_DIR
+            prev_pp = str(env.get("PYTHONPATH", "") or "").strip()
+            env["PYTHONPATH"] = BASE_DIR if not prev_pp else (BASE_DIR + os.pathsep + prev_pp)
+            proc = subprocess.Popen(
+                [sys.executable, "-u", child.script_path],
+                cwd=BASE_DIR,
+                env=env,
+                stdout=log_f,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+                text=True,
+            )
+            child.proc = proc
+            child.next_restart_at = 0.0
+            child.started_at = float(time.time())
+            self.msg = f"Started {key} pid={proc.pid}"
+            _runner_log(self.msg)
+        except Exception as exc:
+            child.proc = None
+            child.started_at = 0.0
+            child.next_restart_at = time.time() + min(MAX_BACKOFF_S, child.backoff_s)
+            self.state = "ERROR"
+            self.msg = f"Failed to start {key}: {type(exc).__name__}: {exc}"
+            _runner_log(self.msg)
+            _append_incident("error", "runner_child_start_failed", self.msg, {"child": key})
+
+    def handle_exit(self, key: str) -> None:
+        child = self.children[key]
+        if not child.proc:
+            return
+        code = child.proc.poll()
+        if code is None:
+            return
+        now = time.time()
+        child.last_exit = {"code": int(code), "ts": int(now)}
+        child.crash_times = [ts for ts in child.crash_times if (now - ts) <= CRASH_WINDOW_S]
+        child.crash_times.append(now)
+        child.restarts += 1
+        child.backoff_s = min(MAX_BACKOFF_S, child.backoff_s * 2.0 if child.backoff_s > 0 else 1.0)
+        child.next_restart_at = now + child.backoff_s
+        self.current_backoff_s = child.backoff_s
+        child.proc = None
+        child.started_at = 0.0
+        if child.log_handle is not None:
+            try:
+                child.log_handle.close()
+            except Exception:
+                pass
+            child.log_handle = None
+        if len(child.crash_times) >= CRASH_THRESHOLD:
+            self.state = "ERROR"
+            child.lockout_until = now + float(self.crash_lockout_s)
+            child.next_restart_at = max(child.next_restart_at, child.lockout_until)
+            self.msg = f"{key} crash loop; lockout {self.crash_lockout_s:.0f}s"
+            _append_incident(
+                "error",
+                "runner_child_crash_loop",
+                self.msg,
+                {
+                    "child": key,
+                    "crashes_in_window": int(len(child.crash_times)),
+                    "backoff_s": float(child.backoff_s),
+                    "lockout_s": float(self.crash_lockout_s),
+                },
+            )
+        else:
+            self.state = "RUNNING"
+            self.msg = f"{key} exited code={code}; restarting in {child.backoff_s:.0f}s"
+            _append_incident(
+                "warning",
+                "runner_child_exit",
+                self.msg,
+                {"child": key, "code": int(code), "backoff_s": float(child.backoff_s)},
+            )
+        _runner_log(self.msg)
+
+    def stop_all(self, force: bool = False) -> None:
+        self.state = "STOPPING"
+        self.msg = "Stopping child processes"
+        self.write_heartbeat()
+        for child in self.children.values():
+            _terminate_process(child.proc, child.name, force=force)
+
+    def wait_for_children(self, timeout_s: float = 5.0) -> None:
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            alive = False
+            for child in self.children.values():
+                if child.proc and child.proc.poll() is None:
+                    alive = True
+                    break
+            if not alive:
+                return
+            time.sleep(0.2)
+
+    def graceful_shutdown(self) -> None:
+        self.stop_all(force=False)
+        self.wait_for_children(timeout_s=5.0)
+        alive_after_term = [name for name, c in self.children.items() if c.proc and c.proc.poll() is None]
+        if alive_after_term:
+            _runner_log(f"graceful shutdown timeout; force-killing {len(alive_after_term)} child process(es)")
+            _append_incident(
+                "warning",
+                "runner_forced_shutdown",
+                "force kill required after graceful timeout",
+                {"children": alive_after_term},
+            )
+        self.stop_all(force=True)
+
+    def run(self) -> int:
+        last_heartbeat = 0.0
+        while self.running:
+            if os.path.exists(STOP_FLAG_PATH):
+                self.state = "STOPPING"
+                self.msg = "Stop flag detected"
+                self.graceful_shutdown()
+                self.state = "STOPPED"
+                self.msg = "Stopped by flag"
+                self.write_heartbeat()
+                return 0
+
+            now = time.time()
+            for key, child in self.children.items():
+                if child.proc and child.proc.poll() is not None:
+                    self.handle_exit(key)
+                if child.lockout_until > now:
+                    continue
+                if (not child.proc) and now >= float(child.next_restart_at):
+                    self.start_child(key)
+            self._drawdown_guard_tick(now)
+            self._watchdog_tick(now)
+            self._retention_tick(now)
+
+            if (now - last_heartbeat) >= HEARTBEAT_INTERVAL_S:
+                if self.state not in ("ERROR", "STOPPING"):
+                    self.state = "RUNNING"
+                if not any(child.pid() for child in self.children.values()):
+                    self.msg = "Waiting for child processes"
+                self.write_heartbeat()
+                last_heartbeat = now
+            time.sleep(0.5)
+        return 0
+
+
+def _install_signal_handlers(runner: Runner) -> None:
+    def _handle(_signum: int, _frame: Any) -> None:
+        runner.running = False
+        runner.state = "STOPPING"
+        runner.msg = "Signal received"
+        runner.graceful_shutdown()
+        runner.state = "STOPPED"
+        runner.msg = "Stopped by signal"
+        runner.write_heartbeat()
+
+    signal.signal(signal.SIGTERM, _handle)
+    signal.signal(signal.SIGINT, _handle)
+
+
+def main() -> int:
+    existing_pid = _read_pid_file(RUNNER_PID_PATH)
+    if _pid_is_alive(existing_pid):
+        _runner_log(f"runner already active pid={existing_pid}; exiting")
+        return 0
+
+    stale_pid_removed = False
+    if existing_pid and (not _pid_is_alive(existing_pid)):
+        _runner_log(f"stale runner pid file detected pid={existing_pid}; removing")
+        _remove_file(RUNNER_PID_PATH)
+        stale_pid_removed = True
+
+    settings_path = resolve_settings_path(BASE_DIR) or _SETTINGS_PATH or os.path.join(BASE_DIR, "gui_settings.json")
+    settings = read_settings_file(settings_path, module_name="pt_runner") or {}
+    settings = sanitize_settings(settings if isinstance(settings, dict) else {})
+    scripts = _settings_scripts()
+    checks = _run_startup_checks(scripts, settings, stale_pid_removed=stale_pid_removed)
+    if not bool(checks.get("ok", False)):
+        _runner_log("startup checks failed; refusing to start runner")
+        return 1
+
+    _write_pid_file(RUNNER_PID_PATH, os.getpid())
+    runner = Runner()
+    _install_signal_handlers(runner)
+
+    try:
+        runner.write_heartbeat()
+        return runner.run()
+    finally:
+        runner.stop_all(force=True)
+        for child in runner.children.values():
+            if child.log_handle is not None:
+                try:
+                    child.log_handle.close()
+                except Exception:
+                    pass
+                child.log_handle = None
+        runner.state = "STOPPED"
+        runner.msg = "Runner exiting"
+        runner.write_heartbeat()
+        _remove_file(RUNNER_PID_PATH)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

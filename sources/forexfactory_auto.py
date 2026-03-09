@@ -2,7 +2,7 @@ import requests
 import pandas as pd
 from datetime import datetime
 from io import StringIO
-from models import NewsEvent
+from app.models import NewsEvent
 
 # ForexFactory weekly calendar export
 # (same file downloaded via website Export button)

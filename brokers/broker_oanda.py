@@ -1,0 +1,380 @@
+from __future__ import annotations
+
+import json
+import urllib.error
+import urllib.request
+from typing import Any, Dict, List, Tuple
+
+from app.backoff_policy import BackoffPolicy
+from app.http_utils import retry_after_from_urllib_http_error
+
+
+def _retry_after_seconds_from_http_error(exc: urllib.error.HTTPError) -> float:
+    return retry_after_from_urllib_http_error(exc, max_wait_s=300.0)
+
+
+class OandaBrokerClient:
+    def __init__(self, account_id: str, api_token: str, rest_url: str) -> None:
+        self.account_id = str(account_id or "").strip()
+        self.api_token = str(api_token or "").strip()
+        self.rest_url = str(rest_url or "").strip().rstrip("/")
+
+    def configured(self) -> bool:
+        return bool(self.account_id and self.api_token and self.rest_url)
+
+    @staticmethod
+    def _as_float(v: Any, default: float = 0.0) -> float:
+        try:
+            return float(v)
+        except Exception:
+            return float(default)
+
+    def _request_json(self, path: str, timeout: float = 8.0) -> Dict[str, Any]:
+        req = urllib.request.Request(
+            f"{self.rest_url}{path}",
+            headers={"Authorization": f"Bearer {self.api_token}"},
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+        return payload if isinstance(payload, dict) else {}
+
+    def _request(self, method: str, path: str, body: Dict[str, Any] | None = None, timeout: float = 8.0) -> Dict[str, Any]:
+        raw = None
+        headers = {"Authorization": f"Bearer {self.api_token}"}
+        if body is not None:
+            raw = json.dumps(body).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+        req = urllib.request.Request(
+            f"{self.rest_url}{path}",
+            headers=headers,
+            data=raw,
+            method=method,
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+        return payload if isinstance(payload, dict) else {}
+
+    def test_connection(self) -> Tuple[bool, str]:
+        if not self.configured():
+            return False, "OANDA credentials missing"
+        try:
+            payload = self._request_json(f"/v3/accounts/{self.account_id}/summary")
+            acct = payload.get("account", {}) or {}
+            nav = acct.get("NAV", "N/A")
+            currency = acct.get("currency", "")
+            return True, f"Connected | NAV={nav} {currency}".strip()
+        except urllib.error.HTTPError as exc:
+            return False, f"HTTP {exc.code}: {exc.reason}"
+        except urllib.error.URLError as exc:
+            return False, f"Network error: {exc.reason}"
+        except Exception as exc:
+            return False, f"{type(exc).__name__}: {exc}"
+
+    def fetch_snapshot(self) -> Dict[str, Any]:
+        if not self.configured():
+            return {
+                "state": "NOT CONFIGURED",
+                "ai_state": "Credentials missing",
+                "trader_state": "Idle",
+                "msg": "Add OANDA practice credentials in Settings",
+                "buying_power": "Pending account link",
+                "open_positions": "0",
+                "realized_pnl": "N/A",
+                "positions_preview": [],
+            }
+
+        try:
+            summary_payload = self._request_json(f"/v3/accounts/{self.account_id}/summary")
+            positions_payload = self._request_json(f"/v3/accounts/{self.account_id}/openPositions")
+            acct = summary_payload.get("account", {}) or {}
+            raw_positions = positions_payload.get("positions", []) or []
+            if not isinstance(raw_positions, list):
+                raw_positions = []
+
+            preview: List[str] = []
+            for pos in raw_positions[:8]:
+                if not isinstance(pos, dict):
+                    continue
+                inst = str(pos.get("instrument", "") or "").strip()
+                long_units = str(((pos.get("long") or {}).get("units", "")) or "").strip()
+                short_units = str(((pos.get("short") or {}).get("units", "")) or "").strip()
+                upl = str(((pos.get("long") or {}).get("unrealizedPL", "")) or ((pos.get("short") or {}).get("unrealizedPL", "")) or "").strip()
+                side = f"L {long_units}" if long_units and long_units not in ("0", "0.0") else f"S {short_units}"
+                preview.append(f"{inst} | {side} | uPnL {upl or '0'}")
+
+            currency = str(acct.get("currency", "") or "").strip()
+            nav = acct.get("NAV", "N/A")
+            pl = acct.get("pl", "N/A")
+            nav_f = self._as_float(nav, 0.0)
+            pl_f = self._as_float(pl, 0.0)
+            margin_available_f = self._as_float(acct.get("marginAvailable", 0.0), 0.0)
+            return {
+                "state": "READY",
+                "ai_state": "Broker linked",
+                "trader_state": "Practice mode ready",
+                "msg": f"NAV {nav} {currency}".strip(),
+                "buying_power": f"{acct.get('marginAvailable', 'N/A')} {currency}".strip(),
+                "open_positions": str(len(raw_positions)),
+                "realized_pnl": f"{pl} {currency}".strip(),
+                "positions_preview": preview,
+                "raw_positions": raw_positions,
+                "nav": nav_f,
+                "pl_value": pl_f,
+                "margin_available": margin_available_f,
+                "currency": currency,
+            }
+        except urllib.error.HTTPError as exc:
+            return {
+                "state": "ERROR",
+                "ai_state": "Broker error",
+                "trader_state": "Idle",
+                "msg": f"HTTP {exc.code}: {exc.reason}",
+                "buying_power": "N/A",
+                "open_positions": "0",
+                "realized_pnl": "N/A",
+                "positions_preview": [],
+                "raw_positions": [],
+                "nav": 0.0,
+                "pl_value": 0.0,
+                "margin_available": 0.0,
+                "currency": "",
+            }
+        except urllib.error.URLError as exc:
+            return {
+                "state": "ERROR",
+                "ai_state": "Network error",
+                "trader_state": "Idle",
+                "msg": f"Network error: {exc.reason}",
+                "buying_power": "N/A",
+                "open_positions": "0",
+                "realized_pnl": "N/A",
+                "positions_preview": [],
+                "raw_positions": [],
+                "nav": 0.0,
+                "pl_value": 0.0,
+                "margin_available": 0.0,
+                "currency": "",
+            }
+        except Exception as exc:
+            return {
+                "state": "ERROR",
+                "ai_state": "Load failed",
+                "trader_state": "Idle",
+                "msg": f"{type(exc).__name__}: {exc}",
+                "buying_power": "N/A",
+                "open_positions": "0",
+                "realized_pnl": "N/A",
+                "positions_preview": [],
+                "raw_positions": [],
+                "nav": 0.0,
+                "pl_value": 0.0,
+                "margin_available": 0.0,
+                "currency": "",
+            }
+
+    def get_mid_prices(self, instruments: List[str]) -> Dict[str, float]:
+        if not self.configured():
+            return {}
+        items = [str(x).strip().upper() for x in (instruments or []) if str(x).strip()]
+        if not items:
+            return {}
+        qs = ",".join(items)
+        try:
+            payload = self._request_json(f"/v3/accounts/{self.account_id}/pricing?instruments={qs}", timeout=8.0)
+        except Exception:
+            return {}
+        prices = payload.get("prices", []) or []
+        out: Dict[str, float] = {}
+        if not isinstance(prices, list):
+            return out
+        for row in prices:
+            if not isinstance(row, dict):
+                continue
+            inst = str(row.get("instrument", "") or "").strip().upper()
+            bids = row.get("bids", []) or []
+            asks = row.get("asks", []) or []
+            try:
+                bid = float((bids[0] or {}).get("price", 0.0)) if bids else 0.0
+                ask = float((asks[0] or {}).get("price", 0.0)) if asks else 0.0
+            except Exception:
+                bid = 0.0
+                ask = 0.0
+            if bid > 0 and ask > 0:
+                out[inst] = (bid + ask) / 2.0
+            elif ask > 0:
+                out[inst] = ask
+            elif bid > 0:
+                out[inst] = bid
+        return out
+
+    def get_pricing_details(self, instruments: List[str]) -> Dict[str, Dict[str, float]]:
+        if not self.configured():
+            return {}
+        items = [str(x).strip().upper() for x in (instruments or []) if str(x).strip()]
+        if not items:
+            return {}
+        qs = ",".join(items)
+        try:
+            payload = self._request_json(f"/v3/accounts/{self.account_id}/pricing?instruments={qs}", timeout=8.0)
+        except Exception:
+            return {}
+        prices = payload.get("prices", []) or []
+        out: Dict[str, Dict[str, float]] = {}
+        if not isinstance(prices, list):
+            return out
+        for row in prices:
+            if not isinstance(row, dict):
+                continue
+            inst = str(row.get("instrument", "") or "").strip().upper()
+            bids = row.get("bids", []) or []
+            asks = row.get("asks", []) or []
+            try:
+                bid = float((bids[0] or {}).get("price", 0.0)) if bids else 0.0
+                ask = float((asks[0] or {}).get("price", 0.0)) if asks else 0.0
+            except Exception:
+                bid = 0.0
+                ask = 0.0
+            mid = (bid + ask) * 0.5 if bid > 0 and ask > 0 else max(bid, ask, 0.0)
+            spread_bps = (((ask - bid) / mid) * 10000.0) if (mid > 0 and ask > 0 and bid > 0) else 0.0
+            out[inst] = {"bid": bid, "ask": ask, "mid": mid, "spread_bps": spread_bps}
+        return out
+
+    def list_tradeable_instruments(self) -> List[str]:
+        if not self.configured():
+            return []
+        try:
+            payload = self._request_json(f"/v3/accounts/{self.account_id}/instruments", timeout=10.0)
+        except Exception:
+            return []
+        rows = payload.get("instruments", []) or []
+        out: List[str] = []
+        if not isinstance(rows, list):
+            return out
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("type", "") or "").upper() != "CURRENCY":
+                continue
+            if str(row.get("tradeable", "true")).lower() in {"false", "0", "no"}:
+                continue
+            name = str(row.get("name", "") or "").strip().upper()
+            if name and name not in out:
+                out.append(name)
+        return out
+
+    def get_candles(self, instrument: str, granularity: str = "H1", count: int = 120) -> List[Dict[str, Any]]:
+        if not self.configured():
+            return []
+        inst = str(instrument or "").strip().upper()
+        if not inst:
+            return []
+        g = str(granularity or "H1").strip().upper()
+        cnt = max(10, min(5000, int(count or 120)))
+        try:
+            payload = self._request_json(
+                f"/v3/instruments/{inst}/candles?price=M&granularity={g}&count={cnt}",
+                timeout=10.0,
+            )
+            rows = payload.get("candles", []) or []
+            return [row for row in rows if isinstance(row, dict)]
+        except Exception:
+            return []
+
+    def place_market_order(
+        self,
+        instrument: str,
+        units: int,
+        client_order_id: str = "",
+        max_retries: int = 2,
+        retry_delay_s: float = 0.35,
+        max_retry_after_s: float = 300.0,
+    ) -> Tuple[bool, str, Dict[str, Any]]:
+        inst = str(instrument or "").strip().upper()
+        if not self.configured():
+            return False, "Not configured", {}
+        if not inst:
+            return False, "Missing instrument", {}
+        body: Dict[str, Any] = {
+            "order": {
+                "type": "MARKET",
+                "instrument": inst,
+                "units": str(int(units)),
+                "timeInForce": "FOK",
+                "positionFill": "DEFAULT",
+            }
+        }
+        if str(client_order_id or "").strip():
+            body["order"]["clientExtensions"] = {"id": str(client_order_id).strip()[:48]}
+        attempts = max(1, int(max_retries))
+        backoff = BackoffPolicy(
+            base_delay_s=max(0.05, float(retry_delay_s)),
+            max_delay_s=8.0,
+            jitter_s=0.35,
+            max_retry_after_s=max(1.0, float(max_retry_after_s or 300.0)),
+        )
+        last_msg = "Order not accepted"
+        for att in range(1, attempts + 1):
+            retry_after_s = 0.0
+            try:
+                payload = self._request(
+                    "POST",
+                    f"/v3/accounts/{self.account_id}/orders",
+                    body=body,
+                    timeout=10.0,
+                )
+                ok = bool(payload.get("orderFillTransaction") or payload.get("orderCreateTransaction"))
+                msg = "Order submitted" if ok else str(payload.get("errorMessage", "Order not accepted") or "Order not accepted")
+                if ok:
+                    return True, msg, payload
+                last_msg = msg
+            except urllib.error.HTTPError as exc:
+                last_msg = f"HTTP {exc.code}: {exc.reason}"
+                if int(exc.code) != 429:
+                    break
+                retry_after_s = _retry_after_seconds_from_http_error(exc)
+            except urllib.error.URLError as exc:
+                last_msg = f"Network error: {exc.reason}"
+            except Exception as exc:
+                last_msg = f"{type(exc).__name__}: {exc}"
+            if att < attempts:
+                try:
+                    import time as _t
+                    wait_s = backoff.wait_seconds(att, retry_after_s=retry_after_s)
+                    if retry_after_s > 0.0:
+                        last_msg = f"{last_msg} | retry_after={wait_s:.2f}s".strip()
+                    _t.sleep(wait_s)
+                except Exception:
+                    pass
+        return False, last_msg, {}
+
+    def close_position(self, instrument: str, side: str = "all") -> Tuple[bool, str, Dict[str, Any]]:
+        inst = str(instrument or "").strip().upper()
+        which = str(side or "all").strip().lower()
+        if not self.configured():
+            return False, "Not configured", {}
+        if not inst:
+            return False, "Missing instrument", {}
+        body: Dict[str, Any] = {}
+        if which == "long":
+            body["longUnits"] = "ALL"
+        elif which == "short":
+            body["shortUnits"] = "ALL"
+        else:
+            body["longUnits"] = "ALL"
+            body["shortUnits"] = "ALL"
+        try:
+            payload = self._request(
+                "PUT",
+                f"/v3/accounts/{self.account_id}/positions/{inst}/close",
+                body=body,
+                timeout=10.0,
+            )
+            ok = bool(payload)
+            msg = "Position close submitted" if ok else "Close not accepted"
+            return ok, msg, payload
+        except urllib.error.HTTPError as exc:
+            return False, f"HTTP {exc.code}: {exc.reason}", {}
+        except urllib.error.URLError as exc:
+            return False, f"Network error: {exc.reason}", {}
+        except Exception as exc:
+            return False, f"{type(exc).__name__}: {exc}", {}

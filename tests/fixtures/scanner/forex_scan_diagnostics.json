@@ -1,0 +1,11 @@
+{
+  "state": "READY",
+  "msg": "scan complete",
+  "leaders_total": 4,
+  "scores_total": 12,
+  "reject_summary": {
+    "total_rejected": 2,
+    "reject_rate_pct": 14.2,
+    "dominant_reason": "spread_too_wide"
+  }
+}

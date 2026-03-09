@@ -1,0 +1,3 @@
+{"ts":1772671601,"symbol":"AAPL","event":"entry_check","side":"buy","ok":false,"msg":"confidence too low"}
+{"ts":1772671610,"symbol":"MSFT","event":"entry_check","side":"buy","ok":true,"msg":"candidate promoted"}
+{"ts":1772671618,"symbol":"AAPL","event":"risk_gate","side":"buy","ok":true,"msg":"position sizing validated"}

@@ -1,0 +1,19 @@
+{
+  "state": "READY",
+  "trader_state": "Practice auto-run",
+  "msg": "Max open positions reached (1/1)",
+  "updated_at": 1772671645,
+  "account_value_usd": 99912.12,
+  "exposure_usd": 1081.3,
+  "open_positions": 1,
+  "actions": [
+    "[10:10:45] entry skipped: max_open_positions",
+    "[10:10:46] monitor active pair EUR_USD"
+  ],
+  "health": {
+    "data_ok": true,
+    "broker_ok": true,
+    "orders_ok": true,
+    "drift_warning": false
+  }
+}

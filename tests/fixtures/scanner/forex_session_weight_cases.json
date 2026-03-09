@@ -1,0 +1,41 @@
+{
+  "cases": [
+    {
+      "label": "trend_boost_long",
+      "settings": {
+        "forex_session_weight_enabled": true,
+        "forex_session_weight_floor": 0.85,
+        "forex_session_weight_ceiling": 1.1
+      },
+      "side": "long",
+      "session_context": {"bias": "TREND"},
+      "expected_mult": 1.1,
+      "expected_mode": "trend_boost"
+    },
+    {
+      "label": "range_dampen_short",
+      "settings": {
+        "forex_session_weight_enabled": true,
+        "forex_session_weight_floor": 0.85,
+        "forex_session_weight_ceiling": 1.1
+      },
+      "side": "short",
+      "session_context": {"bias": "RANGE"},
+      "expected_mult": 0.85,
+      "expected_mode": "range_dampen"
+    },
+    {
+      "label": "disabled",
+      "settings": {
+        "forex_session_weight_enabled": false,
+        "forex_session_weight_floor": 0.85,
+        "forex_session_weight_ceiling": 1.1
+      },
+      "side": "long",
+      "session_context": {"bias": "TREND"},
+      "expected_mult": 1.0,
+      "expected_mode": "disabled"
+    }
+  ]
+}
+

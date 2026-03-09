@@ -1,0 +1,14 @@
+{
+  "market": "stocks",
+  "expected_interval_s": 10.0,
+  "settings": {
+    "runtime_alert_cadence_min_samples": 2,
+    "runtime_alert_cadence_late_warn_pct": 50.0,
+    "runtime_alert_cadence_late_crit_pct": 100.0,
+    "runtime_alert_cadence_cooldown_s": 1
+  },
+  "timestamps": [100, 130, 160],
+  "expected_levels": ["ok", "critical", "critical"],
+  "expected_late_pct": [0.0, 200.0, 200.0]
+}
+

@@ -1,0 +1,23 @@
+{
+  "state": "READY",
+  "msg": "Broker OK",
+  "buying_power": "99875.1100",
+  "open_positions": "1",
+  "realized_pnl": "0.0000",
+  "positions_preview": [
+    "EUR_USD SHORT units=1000 uPnL=-0.1200"
+  ],
+  "raw_positions": [
+    {
+      "instrument": "EUR_USD",
+      "long": {
+        "units": "0",
+        "unrealizedPL": "0.0000"
+      },
+      "short": {
+        "units": "1000",
+        "unrealizedPL": "-0.1200"
+      }
+    }
+  ]
+}

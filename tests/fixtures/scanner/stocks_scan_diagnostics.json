@@ -1,0 +1,11 @@
+{
+  "state": "READY",
+  "msg": "scan complete",
+  "leaders_total": 3,
+  "scores_total": 28,
+  "reject_summary": {
+    "total_rejected": 9,
+    "reject_rate_pct": 24.3,
+    "dominant_reason": "warmup_pending"
+  }
+}

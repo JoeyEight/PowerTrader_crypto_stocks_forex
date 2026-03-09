@@ -1,195 +1,186 @@
-# PowerTrader_AI
-Fully automated crypto trading powered by a custom price prediction AI and a structured/tiered DCA system.
-
-I have not checked any PowerTrader AI forks and cannot confirm or deny their legitimacy.
-
-This is my personal trading bot that I decided to make open source. I made this strategy to match my personal goals. This system is meant to be a foundation/framework for you to build your dream bot! You are responsible for all financial and security risks associated with PowerTrader AI.
-
-I know there are "commonly essential" trading features that are missing (like no stop loss for example). This is by design because many of those things would just not work with this system's strategy as it stands, for my personal reasons below:
-
-I do not believe in selling worthwhile coins at a loss (and why would you trade anything besides worthwhile coins with a trading bot, anyways???).
-
-I DO believe in crypto. I'd rather just wait and maybe add more money to my account if need be so that the bot can buy even more of the coin while the price is down.
-
-I personally feel like many of those common things people use, like stop loss, are actually a trick or something, and I personally have absolutely no problem adding more money to my account to afford more DCA or having to wait for extended periods of time, if need be. In my opinion, anything else is just greedy and desperate, which is the exact OPPOSITE of needed attributes for long term growth. Plus, this is just spot trading... there's no worry of liquidation and it feels to me like many "risk management" tactics are really only meant for futures trading but people blindly apply them to spot trading when it just plain isn't necessary.
-
-I know the AI and the trading strategy are extremely simple because I'm the one that designed and made them. I've been developing this specific trading strategy for almost a decade and the design of the AI system for the last few years. The overall strategy is based on what ACTUALLY works from real trading experience, not just stuff I read in LLM responses or search engine results.
-
-
-Ok now that all of that is out of the way...
-
-I am not selling anything. This trading bot is not a product. This system is for experimentation and education. The only reason you would EVER send me money is if you are voluntarily donating (donation routes can be found at the bottom of this readme :) ). Do not fall for any scams! PowerTrader AI is COMPLETELY FREE FOREVER!
-
-IMPORTANT: This software places real trades automatically. You are responsible for everything it does to your money and your account. Keep your API keys private. I am not giving financial advice. I am not responsible for any losses incurred or any security breaches to your computer (the code is entirely open source and can be confirmed non-malicious). You are fully responsible for doing your own due diligence to learn and understand this trading system and to use it properly. You are fully responsible for all of your money and all of the bot's actions, and any gains or losses.
-
-“It’s an instance-based (kNN/kernel-style) predictor with online per-instance reliability weighting, used as a multi-timeframe trading signal.” - ChatGPT on the type of AI used in this trading bot.
-
-So what exactly does that mean?
-
-When people think AI, they usually think about LLM style AIs and neural networks. What many people don't realize is there are many types of Artificial Intelligence and Machine Learning - and the one in my trading system falls under the "Other" category.
-
-When training for a coin, it goes through the entire history for that coin on multiple timeframes and saves each pattern it sees, along with what happens on the next candle AFTER the pattern. It uses these saved patterns to generate a predicted candle by taking a weighted average of the closest matches in memory to the current pattern in time. This weighted average output is done once for each timeframe, from 1 hour up to 1 week. Each timeframe gets its own predicted candle. The low and high prices from these candles are what are shown as the blue and orange horizontal lines on the price charts. 
-
-After a candle closes, it checks what happened against what it predicted, and adjusts the weight for each "memory pattern" that was used to generate the weighted average, depending on how accurate each pattern was compared to what actually happened.
-
-Yes, it is EXTREMELY simple. Yes, it is STILL considered AI.
-
-Here is how the trading bot utilizes the price prediction ai to automatically make trades:
-
-For determining when to start trades, the AI's Thinker script sends a signal to start a trade for a coin if the ask price for the coin drops below at least 3 of the the AI's predicted low prices for the coin (it predicts the currently active candle's high and low prices for each timeframe across all timeframes from 1hr to 1wk).
-
-For determining when to DCA, it uses either the current price level from the AI that is tied to the current amount of DCA buys that have been done on the trade (for example, right after a trade starts when 3 blue lines get crossed, its first DCA wont happen until the price crosses the 4th line, so on so forth), or it uses the hardcoded drawdown % for its current level, whichever it hits first. It only allows a max of 2 DCAs within a rolling 24hr window to keep from dumping all of your money in too quickly on coins that are having an extended downtrend. Other risk management features can easily be added, as well, with just a bit of Python code!
-
-For determining when to sell, the bot uses a trailing profit margin to maximize the potential gains. The margin line is set at either 5% gain if no DCA has happened on the trade, or 2.5% gain if any DCA has happened. The trailing margin gap is 0.5% (this is the amount the price has to go over the profit margin to begin raising the profit margin up to TRAIL after the price and maximize how much profit is gained once the price drops below the profit margin again and the bot sells the trade.
-
-
-# Setup & First-Time Use (Windows)
-
-THESE INSTRUCTIONS WERE WRITTEN BY AI! PLEASE LET ME KNOW IF THERE ARE ANY ERRORS OR ISSUES WITH THIS SETUP PROCESS!
-
-If you have any crypto holdings in Robinhood currently, either transfer them out of your Robinhood account or sell them to dollars BEFORE going through this setup process!
-
-This page walks you through installing PowerTrader AI from start to finish, in the exact order a first-time user should do it.  
-No coding knowledge needed.  
-These instructions are Windows-based but PowerTrader AI *should* be able to run on any OS.
-
-IMPORTANT: This software places real trades automatically. You are responsible for everything it does to your money and your account. Keep your API keys private. I am not giving financial advice. I am not responsible for any losses incurred or any security breaches to your computer (the code is entirely open source and can be confirmed non-malicious). You are fully responsible for doing your own due diligence to learn and understand this trading system and to use it properly. You are fully responsible for all of your money and all of the bot's actions, and any gains or losses.
-
----
-
-## Step 1 — Install Python
-
-1. Go to **python.org** and download Python for Windows.
-2. Run the installer.
-3. **Check the box** that says: **“Add Python to PATH”**.
-4. Click **Install Now**.
-
----
-
-## Step 2 — Download PowerTrader AI
-
-1. Do not download the zip file of the repo! There is an issue I have to fix.
-2. Create a folder on your computer, like: `C:\PowerTraderAI\`
-3. On the PowerTrader_AI repo page, go to the code page for pt_hub.py, click the "Download Raw File" button, save it into the folder you just created.
-4. Repeat that for all files in the repo (except the readme and the license).
-
----
-
-## Step 3 — Install PowerTrader AI (one command)
-
-1. Open **Command Prompt** (Windows key → type **cmd** → Enter).
-2. Go into your PowerTrader AI folder. Example:
-
-   `cd C:\PowerTraderAI`
-
-3. If using Python 3.12 or higher (or, later on, if you just run into the pkg_resources error) , run this command:
-
-   `python -m pip install "setuptools==81.0.0"`
-
-v81 is required, pkg_resources is not included with v82. I'll change the code away from it soon.
-
-4. Install everything PowerTrader AI needs:
-
-   `python -m pip install -r requirements.txt`
-
----
-
-## Step 4 — Start PowerTrader AI
-
-From the same Command Prompt window (inside your PowerTrader folder), run:
-
-`python pt_hub.py`
-
-The app that opens is the **PowerTrader Hub**.  
-This is the only thing you need to run day-to-day.
-
----
-
-## Step 5 — Set your folder, coins, and Robinhood keys (inside the Hub)
-
-### Open Settings
-
-In the Hub, open **Settings** and do this in order:
-
-- **Main Neural Folder**: set this to the same folder that contains `pt_hub.py` (recommended easiest).
-- **Choose which coins to trade**: start with **BTC**.
-- **While you are still in Settings**, click **Robinhood API Setup** and do this:
-
-1. Click **Generate Keys**.
-2. Copy the **Public Key** shown in the wizard.
-3. On Robinhood, add a new API key and paste that Public Key.
-4. Set permissions to allow trading (the wizard tells you what to select).
-5. Robinhood will show your API Key (often starts with `rh`). Copy it.
-6. Paste the API Key back into the wizard and click **Save**.
-7. Close the wizard and go back to the **Settings** screen.
-8. **NOW** click **Save** in Settings.
-
-After saving, you will have two files in your PowerTrader AI folder:  
-`r_key.txt` and `r_secret.txt`  
-Keep them private.
-
-PowerTrader AI uses a simple folder style:  
-**BTC uses the main folder**, and other coins use their own subfolders (like `ETH\`).
-
----
-
-## Step 6 — Train (inside the Hub)
-
-Training builds the system’s coin “memory” so it can generate signals.
-
-1. In the Hub, click **Train All**.
-2. Wait until training finishes.
-
----
-
-## Step 7 — Start the system (inside the Hub)
-
-When all coins have completed training, click:
-
-1. **Start All**
-
-The Hub will:  
-**start pt_thinker.py**, wait until it is ready, then it will **start pt_trader.py**.  
-You don’t need to manually start separate programs. The hub handles everything!
-
----
-
-## Neural Levels (the LONG/SHORT numbers)
-
-- These are signal strength levels from low to high.
-- They are the predicted high and low prices for all timeframes from 1hr to 1wk.
-- They are used to show how stretched a coin's price is and for determining when to start trades and potentially when to DCA for the first few levels of DCA (Whichever price is higher, the Neural level or the hardcoded drawdown % for the current DCA level.
-- Higher number = stronger signal.
-- LONG = buy-direction signal. SHORT = No-start signal
-
-A TRADE WILL START FOR A COIN IF THAT COIN REACHES A LONG LEVEL OF 3 OR HIGHER WHILE HAVING A SHORT LEVEL OF 0! This is adjustable in the settings.
-
----
-
-## Adding more coins (later)
-
-1. Open **Settings**
-2. Add one new coin
-3. Save
-4. Click **Train All**, wait for training to complete
-5. Click **Start All**
-
----
-
-## Donate
-
-PowerTrader AI is COMPLETELY free and open source! If you want to support the project, you can donate or become a member:
-
-- Cash App: **$garagesteve**
-- PayPal: **@garagesteve**
-- Facebook (Subscribe to my Facebook page for only $1/month): **https://www.facebook.com/stephen.bryant.hughes**
-
----
-
-## License
-
-PowerTrader AI is released under the **Apache 2.0** license.
-
----
-
-IMPORTANT: This software places real trades automatically. You are responsible for everything it does to your money and your account. Keep your API keys private. I am not giving financial advice. I am not responsible for any losses incurred or any security breaches to your computer (the code is entirely open source and can be confirmed non-malicious). You are fully responsible for doing your own due diligence to learn and understand this trading system and to use it properly. You are fully responsible for all of your money and all of the bot's actions, and any gains or losses.
+# PowerTrader AI
+
+PowerTrader AI is a multi-market trading hub with three coordinated engines:
+- Crypto (live-capable)
+- Stocks (Alpaca-backed)
+- Forex (OANDA-backed)
+
+The desktop hub UI is in [ui/pt_hub.py](/Users/joeydelestre/PowerTrader_AI/ui/pt_hub.py), with runtime orchestration in [runtime/pt_runner.py](/Users/joeydelestre/PowerTrader_AI/runtime/pt_runner.py).
+
+## Safety First
+- This software can place real orders when configured for live mode.
+- Run paper/practice/shadow validation first.
+- Keep `paper_only_unless_checklist_green=true` unless you explicitly accept live risk.
+- Review all broker credentials, risk caps, and exposure controls before enabling auto-trade.
+
+## Current Repo Layout
+- `app/` shared utilities (settings, paths, health, runtime helpers)
+- `brokers/` Alpaca/OANDA broker adapters
+- `engines/` thinker/trader/trainer modules
+- `runtime/` process orchestration (`pt_runner`, `pt_markets`, `pt_autopilot`, `pt_autofix`)
+- `ui/` Tkinter hub application
+- `tests/` unit/integration tests
+- `docs/` runbook/changelog/checklists
+- `hub_data/` runtime output (status, logs, diagnostics, incidents)
+- `<COIN>/` coin-specific model/data directories (crypto training/runtime)
+
+## Install
+```bash
+python3 -m pip install -r requirements.txt
+python3 -m pip install -r requirements-dev.txt
+```
+
+## Run
+### Hub UI
+```bash
+python3 ui/pt_hub.py
+```
+
+### Runner (all background services)
+```bash
+python3 runtime/pt_runner.py
+```
+
+### Markets loop only (scanner + market trader steps)
+```bash
+python3 runtime/pt_markets.py
+```
+
+### Autopilot one-shot tune
+```bash
+python3 runtime/pt_autopilot.py --once
+```
+
+### Autofix overseer one-shot (safe dry-run)
+```bash
+python3 runtime/pt_autofix.py --once --dry-run
+```
+
+## Preflight (Run Before Shadow/Live)
+Use the readiness checker before testing:
+```bash
+python3 runtime/tools/preflight_readiness.py
+```
+
+Strict mode fails on warnings and critical issues:
+```bash
+python3 runtime/tools/preflight_readiness.py --strict
+```
+
+Report output default:
+- `hub_data/preflight_readiness.json`
+
+## Quality Suite
+```bash
+python3 runtime/tools/run_quality_suite.py
+```
+
+Optional strict gates:
+```bash
+python3 runtime/tools/run_quality_suite.py --require-artifacts --require-stability --require-preflight
+```
+
+## Rollout Stages
+`market_rollout_stage`:
+1. `legacy`
+2. `scan_expanded`
+3. `risk_caps`
+4. `execution_v2`
+5. `shadow_only`
+6. `live_guarded`
+
+Set this in Hub Settings -> Advanced.
+
+## Recommended Validation Path
+### 1) Shadow validation
+- Keep:
+  - `alpaca_paper_mode=true`
+  - `oanda_practice_mode=true`
+  - `market_rollout_stage=shadow_only`
+- Enable:
+  - `stock_auto_trade_enabled=true`
+  - `forex_auto_trade_enabled=true`
+- Run runner/hub and verify:
+  - scanners produce leaders
+  - trader messages show simulated/shadow behavior
+  - no stale fallback lockouts or health regressions
+
+### 2) Controlled execution (paper/practice)
+- Set `market_rollout_stage=execution_v2`
+- Keep paper/practice modes enabled
+- Verify entry/exit lifecycle and risk caps in logs/status
+
+### 3) Live-guarded rollout
+- Set `market_rollout_stage=live_guarded`
+- Only after checklist is green, disable broker paper/practice mode if intended
+- Keep strict risk controls enabled (cached-scan gates, data-quality gates, reject-pressure gates, exposure caps)
+
+## Key Runtime Files
+### Core status
+- `hub_data/trader_status.json`
+- `hub_data/runner_status.json`
+- `hub_data/runtime_state.json`
+- `hub_data/market_loop_status.json`
+
+### Market status
+- `hub_data/stocks/stock_thinker_status.json`
+- `hub_data/stocks/stock_trader_status.json`
+- `hub_data/forex/forex_thinker_status.json`
+- `hub_data/forex/forex_trader_status.json`
+
+### Diagnostics
+- `hub_data/stocks/scan_diagnostics.json`
+- `hub_data/forex/scan_diagnostics.json`
+- `hub_data/stocks/universe_quality.json`
+- `hub_data/forex/universe_quality.json`
+- `hub_data/scanner_cadence_drift.json`
+- `hub_data/runtime_events.jsonl`
+- `hub_data/incidents.jsonl`
+- `hub_data/autofix_status.json`
+- `hub_data/autofix_state.json`
+- `hub_data/autofix/tickets/*.json`
+
+### Logs
+- `hub_data/logs/runner.log`
+- `hub_data/logs/markets.log`
+- `hub_data/logs/autopilot.log`
+- `hub_data/logs/autofix.log`
+- `hub_data/logs/thinker.log`
+- `hub_data/logs/trader.log`
+
+## Autofix Modes
+Configure in `gui_settings.json`:
+- `autofix_enabled=true|false`
+- `autofix_mode=report_only|manual|shadow_apply`
+- `autofix_allow_live_apply=true|false` (default false)
+
+Recommended:
+1. Start with `report_only` and review generated tickets under `hub_data/autofix/tickets/`.
+2. Use `shadow_apply` only in paper/practice stages after validating your test command.
+
+## Credentials
+### Crypto (Robinhood)
+- Preferred files:
+  - `keys/r_key.txt`
+  - `keys/r_secret.txt`
+- Or env:
+  - `POWERTRADER_RH_API_KEY`
+  - `POWERTRADER_RH_PRIVATE_B64`
+
+### Stocks (Alpaca)
+- Env or settings-backed values:
+  - `POWERTRADER_ALPACA_API_KEY_ID`
+  - `POWERTRADER_ALPACA_SECRET_KEY`
+
+### Forex (OANDA)
+- Env or settings-backed values:
+  - `POWERTRADER_OANDA_ACCOUNT_ID`
+  - `POWERTRADER_OANDA_API_TOKEN`
+
+## Operator Notes
+- Changelog: [docs/CHANGELOG.md](/Users/joeydelestre/PowerTrader_AI/docs/CHANGELOG.md)
+- Runbook: [docs/RUNBOOK.md](/Users/joeydelestre/PowerTrader_AI/docs/RUNBOOK.md)
+- Settings migration notes: [docs/SETTINGS_MIGRATIONS.md](/Users/joeydelestre/PowerTrader_AI/docs/SETTINGS_MIGRATIONS.md)
+
+## Disclaimer
+Use at your own risk. You are responsible for all broker/account configuration, risk limits, and any resulting trades.

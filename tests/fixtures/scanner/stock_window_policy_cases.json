@@ -1,0 +1,50 @@
+{
+  "cases": [
+    {
+      "label": "opening_window",
+      "timestamp_iso": "2026-03-02T09:35:00-05:00",
+      "settings": {
+        "stock_scan_open_cooldown_minutes": 20,
+        "stock_scan_close_cooldown_minutes": 15,
+        "stock_scan_open_score_mult": 0.8,
+        "stock_scan_close_score_mult": 0.9
+      },
+      "expected": {
+        "active": true,
+        "window": "OPENING",
+        "score_mult": 0.8
+      }
+    },
+    {
+      "label": "closing_window",
+      "timestamp_iso": "2026-03-02T15:50:00-05:00",
+      "settings": {
+        "stock_scan_open_cooldown_minutes": 20,
+        "stock_scan_close_cooldown_minutes": 15,
+        "stock_scan_open_score_mult": 0.8,
+        "stock_scan_close_score_mult": 0.9
+      },
+      "expected": {
+        "active": true,
+        "window": "CLOSING",
+        "score_mult": 0.9
+      }
+    },
+    {
+      "label": "midday",
+      "timestamp_iso": "2026-03-02T12:00:00-05:00",
+      "settings": {
+        "stock_scan_open_cooldown_minutes": 20,
+        "stock_scan_close_cooldown_minutes": 15,
+        "stock_scan_open_score_mult": 0.8,
+        "stock_scan_close_score_mult": 0.9
+      },
+      "expected": {
+        "active": false,
+        "window": "NONE",
+        "score_mult": 1.0
+      }
+    }
+  ]
+}
+

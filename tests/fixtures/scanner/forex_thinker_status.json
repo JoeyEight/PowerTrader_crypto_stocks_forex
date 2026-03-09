@@ -1,0 +1,52 @@
+{
+  "state": "READY",
+  "ai_state": "Scan ready",
+  "updated_at": 1772671625,
+  "msg": "top pair ready",
+  "leaders": [
+    {
+      "pair": "EUR_USD",
+      "side": "SHORT",
+      "score": -0.3021,
+      "confidence": "HIGH",
+      "reason": "trend fade"
+    },
+    {
+      "pair": "USD_JPY",
+      "side": "LONG",
+      "score": 0.2199,
+      "confidence": "MED",
+      "reason": "breakout"
+    }
+  ],
+  "top_pick": {
+    "pair": "EUR_USD",
+    "side": "SHORT",
+    "score": -0.3021,
+    "confidence": "HIGH",
+    "reason": "trend fade"
+  },
+  "top_chart": [
+    {
+      "t": "2026-03-05T10:00:00",
+      "o": 1.0821,
+      "h": 1.0824,
+      "l": 1.0818,
+      "c": 1.0819
+    },
+    {
+      "t": "2026-03-05T10:05:00",
+      "o": 1.0819,
+      "h": 1.0822,
+      "l": 1.0815,
+      "c": 1.0817
+    },
+    {
+      "t": "2026-03-05T10:10:00",
+      "o": 1.0817,
+      "h": 1.0819,
+      "l": 1.0812,
+      "c": 1.0813
+    }
+  ]
+}

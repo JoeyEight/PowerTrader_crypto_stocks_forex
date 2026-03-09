@@ -1,0 +1,20 @@
+{
+  "cases": [
+    {
+      "prev": ["AAPL", "MSFT", "NVDA"],
+      "cur": ["AAPL", "TSLA", "META"],
+      "expected_pct": 80.0
+    },
+    {
+      "prev": ["EUR_USD", "USD_JPY"],
+      "cur": ["EUR_USD", "USD_JPY"],
+      "expected_pct": 0.0
+    },
+    {
+      "prev": [],
+      "cur": ["ADA"],
+      "expected_pct": 100.0
+    }
+  ]
+}
+

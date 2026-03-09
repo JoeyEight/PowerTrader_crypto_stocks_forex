@@ -8,7 +8,7 @@
   <key>ProgramArguments</key>
   <array>
     <string>/usr/bin/python3</string>
-    <string>/Users/joeydelestre/PowerTrader_AI/pt_runner.py</string>
+    <string>/Users/joeydelestre/PowerTrader_AI/runtime/pt_runner.py</string>
   </array>
 
   <key>WorkingDirectory</key>
@@ -24,6 +24,8 @@
   <dict>
     <key>POWERTRADER_GUI_SETTINGS</key>
     <string>/Users/joeydelestre/PowerTrader_AI/gui_settings.json</string>
+    <key>POWERTRADER_PROJECT_DIR</key>
+    <string>/Users/joeydelestre/PowerTrader_AI</string>
   </dict>
 
   <key>StandardOutPath</key>
