@@ -26,9 +26,20 @@ if [[ -z "${OPENAI_API_KEY:-}" && -f "$PROJECT_DIR/keys/openai_api_key.txt" ]]; 
   export OPENAI_API_KEY="$(tr -d '\r\n' < "$PROJECT_DIR/keys/openai_api_key.txt")"
 fi
 
-PY_BIN="$PROJECT_DIR/venv/bin/python3"
+VENV_DIR="$PROJECT_DIR/venv"
+PY_BIN="$VENV_DIR/bin/python3"
+
+# Keep startup deterministic: always use project venv.
 if [[ ! -x "$PY_BIN" ]]; then
-  PY_BIN="$(command -v python3)"
+  echo "[launch] venv not found; creating at $VENV_DIR"
+  python3 -m venv "$VENV_DIR"
+fi
+
+# If core deps are missing/corrupt, bootstrap from requirements.
+if ! "$PY_BIN" -c "import matplotlib" >/dev/null 2>&1; then
+  echo "[launch] installing dependencies from requirements.txt"
+  "$PY_BIN" -m pip install --upgrade pip setuptools wheel
+  "$PY_BIN" -m pip install -r "$PROJECT_DIR/requirements.txt"
 fi
 
 exec "$PY_BIN" -m ui.pt_hub

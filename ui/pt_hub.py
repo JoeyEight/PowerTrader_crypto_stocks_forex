@@ -39,6 +39,16 @@ from app.settings_utils import sanitize_settings
 from app.live_mode_guard import evaluate_live_mode_checklist
 from app.market_awareness import build_awareness_payload
 from app.status_hydration import load_market_status_bundle
+from app.api_endpoint_validation import (
+    ALPACA_DATA_HOST,
+    ALPACA_LIVE_HOST,
+    ALPACA_PAPER_HOST,
+    OANDA_LIVE_REST_HOST,
+    OANDA_LIVE_STREAM_HOST,
+    OANDA_PRACTICE_REST_HOST,
+    OANDA_PRACTICE_STREAM_HOST,
+    normalize_endpoint_url,
+)
 from brokers.broker_alpaca import AlpacaBrokerClient
 from brokers.broker_oanda import OandaBrokerClient
 from app.credential_utils import (
@@ -15464,6 +15474,8 @@ class PowerTraderHub(tk.Tk):
         oanda_status_var = tk.StringVar(value="")
         settings_mode_hint_var = tk.StringVar(value="")
 
+        # Keep broker live/paper mode switches out of preset auto-fill so manual
+        # execution-mode choices persist across settings reopen/save cycles.
         profile_var_map: Dict[str, tk.Variable] = {
             "trade_start_level": trade_start_level_var,
             "start_allocation_pct": start_alloc_pct_var,
@@ -15492,7 +15504,6 @@ class PowerTraderHub(tk.Tk):
             "global_drawdown_resume_cooloff_s": drawdown_cooloff_var,
             "global_drawdown_resume_recovery_buffer_pct": drawdown_recovery_var,
             "global_drawdown_require_manual_ack": drawdown_ack_required_var,
-            "alpaca_paper_mode": alpaca_paper_var,
             "stock_universe_mode": stock_universe_mode_var,
             "stock_scan_max_symbols": stock_scan_max_symbols_var,
             "stock_min_price": stock_min_price_var,
@@ -15539,8 +15550,6 @@ class PowerTraderHub(tk.Tk):
             "stock_reject_drift_warn_pct": stock_reject_warn_pct_var,
             "stock_block_new_entries_near_close": stock_block_near_close_var,
             "stock_no_new_entries_mins_to_close": stock_no_new_close_mins_var,
-            "oanda_practice_mode": oanda_practice_var,
-            "paper_only_unless_checklist_green": paper_only_guard_var,
             "forex_scan_max_pairs": forex_scan_max_pairs_var,
             "forex_max_spread_bps": fx_max_spread_bps_var,
             "forex_min_volatility_pct": fx_min_vol_pct_var,
@@ -15605,7 +15614,6 @@ class PowerTraderHub(tk.Tk):
                 "chart_refresh_seconds": 12.0,
                 "candles_limit": 120,
                 "auto_start_scripts": False,
-                "alpaca_paper_mode": True,
                 "stock_universe_mode": "core",
                 "stock_scan_max_symbols": 40,
                 "stock_min_price": 8.0,
@@ -15646,8 +15654,6 @@ class PowerTraderHub(tk.Tk):
                 "stock_reject_drift_warn_pct": 50.0,
                 "stock_block_new_entries_near_close": True,
                 "stock_no_new_entries_mins_to_close": 30,
-                "oanda_practice_mode": True,
-                "paper_only_unless_checklist_green": True,
                 "forex_universe_pairs": "",
                 "forex_scan_max_pairs": 12,
                 "forex_max_spread_bps": 6.0,
@@ -15708,7 +15714,6 @@ class PowerTraderHub(tk.Tk):
                 "chart_refresh_seconds": 6.0,
                 "candles_limit": 180,
                 "auto_start_scripts": True,
-                "alpaca_paper_mode": True,
                 "stock_universe_mode": "all_tradable_filtered",
                 "stock_scan_max_symbols": 240,
                 "stock_min_price": 2.0,
@@ -15750,8 +15755,6 @@ class PowerTraderHub(tk.Tk):
                 "stock_reject_drift_warn_pct": 75.0,
                 "stock_block_new_entries_near_close": False,
                 "stock_no_new_entries_mins_to_close": 5,
-                "oanda_practice_mode": True,
-                "paper_only_unless_checklist_green": True,
                 "forex_universe_pairs": "",
                 "forex_scan_max_pairs": 36,
                 "forex_max_spread_bps": 12.0,
@@ -17052,6 +17055,54 @@ class PowerTraderHub(tk.Tk):
                     ):
                         return
 
+                alpaca_paper_mode = bool(alpaca_paper_var.get())
+                oanda_practice_mode = bool(oanda_practice_var.get())
+                alpaca_base_default = f"https://{ALPACA_PAPER_HOST}" if alpaca_paper_mode else f"https://{ALPACA_LIVE_HOST}"
+                oanda_rest_default = (
+                    f"https://{OANDA_PRACTICE_REST_HOST}" if oanda_practice_mode else f"https://{OANDA_LIVE_REST_HOST}"
+                )
+                oanda_stream_default = (
+                    f"https://{OANDA_PRACTICE_STREAM_HOST}" if oanda_practice_mode else f"https://{OANDA_LIVE_STREAM_HOST}"
+                )
+                raw_alpaca_base = str(alpaca_base_url_var.get() or "").strip()
+                raw_alpaca_data = str(alpaca_data_url_var.get() or "").strip()
+                raw_oanda_rest = str(oanda_rest_url_var.get() or "").strip()
+                raw_oanda_stream = str(oanda_stream_url_var.get() or "").strip()
+                alpaca_base_norm, _, alpaca_base_host = normalize_endpoint_url(raw_alpaca_base, default=alpaca_base_default)
+                alpaca_data_norm, _, _ = normalize_endpoint_url(raw_alpaca_data, default=f"https://{ALPACA_DATA_HOST}")
+                oanda_rest_norm, _, oanda_rest_host = normalize_endpoint_url(raw_oanda_rest, default=oanda_rest_default)
+                oanda_stream_norm, _, oanda_stream_host = normalize_endpoint_url(raw_oanda_stream, default=oanda_stream_default)
+                if (not raw_alpaca_base) or (not alpaca_base_norm):
+                    alpaca_base_url_txt = alpaca_base_default
+                    alpaca_base_host = ALPACA_PAPER_HOST if alpaca_paper_mode else ALPACA_LIVE_HOST
+                else:
+                    alpaca_base_url_txt = alpaca_base_norm
+                if alpaca_paper_mode and (alpaca_base_host == ALPACA_LIVE_HOST):
+                    alpaca_base_url_txt = f"https://{ALPACA_PAPER_HOST}"
+                elif (not alpaca_paper_mode) and (alpaca_base_host == ALPACA_PAPER_HOST):
+                    alpaca_base_url_txt = f"https://{ALPACA_LIVE_HOST}"
+                alpaca_data_url_txt = alpaca_data_norm or f"https://{ALPACA_DATA_HOST}"
+                if (not raw_oanda_rest) or (not oanda_rest_norm):
+                    oanda_rest_url_txt = oanda_rest_default
+                    oanda_rest_host = OANDA_PRACTICE_REST_HOST if oanda_practice_mode else OANDA_LIVE_REST_HOST
+                else:
+                    oanda_rest_url_txt = oanda_rest_norm
+                if (not raw_oanda_stream) or (not oanda_stream_norm):
+                    oanda_stream_url_txt = oanda_stream_default
+                    oanda_stream_host = OANDA_PRACTICE_STREAM_HOST if oanda_practice_mode else OANDA_LIVE_STREAM_HOST
+                else:
+                    oanda_stream_url_txt = oanda_stream_norm
+                if oanda_practice_mode:
+                    if oanda_rest_host == OANDA_LIVE_REST_HOST:
+                        oanda_rest_url_txt = f"https://{OANDA_PRACTICE_REST_HOST}"
+                    if oanda_stream_host == OANDA_LIVE_STREAM_HOST:
+                        oanda_stream_url_txt = f"https://{OANDA_PRACTICE_STREAM_HOST}"
+                else:
+                    if oanda_rest_host == OANDA_PRACTICE_REST_HOST:
+                        oanda_rest_url_txt = f"https://{OANDA_LIVE_REST_HOST}"
+                    if oanda_stream_host == OANDA_PRACTICE_STREAM_HOST:
+                        oanda_stream_url_txt = f"https://{OANDA_LIVE_STREAM_HOST}"
+
                 self.settings["main_neural_dir"] = main_dir_var.get().strip()
                 self.settings["coins"] = [c.strip().upper() for c in coins_var.get().split(",") if c.strip()]
                 self.settings["trade_start_level"] = max(1, min(int(float(trade_start_level_var.get().strip())), 7))
@@ -17149,9 +17200,9 @@ class PowerTraderHub(tk.Tk):
                     _write_secret_file(as_path, alpaca_secret_in)
                 self.settings["alpaca_api_key_id"] = ""
                 self.settings["alpaca_secret_key"] = ""
-                self.settings["alpaca_base_url"] = alpaca_base_url_var.get().strip() or str(DEFAULT_SETTINGS.get("alpaca_base_url", ""))
-                self.settings["alpaca_data_url"] = alpaca_data_url_var.get().strip() or str(DEFAULT_SETTINGS.get("alpaca_data_url", ""))
-                self.settings["alpaca_paper_mode"] = bool(alpaca_paper_var.get())
+                self.settings["alpaca_base_url"] = str(alpaca_base_url_txt or alpaca_base_default)
+                self.settings["alpaca_data_url"] = str(alpaca_data_url_txt or f"https://{ALPACA_DATA_HOST}")
+                self.settings["alpaca_paper_mode"] = bool(alpaca_paper_mode)
                 stage = str(rollout_stage_var.get() or "").strip().lower()
                 if stage not in {"legacy", "scan_expanded", "risk_caps", "execution_v2", "shadow_only", "live_guarded"}:
                     stage = str(DEFAULT_SETTINGS.get("market_rollout_stage", "legacy"))
@@ -17330,9 +17381,9 @@ class PowerTraderHub(tk.Tk):
                 # account id is less sensitive but is sourced from env first for consistency.
                 self.settings["oanda_account_id"] = ""
                 self.settings["oanda_api_token"] = ""
-                self.settings["oanda_rest_url"] = oanda_rest_url_var.get().strip() or str(DEFAULT_SETTINGS.get("oanda_rest_url", ""))
-                self.settings["oanda_stream_url"] = oanda_stream_url_var.get().strip() or str(DEFAULT_SETTINGS.get("oanda_stream_url", ""))
-                self.settings["oanda_practice_mode"] = bool(oanda_practice_var.get())
+                self.settings["oanda_rest_url"] = str(oanda_rest_url_txt or oanda_rest_default)
+                self.settings["oanda_stream_url"] = str(oanda_stream_url_txt or oanda_stream_default)
+                self.settings["oanda_practice_mode"] = bool(oanda_practice_mode)
                 self.settings["paper_only_unless_checklist_green"] = bool(paper_only_guard_var.get())
                 try:
                     self.settings["key_rotation_warn_days"] = max(7, int(float((key_rotation_warn_days_var.get() or "").strip() or 90)))
