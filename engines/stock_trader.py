@@ -11,6 +11,7 @@ from app.credential_utils import get_alpaca_creds
 from app.http_utils import parse_retry_after_value
 from app.path_utils import resolve_runtime_paths
 from app.runtime_logging import runtime_event
+from app.scanner_quality import effective_reject_pressure
 from brokers.broker_alpaca import AlpacaBrokerClient
 
 BASE_DIR, _SETTINGS_PATH, HUB_DATA_DIR, _BOOT_SETTINGS = resolve_runtime_paths(__file__, "stock_trader")
@@ -270,6 +271,30 @@ def _fail_reason_summary(reasons: List[str], max_items: int = 4) -> tuple[str, D
     return f"{str(top[0])} x{int(top[1])}", clipped
 
 
+def _effective_reject_pressure(settings: Dict[str, Any], thinker: Dict[str, Any]) -> tuple[float, float]:
+    reject_summary = thinker.get("reject_summary", {}) if isinstance(thinker.get("reject_summary", {}), dict) else {}
+    try:
+        raw_rate = max(0.0, float(reject_summary.get("reject_rate_pct", 0.0) or 0.0))
+    except Exception:
+        raw_rate = 0.0
+    dominant_reason = str(reject_summary.get("dominant_reason", "") or "").strip().lower()
+    try:
+        dominant_ratio_pct = max(0.0, float(reject_summary.get("dominant_ratio_pct", 0.0) or 0.0))
+    except Exception:
+        dominant_ratio_pct = 0.0
+    leaders_total = int(len(list(thinker.get("leaders", []) or []))) if isinstance(thinker, dict) else 0
+    scores_total = int(len(list(thinker.get("all_scores", []) or []))) if isinstance(thinker, dict) else 0
+    effective = effective_reject_pressure(
+        raw_rate,
+        dominant_reason=dominant_reason,
+        dominant_ratio_pct=dominant_ratio_pct,
+        leaders_total=leaders_total,
+        scores_total=scores_total,
+        unknown_dom_cap_pct=100.0,
+    )
+    return effective, raw_rate
+
+
 def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
     stocks_dir = os.path.join(hub_dir, "stocks")
     os.makedirs(stocks_dir, exist_ok=True)
@@ -371,11 +396,7 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
         fallback_age_s = int(float(thinker.get("fallback_age_s", 0) or 0)) if fallback_active else 0
     except Exception:
         fallback_age_s = 0
-    reject_summary = thinker.get("reject_summary", {}) if isinstance(thinker.get("reject_summary", {}), dict) else {}
-    try:
-        thinker_reject_rate_pct = max(0.0, float(reject_summary.get("reject_rate_pct", 0.0) or 0.0))
-    except Exception:
-        thinker_reject_rate_pct = 0.0
+    thinker_reject_rate_pct, thinker_reject_rate_raw_pct = _effective_reject_pressure(settings, thinker if isinstance(thinker, dict) else {})
     entry_size_scale = 1.0
     if fallback_active and (not block_cached_scan):
         entry_size_scale = float(cached_scan_entry_size_mult)
@@ -706,6 +727,7 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
             "data_quality_required": bool(require_data_quality_ok),
             "data_quality_ok": bool(thinker_data_ok),
             "reject_rate_pct": float(round(thinker_reject_rate_pct, 4)),
+            "reject_rate_raw_pct": float(round(thinker_reject_rate_raw_pct, 4)),
             "reject_rate_max_pct": float(round(reject_rate_gate_pct, 4)),
             "cached_fallback_active": bool(fallback_active),
             "cached_fallback_age_s": int(fallback_age_s),
@@ -791,6 +813,7 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
             "data_quality_required": bool(require_data_quality_ok),
             "data_quality_ok": bool(thinker_data_ok),
             "reject_rate_pct": float(round(thinker_reject_rate_pct, 4)),
+            "reject_rate_raw_pct": float(round(thinker_reject_rate_raw_pct, 4)),
             "reject_rate_max_pct": float(round(reject_rate_gate_pct, 4)),
             "cached_fallback_active": bool(fallback_active),
             "cached_fallback_age_s": int(fallback_age_s),

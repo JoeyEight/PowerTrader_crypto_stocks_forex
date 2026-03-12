@@ -390,8 +390,10 @@ class AlpacaBrokerClient:
                 "trader_state": "Paper mode ready",
                 "msg": f"Account status={str(acct.get('status', 'ok') or 'ok')}",
                 "buying_power": str(acct.get("buying_power", "N/A") or "N/A"),
+                "cash": str(acct.get("cash", "N/A") or "N/A"),
                 "open_positions": str(len(raw_positions)),
-                "realized_pnl": str(acct.get("equity", "N/A") or "N/A"),
+                # Alpaca account summary does not expose realized PnL in this snapshot path.
+                "realized_pnl": "N/A",
                 "positions_preview": preview,
                 "raw_positions": raw_positions,
                 "equity": str(acct.get("equity", "N/A") or "N/A"),

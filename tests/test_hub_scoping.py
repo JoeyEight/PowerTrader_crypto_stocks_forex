@@ -237,7 +237,15 @@ class HubScopingTests(unittest.TestCase):
                             "reasons": ["exposure_concentration"],
                             "hints": ["Exposure concentration is high."],
                         },
-                        "exposure_map": {"top_positions": [{"market": "stocks", "pct_of_total_exposure": 86.0}]},
+                        "exposure_map": {
+                            "top_positions": [
+                                {
+                                    "market": "stocks",
+                                    "pct_of_total_exposure": 86.0,
+                                    "pct_of_market_account": 12.0,
+                                }
+                            ]
+                        },
                         "market_trends": {},
                     },
                     f,

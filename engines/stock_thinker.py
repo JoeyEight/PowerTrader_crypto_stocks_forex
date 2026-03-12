@@ -17,12 +17,36 @@ from app.http_utils import retry_after_from_urllib_http_error
 from app.path_utils import resolve_runtime_paths
 from app.rejection_replay import recommend_threshold_from_scores, replay_target_entries_for_market
 from app.scan_diagnostics_schema import with_scan_schema
-from app.scanner_quality import build_universe_quality_report, quality_hints, turnover_pct
+from app.scanner_quality import build_universe_quality_report, effective_reject_pressure, quality_hints, turnover_pct
 from brokers.broker_alpaca import AlpacaBrokerClient
 
 BASE_DIR, _SETTINGS_PATH, HUB_DATA_DIR, _BOOT_SETTINGS = resolve_runtime_paths(__file__, "stock_thinker")
 
 DEFAULT_STOCK_UNIVERSE = ["AAPL", "MSFT", "NVDA", "AMZN", "META", "TSLA", "SPY", "QQQ"]
+_UNIVERSE_PRIORITY_SYMBOLS = [
+    "QQQ",
+    "SPY",
+    "AAPL",
+    "MSFT",
+    "NVDA",
+    "AMZN",
+    "META",
+    "TSLA",
+    "IWM",
+    "DIA",
+    "AMD",
+    "GOOGL",
+    "NFLX",
+    "PLTR",
+    "AVGO",
+    "SMCI",
+    "JPM",
+    "BAC",
+    "XOM",
+    "CVX",
+    "UNH",
+    "COST",
+]
 _UNIVERSE_CACHE_SCHEMA = 2
 _SCANNABLE_EXCHANGES = {"NASDAQ", "NYSE", "AMEX", "ARCA", "BATS"}
 ROLLOUT_ORDER = {
@@ -566,6 +590,11 @@ def _cooldown_reasons(settings: Dict[str, Any], key: str, default_csv: str) -> s
         r = str(tok or "").strip().lower()
         if r:
             out.add(r)
+    # Legacy defaults cooled down spread/liquidity rejects too aggressively and
+    # could leave most of the universe muted. Treat that exact legacy set as the
+    # newer hard-data-only default unless the operator explicitly customizes it.
+    if out == {"data_quality", "insufficient_bars", "spread", "liquidity"}:
+        return {"data_quality", "insufficient_bars"}
     return out
 
 
@@ -606,13 +635,21 @@ def _apply_symbol_cooldown(
     }
 
 
-def _prune_cooldown_map(cooldown_map: Dict[str, Any], now_ts: int) -> Dict[str, Any]:
+def _prune_cooldown_map(cooldown_map: Dict[str, Any], now_ts: int, settings: Dict[str, Any] | None = None) -> Dict[str, Any]:
     out: Dict[str, Any] = {}
+    allowed_reasons = _cooldown_reasons(
+        settings if isinstance(settings, dict) else {},
+        "stock_symbol_cooldown_reject_reasons",
+        "data_quality,insufficient_bars",
+    )
     for sym, row in (cooldown_map or {}).items():
         if not isinstance(row, dict):
             continue
         s = str(sym or "").strip().upper()
         if not s:
+            continue
+        reason = str(row.get("reason", "") or "").strip().lower()
+        if reason and reason not in allowed_reasons:
             continue
         until = int(row.get("until", 0) or 0)
         updated = int(row.get("updated_ts", 0) or 0)
@@ -1007,6 +1044,77 @@ def _symbol_is_scannable(symbol: str) -> bool:
     return True
 
 
+def _recent_priority_symbols(hub_dir: str) -> List[str]:
+    out: List[str] = []
+
+    def _add(value: Any) -> None:
+        sym = str(value or "").strip().upper()
+        if _symbol_is_scannable(sym) and sym not in out:
+            out.append(sym)
+
+    try:
+        diag = _load_json_map(_scan_diag_path(hub_dir))
+        for sym in list(diag.get("leader_symbols", []) or []):
+            _add(sym)
+        for sym in list(diag.get("candidate_symbols", []) or []):
+            _add(sym)
+        _add(diag.get("top_symbol"))
+    except Exception:
+        pass
+    try:
+        thinker = _load_json_map(_thinker_status_path(hub_dir))
+        top_pick = thinker.get("top_pick", {}) if isinstance(thinker.get("top_pick", {}), dict) else {}
+        _add(top_pick.get("symbol"))
+        for row in list(thinker.get("leaders", []) or []):
+            if isinstance(row, dict):
+                _add(row.get("symbol"))
+    except Exception:
+        pass
+    try:
+        status = _load_json_map(os.path.join(hub_dir, "stocks", "alpaca_status.json"))
+        for row in list(status.get("raw_positions", []) or []):
+            if isinstance(row, dict):
+                _add(row.get("symbol"))
+    except Exception:
+        pass
+    return out
+
+
+def _prioritize_universe_symbols(symbols: List[str], watch: List[str], hub_dir: str) -> List[str]:
+    ordered_pool: List[str] = []
+    seen: set[str] = set()
+    for sym in list(symbols or []):
+        norm = str(sym or "").strip().upper()
+        if not _symbol_is_scannable(norm) or norm in seen:
+            continue
+        seen.add(norm)
+        ordered_pool.append(norm)
+
+    out: List[str] = []
+    used: set[str] = set()
+
+    def _push(sym: Any) -> None:
+        norm = str(sym or "").strip().upper()
+        if (not _symbol_is_scannable(norm)) or (norm in used):
+            return
+        if norm not in seen and norm not in {str(s or "").strip().upper() for s in list(watch or [])}:
+            return
+        used.add(norm)
+        out.append(norm)
+
+    for sym in list(watch or []):
+        _push(sym)
+    for sym in _recent_priority_symbols(hub_dir):
+        _push(sym)
+    for sym in _UNIVERSE_PRIORITY_SYMBOLS:
+        _push(sym)
+    for sym in DEFAULT_STOCK_UNIVERSE:
+        _push(sym)
+    for sym in sorted(ordered_pool):
+        _push(sym)
+    return out
+
+
 def _select_universe(settings: Dict[str, Any], hub_dir: str, api_key: str, secret: str) -> List[str]:
     mode = str(settings.get("stock_universe_mode", "all_tradable_filtered") or "all_tradable_filtered").strip().lower()
     watch = _parse_watchlist(settings)
@@ -1021,7 +1129,7 @@ def _select_universe(settings: Dict[str, Any], hub_dir: str, api_key: str, secre
 
     cached = _load_universe_cache(hub_dir, ttl_s=1800)
     if cached:
-        return cached
+        return _prioritize_universe_symbols(cached, watch, hub_dir)
 
     client = AlpacaBrokerClient(
         api_key_id=api_key,
@@ -1054,13 +1162,7 @@ def _select_universe(settings: Dict[str, Any], hub_dir: str, api_key: str, secre
             continue
         if sym and sym not in symbols:
             symbols.append(sym)
-    symbols.sort(key=lambda s: (len(s), s))
-    if watch:
-        merged = [s for s in watch if _symbol_is_scannable(s)]
-        for s in symbols:
-            if s not in merged:
-                merged.append(s)
-        symbols = merged
+    symbols = _prioritize_universe_symbols(symbols, watch, hub_dir)
     if not symbols:
         return watch if watch else list(DEFAULT_STOCK_UNIVERSE)
     _save_universe_cache(hub_dir, symbols)
@@ -1211,7 +1313,7 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
     now_ts = int(time.time())
     window_policy = _stock_scan_window_policy(settings) if market_open else {"active": False, "window": "OFF", "score_mult": 1.0, "minutes": 0}
     window_policy_hits = 0
-    cooldown_map = _prune_cooldown_map(cooldown_map, now_ts)
+    cooldown_map = _prune_cooldown_map(cooldown_map, now_ts, settings=settings)
 
     # Warmup prefetch queue: pull extra daily history for recently short symbols.
     if warm_queue:
@@ -1296,9 +1398,6 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
             _apply_symbol_cooldown(cooldown_map, sym, "liquidity", settings, now_ts)
             continue
         candidates.append(sym)
-    if not candidates:
-        candidates = universe[: min(12, len(universe))]
-
     scored: List[Dict[str, Any]] = []
     last_exc: Exception | None = None
     bars_by_symbol: Dict[str, List[Dict[str, Any]]] = {}
@@ -1479,7 +1578,9 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
             elif len(err_txt) > 92:
                 err_txt = err_txt[:89] + "..."
             feed_issue_parts.append(f"{feed_name}:{err_txt}")
-        if rejected:
+        if (not candidates) and rejected:
+            msg = "No symbols passed stock marketability prefilters"
+        elif rejected:
             msg = "No viable symbols after data-quality gates"
         else:
             msg = (f"{type(last_exc).__name__}: {last_exc}" if last_exc else "No viable symbols after data-quality gates")
@@ -1523,7 +1624,13 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
         reason_counts = dict(reject_summary.get("counts", {}) or {})
         dominant_reason = str(reject_summary.get("dominant_reason", "") or "")
         dominant_ratio = float(reject_summary.get("dominant_ratio_pct", 0.0) or 0.0) / 100.0
-        reject_rate_pct = float(reject_summary.get("reject_rate_pct", 0.0) or 0.0)
+        reject_rate_pct = effective_reject_pressure(
+            reject_summary.get("reject_rate_pct", 0.0),
+            dominant_reason=dominant_reason,
+            dominant_ratio_pct=float(reject_summary.get("dominant_ratio_pct", 0.0) or 0.0),
+            leaders_total=0,
+            scores_total=0,
+        )
         reject_warn_pct = max(10.0, float(settings.get("stock_reject_drift_warn_pct", 65.0) or 65.0))
         drift_warning = bool((reject_rate_pct >= reject_warn_pct) and (dominant_ratio >= 0.60))
         _save_scan_diagnostics(
@@ -1568,13 +1675,16 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
         for h in quality_hints(quality_report):
             if h not in hints:
                 hints.append(h)
-        fallback = _cached_scan_fallback(
-            hub_dir,
-            ts_now,
-            msg,
-            universe=list(candidates),
-            market_open=bool(market_open),
-        )
+        fallback_allowed = bool(feed_issue_parts or (last_exc is not None))
+        fallback = None
+        if fallback_allowed:
+            fallback = _cached_scan_fallback(
+                hub_dir,
+                ts_now,
+                msg,
+                universe=list(candidates),
+                market_open=bool(market_open),
+            )
         if fallback:
             _save_scan_diagnostics(
                 hub_dir,
@@ -1806,7 +1916,13 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
     reason_counts = dict(reject_summary.get("counts", {}) or {})
     dominant_reason = str(reject_summary.get("dominant_reason", "") or "")
     dominant_ratio = float(reject_summary.get("dominant_ratio_pct", 0.0) or 0.0) / 100.0
-    reject_rate_pct = float(reject_summary.get("reject_rate_pct", 0.0) or 0.0)
+    reject_rate_pct = effective_reject_pressure(
+        reject_summary.get("reject_rate_pct", 0.0),
+        dominant_reason=dominant_reason,
+        dominant_ratio_pct=float(reject_summary.get("dominant_ratio_pct", 0.0) or 0.0),
+        leaders_total=int(len(leaders)),
+        scores_total=int(len(scored)),
+    )
     reject_warn_pct = max(10.0, float(settings.get("stock_reject_drift_warn_pct", 65.0) or 65.0))
     drift_warning = bool((reject_rate_pct >= reject_warn_pct) and (dominant_ratio >= 0.60))
     _save_scan_diagnostics(

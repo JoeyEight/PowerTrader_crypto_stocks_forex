@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import Any, Dict, Iterable, Tuple
 
 from app.settings_migrations import CURRENT_SETTINGS_VERSION, migrate_settings
@@ -186,9 +187,9 @@ SANITIZER_DEFAULTS: Dict[str, Any] = {
     "global_drawdown_resume_cooloff_s": 14400,
     "global_drawdown_resume_recovery_buffer_pct": 0.25,
     "global_drawdown_require_manual_ack": True,
-    "stock_symbol_cooldown_minutes": 30,
-    "stock_symbol_cooldown_min_hits": 2,
-    "stock_symbol_cooldown_reject_reasons": "data_quality,insufficient_bars,spread,liquidity",
+    "stock_symbol_cooldown_minutes": 15,
+    "stock_symbol_cooldown_min_hits": 3,
+    "stock_symbol_cooldown_reject_reasons": "data_quality,insufficient_bars",
     "forex_pair_cooldown_minutes": 20,
     "forex_pair_cooldown_min_hits": 2,
     "forex_pair_cooldown_reject_reasons": "data_quality,insufficient_bars,spread,low_volatility",
@@ -408,8 +409,8 @@ _INT_BOUNDS: Dict[str, Tuple[int, int, int]] = {
     "data_cache_max_total_mb": (300, 32, 5000),
     "global_drawdown_lookback_hours": (24, 1, 168),
     "global_drawdown_resume_cooloff_s": (14400, 60, 604800),
-    "stock_symbol_cooldown_minutes": (30, 1, 1440),
-    "stock_symbol_cooldown_min_hits": (2, 1, 20),
+    "stock_symbol_cooldown_minutes": (15, 1, 1440),
+    "stock_symbol_cooldown_min_hits": (3, 1, 20),
     "forex_pair_cooldown_minutes": (20, 1, 1440),
     "forex_pair_cooldown_min_hits": (2, 1, 20),
 }
@@ -425,6 +426,251 @@ _ENUMS: Dict[str, Iterable[str]] = {
     "stock_universe_mode": ("core", "watchlist", "all_tradable_filtered"),
     "forex_session_mode": ("all", "london_ny", "london", "ny", "asia"),
 }
+
+
+def _as_number(value: Any, default: float = 0.0) -> float:
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value or "").strip().replace(",", "")
+    if not text:
+        return float(default)
+    match = re.search(r"[-+]?\d+(?:\.\d+)?", text)
+    if not match:
+        return float(default)
+    try:
+        return float(match.group(0))
+    except Exception:
+        return float(default)
+
+
+def _round_to_step(value: float, step: int, minimum: int = 1) -> int:
+    step_i = max(1, int(step or 1))
+    val = max(float(minimum), float(value))
+    return max(int(minimum), int(round(val / step_i) * step_i))
+
+
+def _market_account_metrics(status: Dict[str, Any] | None, trader: Dict[str, Any] | None) -> Dict[str, float]:
+    status_row = status if isinstance(status, dict) else {}
+    trader_row = trader if isinstance(trader, dict) else {}
+    account_value = max(
+        _as_number(trader_row.get("account_value_usd"), 0.0),
+        _as_number(status_row.get("equity"), 0.0),
+        _as_number(status_row.get("nav"), 0.0),
+        _as_number(status_row.get("account_balance"), 0.0),
+    )
+    exposure = max(
+        0.0,
+        _as_number(trader_row.get("exposure_usd"), 0.0),
+        _as_number(status_row.get("market_value"), 0.0),
+    )
+    buying_power = max(
+        _as_number(status_row.get("buying_power"), 0.0),
+        _as_number(status_row.get("margin_available"), 0.0),
+        _as_number(status_row.get("cash"), 0.0),
+    )
+    if buying_power <= 0.0 and account_value > 0.0:
+        buying_power = max(0.0, account_value - exposure)
+    open_positions = max(
+        int(_as_number(status_row.get("open_positions"), 0.0)),
+        int(_as_number(trader_row.get("open_positions"), 0.0)),
+    )
+    return {
+        "account_value_usd": float(account_value),
+        "buying_power_usd": float(buying_power),
+        "exposure_usd": float(exposure),
+        "open_positions": int(open_positions),
+    }
+
+
+def _recommended_stock_open_positions(profile_key: str, account_value_usd: float, current_open_positions: int) -> int:
+    acct = max(0.0, float(account_value_usd))
+    cur = max(0, int(current_open_positions))
+    if profile_key == "guarded":
+        if acct >= 50_000.0:
+            base = 3
+        elif acct >= 10_000.0:
+            base = 2
+        else:
+            base = 1
+    elif profile_key == "performance":
+        if acct >= 75_000.0:
+            base = 8
+        elif acct >= 50_000.0:
+            base = 6
+        elif acct >= 10_000.0:
+            base = 4
+        elif acct >= 2_500.0:
+            base = 3
+        elif acct >= 750.0:
+            base = 2
+        else:
+            base = 1
+    else:
+        if acct >= 75_000.0:
+            base = 6
+        elif acct >= 25_000.0:
+            base = 4
+        elif acct >= 5_000.0:
+            base = 3
+        elif acct >= 1_000.0:
+            base = 2
+        else:
+            base = 1
+    if profile_key in {"balanced", "performance"} and cur > 0:
+        base = max(base, cur + 1)
+    else:
+        base = max(base, cur)
+    return max(1, min(12, int(base)))
+
+
+def _recommended_stock_notional_usd(
+    profile_key: str,
+    account_value_usd: float,
+    buying_power_usd: float,
+    max_open_positions: int,
+    current_open_positions: int,
+) -> float:
+    acct = max(0.0, float(account_value_usd))
+    bp = max(0.0, float(buying_power_usd))
+    max_pos = max(1, int(max_open_positions))
+    cur = max(0, int(current_open_positions))
+    pct = {
+        "guarded": 0.0040,
+        "balanced": 0.0080,
+        "performance": 0.0125,
+    }.get(profile_key, 0.0080)
+    base = acct * pct
+    remaining_slots = max(1, max_pos - cur)
+    room_per_slot = bp / remaining_slots if bp > 0.0 else acct / max_pos if acct > 0.0 else 0.0
+    room_cap_mult = {
+        "guarded": 0.20,
+        "balanced": 0.28,
+        "performance": 0.35,
+    }.get(profile_key, 0.28)
+    room_cap = room_per_slot * room_cap_mult if room_per_slot > 0.0 else base
+    floor = 25.0 if acct >= 500.0 else 5.0
+    raw = max(floor, min(max(base, floor), max(floor, room_cap)))
+    step = 25 if raw >= 250.0 else 10 if raw >= 100.0 else 5
+    return float(_round_to_step(raw, step, minimum=max(1, step)))
+
+
+def _recommended_forex_open_positions(profile_key: str, account_value_usd: float, current_open_positions: int) -> int:
+    acct = max(0.0, float(account_value_usd))
+    cur = max(0, int(current_open_positions))
+    if profile_key == "guarded":
+        base = 1 if acct < 250.0 else 2
+    elif profile_key == "performance":
+        if acct >= 500.0:
+            base = 5
+        elif acct >= 250.0:
+            base = 4
+        elif acct >= 100.0:
+            base = 3
+        else:
+            base = 2
+    else:
+        if acct >= 500.0:
+            base = 4
+        elif acct >= 150.0:
+            base = 3
+        else:
+            base = 2
+    return max(1, min(8, max(base, cur)))
+
+
+def _recommended_forex_trade_units(
+    profile_key: str,
+    account_value_usd: float,
+    buying_power_usd: float,
+    max_open_positions: int,
+    current_open_positions: int,
+) -> int:
+    acct = max(0.0, float(account_value_usd))
+    bp = max(0.0, float(buying_power_usd))
+    cur = max(0, int(current_open_positions))
+    max_pos = max(1, int(max_open_positions))
+    factor = {
+        "guarded": 0.15,
+        "balanced": 0.20,
+        "performance": 0.25,
+    }.get(profile_key, 0.20)
+    base = max(1.0, acct * factor)
+    remaining_slots = max(1, max_pos - cur)
+    room_cap = (bp / remaining_slots) * 0.40 if bp > 0.0 else base
+    units = max(1.0, min(base, max(1.0, room_cap)))
+    if units < 10.0:
+        step = 1
+    elif units < 50.0:
+        step = 5
+    elif units < 250.0:
+        step = 25
+    elif units < 1_000.0:
+        step = 50
+    else:
+        step = 100
+    return int(_round_to_step(units, step, minimum=1))
+
+
+def recommend_market_profile_overrides(
+    profile_key: str,
+    settings: Dict[str, Any] | None = None,
+    stock_status: Dict[str, Any] | None = None,
+    stock_trader: Dict[str, Any] | None = None,
+    forex_status: Dict[str, Any] | None = None,
+    forex_trader: Dict[str, Any] | None = None,
+) -> Dict[str, Any]:
+    pkey = str(profile_key or "balanced").strip().lower()
+    if pkey not in {"guarded", "balanced", "performance"}:
+        pkey = "balanced"
+    cfg = settings if isinstance(settings, dict) else {}
+    stock_metrics = _market_account_metrics(stock_status, stock_trader)
+    forex_metrics = _market_account_metrics(forex_status, forex_trader)
+    stock_max_open = _recommended_stock_open_positions(
+        pkey,
+        stock_metrics.get("account_value_usd", 0.0),
+        int(stock_metrics.get("open_positions", 0) or 0),
+    )
+    forex_max_open = _recommended_forex_open_positions(
+        pkey,
+        forex_metrics.get("account_value_usd", 0.0),
+        int(forex_metrics.get("open_positions", 0) or 0),
+    )
+    stock_scan_max = max(8, int(_as_number(cfg.get("stock_scan_max_symbols"), SANITIZER_DEFAULTS.get("stock_scan_max_symbols", 160))))
+    if pkey == "guarded":
+        stocks_scan_interval_s = 20.0
+    elif stock_scan_max >= 200:
+        stocks_scan_interval_s = 20.0
+    elif stock_scan_max >= 120:
+        stocks_scan_interval_s = 15.0
+    else:
+        stocks_scan_interval_s = 12.0 if pkey == "performance" else 15.0
+    forex_scan_interval_s = 12.0 if pkey == "guarded" else 10.0 if pkey == "balanced" else 8.0
+    overrides: Dict[str, Any] = {
+        "stock_trade_notional_usd": _recommended_stock_notional_usd(
+            pkey,
+            stock_metrics.get("account_value_usd", 0.0),
+            stock_metrics.get("buying_power_usd", 0.0),
+            stock_max_open,
+            int(stock_metrics.get("open_positions", 0) or 0),
+        ),
+        "stock_max_open_positions": int(stock_max_open),
+        "forex_trade_units": _recommended_forex_trade_units(
+            pkey,
+            forex_metrics.get("account_value_usd", 0.0),
+            forex_metrics.get("buying_power_usd", 0.0),
+            forex_max_open,
+            int(forex_metrics.get("open_positions", 0) or 0),
+        ),
+        "forex_max_open_positions": int(forex_max_open),
+        "market_bg_stocks_interval_s": float(stocks_scan_interval_s),
+        "market_bg_forex_interval_s": float(forex_scan_interval_s),
+        "stock_symbol_cooldown_minutes": 15,
+        "stock_symbol_cooldown_min_hits": 3,
+        "stock_symbol_cooldown_reject_reasons": "data_quality,insufficient_bars",
+    }
+    if pkey == "performance":
+        overrides["market_max_total_exposure_pct"] = 0.0
+    return overrides
 
 
 def _as_bool(value: Any, default: bool = False) -> bool:

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from app.settings_utils import sanitize_settings
+from app.settings_utils import recommend_market_profile_overrides, sanitize_settings
 
 
 class TestSettingsSanitize(unittest.TestCase):
@@ -142,6 +142,24 @@ class TestSettingsSanitize(unittest.TestCase):
         self.assertTrue(str(out["script_trader"]).endswith("pt_trader.py"))
         self.assertEqual(str(out.get("settings_control_mode", "")), "self_managed")
         self.assertEqual(str(out.get("settings_profile", "")), "balanced")
+        self.assertEqual(int(out.get("stock_symbol_cooldown_minutes", 0) or 0), 15)
+        self.assertEqual(int(out.get("stock_symbol_cooldown_min_hits", 0) or 0), 3)
+        self.assertEqual(str(out.get("stock_symbol_cooldown_reject_reasons", "")), "data_quality,insufficient_bars")
+
+    def test_market_profile_overrides_are_account_aware(self) -> None:
+        overrides = recommend_market_profile_overrides(
+            "performance",
+            settings={"stock_scan_max_symbols": 240},
+            stock_status={"buying_power": "199748.68", "equity": "99998.68", "open_positions": "2"},
+            stock_trader={"account_value_usd": 99998.72, "open_positions": 2},
+            forex_status={"buying_power": "97.3632 USD", "nav": 99.956, "open_positions": "1"},
+            forex_trader={"account_value_usd": 99.956, "open_positions": 1},
+        )
+        self.assertEqual(int(overrides["stock_max_open_positions"]), 8)
+        self.assertGreater(float(overrides["stock_trade_notional_usd"]), 200.0)
+        self.assertEqual(int(overrides["forex_trade_units"]), 25)
+        self.assertEqual(float(overrides["market_max_total_exposure_pct"]), 0.0)
+        self.assertEqual(float(overrides["market_bg_stocks_interval_s"]), 20.0)
 
 
 if __name__ == "__main__":

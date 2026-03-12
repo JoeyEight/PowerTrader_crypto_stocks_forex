@@ -151,17 +151,51 @@ class TestHealthRules(unittest.TestCase):
         self.assertLess(float(out.get("metrics", {}).get("stocks_reject_rate_pct", 100.0)), 65.0)
         self.assertNotIn("scan_reject_pressure", out.get("reasons", []))
 
+    def test_liquidity_dominated_rejects_with_live_leaders_do_not_raise_runtime_pressure(self) -> None:
+        state = {
+            "checks": {"ok": True, "warnings": []},
+            "scan_health": {
+                "stocks": {
+                    "reject_rate_pct": 100.0,
+                    "leaders_total": 1,
+                    "scores_total": 2,
+                    "reject_dominant_reason": "liquidity",
+                    "reject_dominant_ratio_pct": 78.0,
+                },
+                "forex": {"reject_rate_pct": 0.0},
+            },
+            "incidents_last_200": {"count": 0, "by_severity": {"error": 0, "warning": 0, "info": 10}},
+            "autopilot": {"api_unstable": False},
+        }
+        out = evaluate_runtime_alerts(state, {"runtime_alert_scan_reject_warn_pct": 65.0})
+        self.assertEqual(out["severity"], "ok")
+        self.assertNotIn("scan_reject_pressure", out.get("reasons", []))
+        self.assertLess(float(out.get("metrics", {}).get("stocks_reject_rate_pct", 100.0)), 65.0)
+
     def test_warn_on_exposure_concentration(self) -> None:
         state = {
             "checks": {"ok": True, "warnings": []},
             "scan_health": {"stocks": {"reject_rate_pct": 0.0}, "forex": {"reject_rate_pct": 0.0}},
             "incidents_last_200": {"count": 0, "by_severity": {"error": 0}},
             "autopilot": {"api_unstable": False},
-            "exposure_map": {"top_positions": [{"pct_of_total_exposure": 66.0}]},
+            "exposure_map": {"top_positions": [{"pct_of_total_exposure": 66.0, "pct_of_market_account": 12.0}]},
         }
         out = evaluate_runtime_alerts(state, {"runtime_alert_exposure_concentration_warn_pct": 55.0})
         self.assertEqual(out["severity"], "warn")
         self.assertIn("exposure_concentration", out["reasons"])
+
+    def test_exposure_concentration_is_suppressed_for_tiny_position_vs_account(self) -> None:
+        state = {
+            "checks": {"ok": True, "warnings": []},
+            "scan_health": {"stocks": {"reject_rate_pct": 0.0}, "forex": {"reject_rate_pct": 0.0}},
+            "incidents_last_200": {"count": 0, "by_severity": {"error": 0}},
+            "autopilot": {"api_unstable": False},
+            "exposure_map": {"top_positions": [{"pct_of_total_exposure": 79.2, "pct_of_market_account": 0.05}]},
+        }
+        out = evaluate_runtime_alerts(state, {"runtime_alert_exposure_concentration_warn_pct": 55.0})
+        self.assertEqual(out["severity"], "ok")
+        self.assertNotIn("exposure_concentration", out["reasons"])
+        self.assertEqual(float(out.get("metrics", {}).get("top_exposure_pct_of_market_account", -1.0)), 0.05)
 
     def test_warn_on_execution_guard_active(self) -> None:
         state = {

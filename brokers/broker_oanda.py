@@ -281,7 +281,49 @@ class OandaBrokerClient:
                 ask = 0.0
             mid = (bid + ask) * 0.5 if bid > 0 and ask > 0 else max(bid, ask, 0.0)
             spread_bps = (((ask - bid) / mid) * 10000.0) if (mid > 0 and ask > 0 and bid > 0) else 0.0
-            out[inst] = {"bid": bid, "ask": ask, "mid": mid, "spread_bps": spread_bps}
+            quote_ccy = ""
+            if "_" in inst:
+                try:
+                    quote_ccy = str(inst.split("_", 1)[1] or "").strip().upper()
+                except Exception:
+                    quote_ccy = ""
+            qh = row.get("quoteHomeConversionFactors", {}) or {}
+            try:
+                qh_pos = float(qh.get("positiveUnits", 0.0) or 0.0)
+            except Exception:
+                qh_pos = 0.0
+            try:
+                qh_neg = abs(float(qh.get("negativeUnits", 0.0) or 0.0))
+            except Exception:
+                qh_neg = 0.0
+            quote_to_home = max(abs(qh_pos), abs(qh_neg), 0.0)
+            home_conversions = row.get("homeConversions", []) or []
+            if quote_to_home <= 0.0 and quote_ccy and isinstance(home_conversions, list):
+                for conv in home_conversions:
+                    if not isinstance(conv, dict):
+                        continue
+                    if str(conv.get("currency", "") or "").strip().upper() != quote_ccy:
+                        continue
+                    try:
+                        quote_to_home = max(
+                            quote_to_home,
+                            abs(float(conv.get("positionValue", 0.0) or 0.0)),
+                            abs(float(conv.get("accountGain", 0.0) or 0.0)),
+                            abs(float(conv.get("accountLoss", 0.0) or 0.0)),
+                        )
+                    except Exception:
+                        pass
+                    break
+            out[inst] = {
+                "bid": bid,
+                "ask": ask,
+                "mid": mid,
+                "spread_bps": spread_bps,
+                "quote_currency": quote_ccy,
+                "quote_to_home": quote_to_home,
+                "quote_to_home_positive": qh_pos,
+                "quote_to_home_negative": qh_neg,
+            }
         return out
 
     def list_tradeable_instruments(self) -> List[str]:

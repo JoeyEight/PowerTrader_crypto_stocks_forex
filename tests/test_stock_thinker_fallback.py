@@ -47,6 +47,29 @@ class _FakeAlpacaClient:
         return out
 
 
+class _FakeRejectHeavyAlpacaClient:
+    def __init__(self, api_key_id: str, secret_key: str, base_url: str, data_url: str) -> None:
+        self.api_key_id = api_key_id
+        self.secret_key = secret_key
+        self.base_url = base_url
+        self.data_url = data_url
+
+    def get_snapshot_details(self, universe: list[str], feed: str = "iex") -> dict[str, dict[str, float]]:
+        # Valid price, but no symbol clears the liquidity floor.
+        return {str(sym).strip().upper(): {"mid": 25.0, "spread_bps": 2.0, "dollar_vol": 0.0} for sym in universe}
+
+    def get_stock_bars(
+        self,
+        symbol: str,
+        timeframe: str = "1Day",
+        limit: int = 120,
+        feed: str = "iex",
+        start_iso: str | None = None,
+        end_iso: str | None = None,
+    ) -> list[dict]:
+        return [_mk_bar(i, 25.0 + (i * 0.1)) for i in range(max(24, int(limit or 48)))]
+
+
 class TestStockThinkerFallback(unittest.TestCase):
     def test_uses_cached_scan_when_universe_selection_fails(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -108,6 +131,47 @@ class TestStockThinkerFallback(unittest.TestCase):
             self.assertTrue(bool(str(top.get("reason_logic", "") or "").strip()))
             self.assertTrue(bool(str(top.get("reason_data", "") or "").strip()))
             self.assertNotIn("6h", str(top.get("reason", "") or "").lower())
+
+    def test_does_not_invent_fallback_candidates_when_all_symbols_fail_prefilters(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            stocks_dir = os.path.join(td, "stocks")
+            os.makedirs(stocks_dir, exist_ok=True)
+            with open(os.path.join(stocks_dir, "stock_thinker_status.json"), "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "state": "READY",
+                        "leaders": [{"symbol": "AAPL", "side": "long", "score": 0.8, "reason": "cached"}],
+                        "all_scores": [{"symbol": "AAPL", "side": "long", "score": 0.8, "reason": "cached"}],
+                        "top_pick": {"symbol": "AAPL", "side": "long", "score": 0.8, "reason": "cached"},
+                        "top_chart": [{"t": "t1", "o": 1, "h": 1, "l": 1, "c": 1}],
+                        "top_chart_map": {"AAPL": [{"t": "t1", "o": 1, "h": 1, "l": 1, "c": 1}]},
+                        "updated_at": 1_700_000_000,
+                    },
+                    f,
+                )
+
+            settings = {
+                "alpaca_api_key_id": "abc",
+                "alpaca_secret_key": "xyz",
+                "stock_scan_max_symbols": 20,
+                "stock_min_dollar_volume": 2_500_000.0,
+            }
+            with (
+                patch.object(stock_thinker, "get_alpaca_creds", return_value=("abc", "xyz")),
+                patch.object(stock_thinker, "AlpacaBrokerClient", _FakeRejectHeavyAlpacaClient),
+                patch.object(stock_thinker, "_select_universe", return_value=["AAPL", "MSFT", "QQQ"]),
+                patch.object(stock_thinker, "_market_open_now", return_value=True),
+            ):
+                out = stock_thinker.run_scan(settings, td)
+
+            self.assertEqual(str(out.get("state", "")), "READY")
+            self.assertFalse(bool(out.get("fallback_cached", False)))
+            self.assertEqual(list(out.get("leaders", []) or []), [])
+            self.assertEqual(list(out.get("all_scores", []) or []), [])
+            self.assertEqual(list(out.get("universe", []) or []), [])
+            reject_summary = out.get("reject_summary", {}) if isinstance(out.get("reject_summary", {}), dict) else {}
+            self.assertEqual(str(reject_summary.get("dominant_reason", "")), "liquidity")
+            self.assertAlmostEqual(float(reject_summary.get("reject_rate_pct", 0.0) or 0.0), 100.0, places=2)
 
     def test_applies_leader_hysteresis_to_previous_top(self) -> None:
         with tempfile.TemporaryDirectory() as td:

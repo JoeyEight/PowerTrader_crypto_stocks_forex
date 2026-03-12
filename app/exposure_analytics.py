@@ -92,6 +92,51 @@ def _collect_forex_positions(hub_dir: str) -> List[Dict[str, Any]]:
     return out
 
 
+def _collect_account_values(hub_dir: str) -> Dict[str, float]:
+    trader_data = _safe_read_json(os.path.join(hub_dir, "trader_data.json"))
+    crypto_account = trader_data.get("account", {}) if isinstance(trader_data.get("account", {}), dict) else {}
+
+    stocks_trader = _safe_read_json(os.path.join(hub_dir, "stocks", "stock_trader_status.json"))
+    stocks_status = _safe_read_json(os.path.join(hub_dir, "stocks", "alpaca_status.json"))
+
+    forex_trader = _safe_read_json(os.path.join(hub_dir, "forex", "forex_trader_status.json"))
+    forex_status = _safe_read_json(os.path.join(hub_dir, "forex", "oanda_status.json"))
+
+    account_values = {
+        "crypto": max(
+            0.0,
+            _f(
+                crypto_account.get(
+                    "total_account_value",
+                    trader_data.get("account_value_usd", 0.0),
+                ),
+                0.0,
+            ),
+        ),
+        "stocks": max(
+            0.0,
+            _f(
+                stocks_trader.get(
+                    "account_value_usd",
+                    stocks_status.get("equity", 0.0),
+                ),
+                0.0,
+            ),
+        ),
+        "forex": max(
+            0.0,
+            _f(
+                forex_trader.get(
+                    "account_value_usd",
+                    forex_status.get("nav", 0.0),
+                ),
+                0.0,
+            ),
+        ),
+    }
+    return {k: round(float(v), 6) for k, v in account_values.items()}
+
+
 def _quote_currency(symbol: str) -> str:
     s = str(symbol or "").strip().upper()
     if "_" in s:
@@ -153,6 +198,7 @@ def _cross_market_warnings(positions: List[Dict[str, Any]], total: float, by_mar
 
 def build_exposure_payload(hub_dir: str) -> Dict[str, Any]:
     positions = _collect_crypto_positions(hub_dir) + _collect_stock_positions(hub_dir) + _collect_forex_positions(hub_dir)
+    account_values = _collect_account_values(hub_dir)
 
     by_market: Dict[str, float] = {"crypto": 0.0, "stocks": 0.0, "forex": 0.0}
     for row in positions:
@@ -168,12 +214,16 @@ def build_exposure_payload(hub_dir: str) -> Dict[str, Any]:
     for row in top:
         v = max(0.0, _f(row.get("value_usd", 0.0), 0.0))
         pct = (100.0 * v / total) if total > 0.0 else 0.0
+        market = str(row.get("market", "") or "").strip().lower()
+        market_account_value = max(0.0, _f(account_values.get(market, 0.0), 0.0))
+        pct_of_market_account = (100.0 * v / market_account_value) if market_account_value > 0.0 else 0.0
         heatmap.append(
             {
                 "market": str(row.get("market", "") or ""),
                 "symbol": str(row.get("symbol", "") or ""),
                 "value_usd": round(v, 6),
                 "pct_of_total_exposure": round(pct, 4),
+                "pct_of_market_account": round(pct_of_market_account, 4),
             }
         )
 
@@ -185,6 +235,8 @@ def build_exposure_payload(hub_dir: str) -> Dict[str, Any]:
     return {
         "ts": int(time.time()),
         "total_exposure_usd": round(total, 6),
+        "account_value_by_market_usd": {k: round(float(v), 6) for k, v in account_values.items()},
+        "total_account_value_usd": round(sum(float(v) for v in account_values.values()), 6),
         "by_market_usd": {k: round(float(v), 6) for k, v in by_market.items()},
         "by_market_pct": market_pct,
         "top_positions": heatmap,

@@ -7,6 +7,7 @@ import time
 from typing import Any, Dict, Iterable, List
 
 from app.scan_diagnostics_schema import normalize_scan_diagnostics
+from app.scanner_quality import effective_reject_pressure
 
 
 def _safe_read_json(path: str) -> Dict[str, Any]:
@@ -260,18 +261,34 @@ def _quality_aggregate(scan_diag: Dict[str, Any], quality_report: Dict[str, Any]
         dominant_reason = str(report_reasons[0].get("reason", "") or "").strip().lower()
     if not dominant_reason:
         dominant_reason = str(reject_summary.get("dominant_reason", "") or "").strip().lower()
-    reject_rate = float(report.get("reject_rate_pct", reject_summary.get("reject_rate_pct", 0.0)) or 0.0)
+    reject_rate_raw = float(
+        report.get(
+            "reject_rate_raw_pct",
+            report.get("reject_rate_pct", reject_summary.get("reject_rate_pct", 0.0)),
+        )
+        or 0.0
+    )
     candidate_churn = float(report.get("candidate_churn_pct", diag.get("candidate_churn_pct", 0.0)) or 0.0)
     leader_churn = float(report.get("leader_churn_pct", diag.get("leader_churn_pct", 0.0)) or 0.0)
     gate_pass_pct = float(report.get("gate_pass_pct", 0.0) or 0.0)
     leaders_total = int(report.get("leaders_total", diag.get("leaders_total", 0)) or 0)
     scores_total = int(report.get("scores_total", diag.get("scores_total", 0)) or 0)
+    dominant_ratio_pct = float(reject_summary.get("dominant_ratio_pct", 0.0) or 0.0)
+    reject_rate = effective_reject_pressure(
+        reject_rate_raw,
+        dominant_reason=dominant_reason,
+        dominant_ratio_pct=dominant_ratio_pct,
+        leaders_total=leaders_total,
+        scores_total=scores_total,
+    )
     return {
         "reject_rate_pct": round(max(0.0, min(100.0, reject_rate)), 3),
+        "reject_rate_raw_pct": round(max(0.0, min(100.0, reject_rate_raw)), 3),
         "candidate_churn_pct": round(max(0.0, min(100.0, candidate_churn)), 3),
         "leader_churn_pct": round(max(0.0, min(100.0, leader_churn)), 3),
         "gate_pass_pct": round(max(0.0, min(100.0, gate_pass_pct)), 3),
         "dominant_reason": dominant_reason,
+        "reject_dominant_ratio_pct": round(max(0.0, min(100.0, dominant_ratio_pct)), 3),
         "leaders_total": max(0, leaders_total),
         "scores_total": max(0, scores_total),
     }

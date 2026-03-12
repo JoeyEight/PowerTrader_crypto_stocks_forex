@@ -55,6 +55,22 @@ class TestScannerStability(unittest.TestCase):
         self.assertIn("AAPL", out)
         self.assertNotIn("MSFT", out)
 
+    def test_prune_cooldown_drops_legacy_spread_locks(self) -> None:
+        now = 1_700_000_000
+        m = {
+            "AAPL": {"until": now + 600, "updated_ts": now, "reason": "spread"},
+            "MSFT": {"until": now + 600, "updated_ts": now, "reason": "data_quality"},
+        }
+        out = _prune_cooldown_map(
+            m,
+            now,
+            settings={
+                "stock_symbol_cooldown_reject_reasons": "data_quality,insufficient_bars,spread,liquidity",
+            },
+        )
+        self.assertNotIn("AAPL", out)
+        self.assertIn("MSFT", out)
+
 
 if __name__ == "__main__":
     unittest.main()

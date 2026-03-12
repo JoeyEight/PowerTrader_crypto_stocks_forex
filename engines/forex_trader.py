@@ -10,6 +10,7 @@ from app.credential_utils import get_oanda_creds
 from app.http_utils import parse_retry_after_value
 from app.path_utils import resolve_runtime_paths
 from app.runtime_logging import runtime_event
+from app.scanner_quality import effective_reject_pressure
 from brokers.broker_oanda import OandaBrokerClient
 
 BASE_DIR, _SETTINGS_PATH, HUB_DATA_DIR, _BOOT_SETTINGS = resolve_runtime_paths(__file__, "forex_trader")
@@ -219,6 +220,81 @@ def _market_status_exposure_usd(hub_dir: str, market_key: str) -> float:
     return _safe_float_from_dict(data, ["exposure_usd", "total_positions_value_usd", "positions_value_usd"])
 
 
+def _forex_unit_notional_usd(instrument: str, mid: float, pricing_row: Dict[str, Any] | None = None) -> float:
+    mid_px = abs(float(mid or 0.0))
+    if mid_px <= 0.0:
+        return 0.0
+    inst = str(instrument or "").strip().upper()
+    base_ccy = ""
+    quote_ccy = ""
+    if "_" in inst:
+        try:
+            base_ccy, quote_ccy = [str(part or "").strip().upper() for part in inst.split("_", 1)]
+        except Exception:
+            base_ccy = ""
+            quote_ccy = ""
+    # When the base is USD, each unit is already 1 USD of notional.
+    if base_ccy == "USD":
+        return 1.0
+    # USD-quoted pairs already express one base unit directly in USD.
+    if quote_ccy == "USD":
+        return mid_px
+    row = pricing_row if isinstance(pricing_row, dict) else {}
+    try:
+        q_home = max(
+            abs(float(row.get("quote_to_home", 0.0) or 0.0)),
+            abs(float(row.get("quote_to_home_positive", 0.0) or 0.0)),
+            abs(float(row.get("quote_to_home_negative", 0.0) or 0.0)),
+        )
+    except Exception:
+        q_home = 0.0
+    if q_home > 0.0:
+        return mid_px * q_home
+    return mid_px
+
+
+def _risk_capped_units(
+    desired_units: int,
+    unit_notional_usd: float,
+    nav: float,
+    total_exposure_usd: float,
+    crypto_exposure_usd: float,
+    stocks_exposure_usd: float,
+    max_total_exposure_pct: float,
+    max_pos_usd: float,
+    global_cap_pct: float,
+) -> Tuple[int, float]:
+    units_abs = abs(int(desired_units or 0))
+    if units_abs <= 0:
+        return 0, 0.0
+    unit_notional = abs(float(unit_notional_usd or 0.0))
+    if unit_notional <= 0.0:
+        return int(desired_units or 0), 1.0
+    desired_notional = float(units_abs) * unit_notional
+    allowed_notional = float(desired_notional)
+    if max_pos_usd > 0.0:
+        allowed_notional = min(allowed_notional, max(0.0, float(max_pos_usd)))
+    if max_total_exposure_pct > 0.0 and nav > 0.0:
+        allowed_forex_notional = max(0.0, (float(nav) * float(max_total_exposure_pct) / 100.0) - float(total_exposure_usd))
+        allowed_notional = min(allowed_notional, allowed_forex_notional)
+    if global_cap_pct > 0.0 and nav > 0.0:
+        allowed_global_notional = max(
+            0.0,
+            (float(nav) * float(global_cap_pct) / 100.0)
+            - (float(total_exposure_usd) + float(crypto_exposure_usd) + float(stocks_exposure_usd)),
+        )
+        allowed_notional = min(allowed_notional, allowed_global_notional)
+    if allowed_notional >= desired_notional:
+        return int(desired_units or 0), 1.0
+    capped_units = max(0, int(allowed_notional / unit_notional))
+    if capped_units <= 0:
+        return 0, 0.0
+    capped_units = min(units_abs, capped_units)
+    scale = float(capped_units) / float(max(1, units_abs))
+    signed_units = capped_units if int(desired_units or 0) >= 0 else (-1 * capped_units)
+    return int(signed_units), float(scale)
+
+
 def _forex_candidates_from_thinker(thinker: Dict[str, Any]) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
     seen: set[str] = set()
@@ -282,6 +358,30 @@ def _fail_reason_summary(reasons: List[str], max_items: int = 4) -> tuple[str, D
     top = ranked[0]
     clipped = {str(k): int(v) for k, v in ranked[: max(1, int(max_items))]}
     return f"{str(top[0])} x{int(top[1])}", clipped
+
+
+def _effective_reject_pressure(settings: Dict[str, Any], thinker: Dict[str, Any]) -> tuple[float, float]:
+    reject_summary = thinker.get("reject_summary", {}) if isinstance(thinker.get("reject_summary", {}), dict) else {}
+    try:
+        raw_rate = max(0.0, float(reject_summary.get("reject_rate_pct", 0.0) or 0.0))
+    except Exception:
+        raw_rate = 0.0
+    dominant_reason = str(reject_summary.get("dominant_reason", "") or "").strip().lower()
+    try:
+        dominant_ratio_pct = max(0.0, float(reject_summary.get("dominant_ratio_pct", 0.0) or 0.0))
+    except Exception:
+        dominant_ratio_pct = 0.0
+    leaders_total = int(len(list(thinker.get("leaders", []) or []))) if isinstance(thinker, dict) else 0
+    scores_total = int(len(list(thinker.get("all_scores", []) or []))) if isinstance(thinker, dict) else 0
+    effective = effective_reject_pressure(
+        raw_rate,
+        dominant_reason=dominant_reason,
+        dominant_ratio_pct=dominant_ratio_pct,
+        leaders_total=leaders_total,
+        scores_total=scores_total,
+        unknown_dom_cap_pct=100.0,
+    )
+    return effective, raw_rate
 
 
 def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
@@ -375,15 +475,12 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
         fallback_age_s = int(float(thinker.get("fallback_age_s", 0) or 0)) if fallback_active else 0
     except Exception:
         fallback_age_s = 0
-    reject_summary = thinker.get("reject_summary", {}) if isinstance(thinker.get("reject_summary", {}), dict) else {}
-    try:
-        thinker_reject_rate_pct = max(0.0, float(reject_summary.get("reject_rate_pct", 0.0) or 0.0))
-    except Exception:
-        thinker_reject_rate_pct = 0.0
+    thinker_reject_rate_pct, thinker_reject_rate_raw_pct = _effective_reject_pressure(settings, thinker if isinstance(thinker, dict) else {})
     entry_size_scale = 1.0
     if fallback_active and (not block_cached_scan):
         entry_size_scale = float(cached_scan_entry_size_mult)
     trade_units_entry = max(1, int(round(float(trade_units_effective) * float(entry_size_scale))))
+    risk_cap_size_scale = 1.0
     actions: List[str] = []
     thinker_health = thinker.get("health", {}) if isinstance(thinker, dict) else {}
     thinker_data_ok = bool((thinker_health or {}).get("data_ok", True))
@@ -394,7 +491,26 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
         inst = str((row or {}).get("pair", "") or "").strip().upper()
         if inst:
             all_instruments.add(inst)
-    prices = client.get_mid_prices(sorted(all_instruments))
+    pricing_details = client.get_pricing_details(sorted(all_instruments)) if all_instruments else {}
+    prices: Dict[str, float] = {}
+    for inst, row in list(pricing_details.items()):
+        if not isinstance(row, dict):
+            continue
+        try:
+            mid_px = float(row.get("mid", 0.0) or 0.0)
+        except Exception:
+            mid_px = 0.0
+        if mid_px > 0.0:
+            prices[str(inst).strip().upper()] = mid_px
+    missing_prices = [inst for inst in sorted(all_instruments) if float(prices.get(inst, 0.0) or 0.0) <= 0.0]
+    if missing_prices:
+        for inst, mid_px in (client.get_mid_prices(missing_prices) or {}).items():
+            try:
+                px = float(mid_px or 0.0)
+            except Exception:
+                px = 0.0
+            if px > 0.0:
+                prices[str(inst).strip().upper()] = px
 
     nav = _safe_float_from_dict(broker_snap if isinstance(broker_snap, dict) else {}, ["nav", "NAV", "account_value_usd"])
     if nav <= 0.0:
@@ -411,9 +527,11 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
         mid_px = float(prices.get(inst, 0.0) or 0.0)
         if mid_px <= 0:
             continue
+        pricing_row = pricing_details.get(inst, {}) if isinstance(pricing_details.get(inst, {}), dict) else {}
         lu = abs(float(pos.get("long_units", 0.0) or 0.0))
         su = abs(float(pos.get("short_units", 0.0) or 0.0))
-        total_exposure_usd += (lu + su) * mid_px
+        unit_notional_usd = _forex_unit_notional_usd(inst, mid_px, pricing_row)
+        total_exposure_usd += (lu + su) * unit_notional_usd
 
     today = time.strftime("%Y-%m-%d", time.localtime(now_ts))
     if pending:
@@ -526,36 +644,53 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
         elif not enable_exec_v2:
             entry_msg = "Execution gated by rollout stage"
         else:
-            quote_pairs = [str((row or {}).get("pair", "") or "").strip().upper() for row in candidate_rows]
-            quote_pairs = [p for p in quote_pairs if p][:16]
-            pricing = client.get_pricing_details(quote_pairs) if quote_pairs else {}
             fail_reasons: List[str] = []
             selected_pair = ""
             selected_side = "watch"
             selected_score = 0.0
             selected_calib_prob = 0.0
             selected_samples = 0
+            selected_calibration_scope = "pair"
             selected_bars = 0
             selected_mid = 0.0
             selected_spread_bps = 0.0
             selected_units = 0
+            selected_risk_cap_size_scale = 1.0
             for cand in candidate_rows:
                 pair = str((cand or {}).get("pair", "") or "").strip().upper()
                 if not pair:
                     continue
                 score = float(cand.get("score", 0.0) or 0.0)
                 side = str(cand.get("side", "watch") or "watch").strip().lower()
-                calib_prob = float(cand.get("calib_prob", 0.0) or 0.0)
-                sample_count = int(float(cand.get("samples", 0) or 0))
+                calib_prob = float(cand.get("calibration_effective_prob", cand.get("calib_prob", 0.0)) or 0.0)
+                sample_count = int(float(cand.get("calibration_effective_samples", cand.get("samples", 0)) or 0))
+                calibration_scope = str(cand.get("calibration_scope", "pair") or "pair").strip().lower() or "pair"
                 bars_count = int(float(cand.get("bars_count", 0) or 0))
-                mid = float((pricing.get(pair, {}) or {}).get("mid", 0.0) or 0.0)
-                spread_bps = float((pricing.get(pair, {}) or {}).get("spread_bps", 0.0) or 0.0)
+                pricing_row = pricing_details.get(pair, {}) if isinstance(pricing_details.get(pair, {}), dict) else {}
+                mid = float(pricing_row.get("mid", 0.0) or 0.0)
+                spread_bps = float(pricing_row.get("spread_bps", 0.0) or 0.0)
                 units = int(trade_units_entry)
                 if side == "short":
                     units = -units
                 if live_guarded and (calib_prob <= 0.0):
                     calib_prob = 0.5
-                est_entry_notional = abs(float(units)) * (mid if mid > 0.0 else float(prices.get(pair, 0.0) or 0.0))
+                unit_notional_usd = _forex_unit_notional_usd(
+                    pair,
+                    (mid if mid > 0.0 else float(prices.get(pair, 0.0) or 0.0)),
+                    pricing_row,
+                )
+                units, pair_risk_cap_size_scale = _risk_capped_units(
+                    units,
+                    unit_notional_usd=unit_notional_usd,
+                    nav=nav,
+                    total_exposure_usd=total_exposure_usd,
+                    crypto_exposure_usd=crypto_exposure_usd,
+                    stocks_exposure_usd=stocks_exposure_usd,
+                    max_total_exposure_pct=(max_total_exposure_pct if enable_risk_caps else 0.0),
+                    max_pos_usd=(max_pos_usd if enable_risk_caps else 0.0),
+                    global_cap_pct=global_cap_pct,
+                )
+                est_entry_notional = abs(float(units)) * unit_notional_usd
                 fail = ""
                 if bars_count > 0 and bars_count < min_bars_required:
                     fail = f"Bars preflight failed for {pair} ({bars_count} < {min_bars_required})"
@@ -569,6 +704,8 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
                     fail = f"Data quality gate blocked {pair}"
                 elif mid <= 0.0:
                     fail = f"Quote preflight failed for {pair}"
+                elif abs(int(units)) <= 0:
+                    fail = f"Risk cap: no tradable size fits current NAV/exposure for {pair}"
                 elif live_guarded and sample_count < min_samples_guarded:
                     fail = f"Calibration sample gate for {pair} ({sample_count} < {min_samples_guarded})"
                 elif live_guarded and calib_prob < float(settings.get("forex_min_calib_prob_live_guarded", 0.56) or 0.56):
@@ -602,10 +739,12 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
                 selected_score = score
                 selected_calib_prob = calib_prob
                 selected_samples = sample_count
+                selected_calibration_scope = calibration_scope
                 selected_bars = bars_count
                 selected_mid = mid
                 selected_spread_bps = spread_bps
                 selected_units = units
+                selected_risk_cap_size_scale = pair_risk_cap_size_scale
                 break
             if not selected_pair:
                 entry_msg = fail_reasons[0] if fail_reasons else "No pairs available from thinker"
@@ -615,8 +754,9 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
                 signal_inst = selected_pair
                 signal_side = selected_side
                 signal_score = selected_score
+                risk_cap_size_scale = float(selected_risk_cap_size_scale)
                 entry_msg = f"SHADOW entry simulated for {selected_pair}"
-                actions.append(f"SHADOW ENTRY {selected_pair} {selected_side.upper()} units={trade_units_entry}")
+                actions.append(f"SHADOW ENTRY {selected_pair} {selected_side.upper()} units={selected_units}")
                 _append_jsonl(
                     audit_path,
                     {
@@ -625,14 +765,16 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
                         "event": "shadow_entry",
                         "instrument": selected_pair,
                         "side": selected_side,
-                        "units": int(trade_units_entry),
+                        "units": int(selected_units),
                         "configured_units": int(abs(trade_units)),
                         "entry_size_scale": float(round(entry_size_scale, 4)),
                         "score": selected_score,
                         "calib_prob": selected_calib_prob,
                         "samples": selected_samples,
+                        "calibration_scope": selected_calibration_scope,
                         "bars_count": selected_bars,
                         "spread_bps": selected_spread_bps,
+                        "risk_cap_size_scale": float(round(risk_cap_size_scale, 4)),
                         "ok": True,
                         "msg": "shadow_only stage",
                     },
@@ -641,6 +783,7 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
                 signal_inst = selected_pair
                 signal_side = selected_side
                 signal_score = selected_score
+                risk_cap_size_scale = float(selected_risk_cap_size_scale)
                 client_id = f"ptfx-{selected_pair}-{now_ts}"
                 ok, msg, payload = client.place_market_order(
                     selected_pair,
@@ -679,9 +822,11 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
                         "score": selected_score,
                         "calib_prob": selected_calib_prob,
                         "samples": selected_samples,
+                        "calibration_scope": selected_calibration_scope,
                         "bars_count": selected_bars,
                         "price": selected_mid,
                         "spread_bps": selected_spread_bps,
+                        "risk_cap_size_scale": float(round(risk_cap_size_scale, 4)),
                         "client_order_id": client_id,
                         "order_id": oid,
                         "retry_after_wait_s": float(round(retry_after_wait_s, 3)),
@@ -728,6 +873,7 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
             "data_quality_required": bool(require_data_quality_ok),
             "data_quality_ok": bool(thinker_data_ok),
             "reject_rate_pct": float(round(thinker_reject_rate_pct, 4)),
+            "reject_rate_raw_pct": float(round(thinker_reject_rate_raw_pct, 4)),
             "reject_rate_max_pct": float(round(reject_rate_gate_pct, 4)),
             "cached_fallback_active": bool(fallback_active),
             "cached_fallback_age_s": int(fallback_age_s),
@@ -735,6 +881,7 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
         },
         "trade_units_entry": int(trade_units_entry),
         "entry_size_scale": round(float(entry_size_scale), 4),
+        "risk_cap_size_scale": round(float(risk_cap_size_scale), 4),
         "last_actions": actions[-80:],
         "updated_at": now_ts,
     }
@@ -759,6 +906,8 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
         msg_parts.append(f"size x{loss_size_scale:.2f}")
     if trade_units_entry < trade_units_effective:
         msg_parts.append(f"scan-size x{entry_size_scale:.2f}")
+    if risk_cap_size_scale < 0.999:
+        msg_parts.append(f"risk-cap-size x{risk_cap_size_scale:.2f}")
     if actions:
         msg_parts.append(actions[-1])
     if auto_enabled and (not shadow_only):
@@ -800,6 +949,7 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
         "trade_units_entry": int(trade_units_entry),
         "loss_size_scale": round(float(loss_size_scale), 4),
         "entry_size_scale": round(float(entry_size_scale), 4),
+        "risk_cap_size_scale": round(float(risk_cap_size_scale), 4),
         "exposure_usd": round(total_exposure_usd, 4),
         "crypto_exposure_usd": round(crypto_exposure_usd, 4) if auto_enabled else round(_crypto_holdings_usd(hub_dir), 4),
         "other_market_exposure_usd": round(stocks_exposure_usd, 4) if auto_enabled else round(_market_status_exposure_usd(hub_dir, "stocks"), 4),
@@ -812,6 +962,7 @@ def run_step(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
             "data_quality_required": bool(require_data_quality_ok),
             "data_quality_ok": bool(thinker_data_ok),
             "reject_rate_pct": float(round(thinker_reject_rate_pct, 4)),
+            "reject_rate_raw_pct": float(round(thinker_reject_rate_raw_pct, 4)),
             "reject_rate_max_pct": float(round(reject_rate_gate_pct, 4)),
             "cached_fallback_active": bool(fallback_active),
             "cached_fallback_age_s": int(fallback_age_s),

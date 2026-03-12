@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Any, Dict, List
 
+from app.scanner_quality import effective_reject_pressure
+
 _QUICKFIX_MAP: Dict[str, str] = {
     "startup_checks_failed": "Open Runtime Checks and resolve missing scripts/permissions first.",
     "startup_warnings": "Review startup warnings; fix credential or path hygiene before live execution.",
@@ -80,6 +82,9 @@ def evaluate_runtime_alerts(runtime_state: Dict[str, Any], settings: Dict[str, A
     market_loop_stale_s = float(settings.get("runtime_alert_market_loop_stale_s", 90.0) or 90.0)
     exposure_warn_pct = float(settings.get("runtime_alert_exposure_concentration_warn_pct", 55.0) or 55.0)
     exposure_crit_pct = float(settings.get("runtime_alert_exposure_concentration_crit_pct", 75.0) or 75.0)
+    exposure_min_market_account_pct = float(
+        settings.get("runtime_alert_exposure_concentration_min_market_account_pct", 5.0) or 5.0
+    )
     rollout_stage = str(settings.get("market_rollout_stage", "legacy") or "legacy").strip().lower()
     shadow_scorecard_gate_relevant = rollout_stage in {"legacy", "scan_expanded", "risk_caps", "shadow_only"}
 
@@ -95,25 +100,22 @@ def evaluate_runtime_alerts(runtime_state: Dict[str, Any], settings: Dict[str, A
     f_scores = int(forex.get("scores_total", 0) or 0)
     unknown_dom_cap = max(0.0, float(settings.get("runtime_alert_reject_unknown_dom_cap_pct", 64.0) or 64.0))
 
-    def _effective_reject_pressure(
-        rate: float,
-        dominant: str,
-        dominant_ratio: float,
-        leaders_total: int,
-        scores_total: int,
-    ) -> float:
-        dom = str(dominant or "").strip().lower()
-        if leaders_total > 0 and dom in {"cooldown", "warmup_pending"} and dominant_ratio >= 60.0:
-            # Cooldown/warmup-dominated rejects with healthy leaders are normal pressure, not scanner failure.
-            return 0.0
-        if leaders_total > 0 and scores_total > 0 and (not dom):
-            # Some producers omit dominant reject reason; if leaders and scores exist,
-            # do not treat 100% reject as hard-fail without context.
-            return min(max(0.0, float(rate or 0.0)), unknown_dom_cap)
-        return max(0.0, float(rate or 0.0))
-
-    s_reject = _effective_reject_pressure(s_reject_raw, s_dom, s_dom_ratio, s_leaders, s_scores)
-    f_reject = _effective_reject_pressure(f_reject_raw, f_dom, f_dom_ratio, f_leaders, f_scores)
+    s_reject = effective_reject_pressure(
+        s_reject_raw,
+        dominant_reason=s_dom,
+        dominant_ratio_pct=s_dom_ratio,
+        leaders_total=s_leaders,
+        scores_total=s_scores,
+        unknown_dom_cap_pct=unknown_dom_cap,
+    )
+    f_reject = effective_reject_pressure(
+        f_reject_raw,
+        dominant_reason=f_dom,
+        dominant_ratio_pct=f_dom_ratio,
+        leaders_total=f_leaders,
+        scores_total=f_scores,
+        unknown_dom_cap_pct=unknown_dom_cap,
+    )
     max_reject = max(s_reject, f_reject)
     incident_count_total = int(incidents.get("count", 0) or 0)
     sev_src = sev_1h if bool(sev_1h) else sev
@@ -205,8 +207,16 @@ def evaluate_runtime_alerts(runtime_state: Dict[str, Any], settings: Dict[str, A
         except Exception:
             continue
     top_exposure_pct = 0.0
+    top_exposure_market_account_pct = 0.0
     if top_positions and isinstance(top_positions[0], dict):
         top_exposure_pct = float(top_positions[0].get("pct_of_total_exposure", 0.0) or 0.0)
+        top_exposure_market_account_pct = float(top_positions[0].get("pct_of_market_account", 0.0) or 0.0)
+    exposure_concentration_warn = bool(
+        top_exposure_pct >= exposure_warn_pct and top_exposure_market_account_pct >= exposure_min_market_account_pct
+    )
+    exposure_concentration_crit = bool(
+        top_exposure_pct >= exposure_crit_pct and top_exposure_market_account_pct >= exposure_min_market_account_pct
+    )
     stocks_score_gate = str((shadow_scorecards.get("stocks", {}) if isinstance(shadow_scorecards.get("stocks", {}), dict) else {}).get("promotion_gate", "") or "").strip().upper()
     forex_score_gate = str((shadow_scorecards.get("forex", {}) if isinstance(shadow_scorecards.get("forex", {}), dict) else {}).get("promotion_gate", "") or "").strip().upper()
     notif_by_sev = notification_center.get("by_severity", {}) if isinstance(notification_center.get("by_severity", {}), dict) else {}
@@ -230,13 +240,13 @@ def evaluate_runtime_alerts(runtime_state: Dict[str, Any], settings: Dict[str, A
         or drift_count >= drift_crit
         or cadence_critical_effective >= cadence_crit
         or loop_crit
-        or top_exposure_pct >= exposure_crit_pct
+        or exposure_concentration_crit
         or shadow_scorecard_blocked
     ):
         bump("critical")
     if bool(drawdown_guard.get("triggered_recent", False)) or bool(stop_flag.get("active", False)):
         bump("critical")
-    if warns >= startup_warn or err_count >= error_warn or incident_count >= incident_warn or max_reject >= reject_warn or api_unstable or drift_count >= drift_warn or cadence_count >= cadence_warn or loop_stale or top_exposure_pct >= exposure_warn_pct or guard_active > 0:
+    if warns >= startup_warn or err_count >= error_warn or incident_count >= incident_warn or max_reject >= reject_warn or api_unstable or drift_count >= drift_warn or cadence_count >= cadence_warn or loop_stale or exposure_concentration_warn or guard_active > 0:
         bump("warn")
 
     if not checks_ok:
@@ -266,7 +276,7 @@ def evaluate_runtime_alerts(runtime_state: Dict[str, Any], settings: Dict[str, A
     if loop_stale:
         reasons.append("market_loop_stale")
         hints.append("Market loop heartbeat is stale; verify markets runner process and loop heartbeat output.")
-    if top_exposure_pct >= exposure_warn_pct:
+    if exposure_concentration_warn:
         reasons.append("exposure_concentration")
         hints.append("Exposure concentration is high; diversify or tighten per-asset caps.")
     if guard_active > 0:
@@ -326,6 +336,7 @@ def evaluate_runtime_alerts(runtime_state: Dict[str, Any], settings: Dict[str, A
             "market_loop_stale": bool(loop_stale),
             "execution_guard_active_markets": int(guard_active),
             "top_exposure_pct_of_total": round(top_exposure_pct, 4),
+            "top_exposure_pct_of_market_account": round(top_exposure_market_account_pct, 4),
             "drawdown_guard_triggered_recent": bool(drawdown_guard.get("triggered_recent", False)),
             "stop_flag_active": bool(stop_flag.get("active", False)),
             "shadow_scorecard_stocks_gate": stocks_score_gate,
@@ -349,5 +360,6 @@ def evaluate_runtime_alerts(runtime_state: Dict[str, Any], settings: Dict[str, A
             "startup_grace_s": float(startup_grace_s),
             "exposure_concentration_warn_pct": float(exposure_warn_pct),
             "exposure_concentration_crit_pct": float(exposure_crit_pct),
+            "exposure_concentration_min_market_account_pct": float(exposure_min_market_account_pct),
         },
     }

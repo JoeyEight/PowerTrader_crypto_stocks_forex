@@ -6,7 +6,7 @@ import tempfile
 import unittest
 
 from app.confidence_calibration import build_confidence_calibration_payload
-from app.notification_center import build_notification_center_payload
+from app.notification_center import build_notification_center_from_hub, build_notification_center_payload
 from app.regime_classifier import build_all_market_regimes, classify_regime_from_series
 from app.shadow_scorecard import build_shadow_scorecards
 from app.walkforward_report import build_walkforward_report
@@ -189,6 +189,27 @@ class TestMarketIntelligence(unittest.TestCase):
         self.assertNotIn("runner_market_loop_status_stale", titles)
         self.assertNotIn("runner_market_loop_restart", titles)
 
+    def test_notification_center_filters_housekeeping_startup_warnings(self) -> None:
+        runtime_state = {
+            "ts": 1_700_000_000,
+            "checks": {"ok": True, "warnings": ["stale_pid_file_removed"], "errors": []},
+            "alerts": {"severity": "ok", "reasons": [], "hints": []},
+            "scan_cadence": {"active": []},
+            "market_trends": {"stocks": {}, "forex": {}},
+        }
+        incidents = [
+            {
+                "ts": 1_699_999_990,
+                "severity": "warning",
+                "event": "runner_startup_check",
+                "msg": "stale_pid_file_removed",
+                "details": {"component": "runner"},
+            }
+        ]
+        out = build_notification_center_payload(runtime_state, incidents_rows=incidents)
+        titles = [str((row or {}).get("title", "") or "") for row in list(out.get("items", []) or [])]
+        self.assertNotIn("runner_startup_check", titles)
+
     def test_notification_center_dedupes_transient_incidents_and_expires_old_ui_rows(self) -> None:
         runtime_state = {
             "ts": 1_700_000_000,
@@ -207,6 +228,126 @@ class TestMarketIntelligence(unittest.TestCase):
         titles = [str((row or {}).get("title", "") or "") for row in items]
         self.assertEqual(titles.count("runner_watchdog_restart"), 1)
         self.assertNotIn("ui_market_panel_desync", titles)
+
+    def test_notification_center_filters_resolved_autopilot_restarts_and_reject_spikes(self) -> None:
+        runtime_state = {
+            "ts": 1_700_000_000,
+            "checks": {"ok": True, "warnings": [], "errors": []},
+            "alerts": {"severity": "ok", "reasons": [], "hints": []},
+            "scan_cadence": {"active": []},
+            "scan_drift": {"active": []},
+            "autopilot": {"ts": 1_700_000_000, "stable_cycles": 8, "api_unstable": False, "markets_healthy": True, "issue_open": False},
+            "runner": {"state": "RUNNING", "children": {"autopilot": 12345}},
+            "market_trends": {"stocks": {}, "forex": {}},
+        }
+        incidents = [
+            {
+                "ts": 1_699_999_990,
+                "severity": "warning",
+                "event": "runner_watchdog_restart",
+                "msg": "autopilot appears hung; restarting",
+                "details": {"child": "autopilot"},
+            },
+            {
+                "ts": 1_699_999_991,
+                "severity": "warning",
+                "event": "runner_child_exit",
+                "msg": "autopilot exited code=0; restarting",
+                "details": {"child": "autopilot", "code": 0},
+            },
+            {
+                "ts": 1_699_999_992,
+                "severity": "warning",
+                "event": "scanner_reject_spike",
+                "msg": "stocks reject spike",
+                "details": {"market": "stocks"},
+            },
+        ]
+        out = build_notification_center_payload(runtime_state, incidents_rows=incidents)
+        titles = [str((row or {}).get("title", "") or "") for row in list(out.get("items", []) or [])]
+        self.assertNotIn("runner_watchdog_restart", titles)
+        self.assertNotIn("runner_child_exit", titles)
+        self.assertNotIn("scanner_reject_spike", titles)
+
+    def test_notification_center_keeps_active_autopilot_restart_issue(self) -> None:
+        runtime_state = {
+            "ts": 1_700_000_000,
+            "checks": {"ok": True, "warnings": [], "errors": []},
+            "alerts": {"severity": "ok", "reasons": [], "hints": []},
+            "scan_cadence": {"active": []},
+            "scan_drift": {"active": []},
+            "autopilot": {"ts": 1_699_999_700, "stable_cycles": 0, "api_unstable": True, "markets_healthy": False, "issue_open": True},
+            "runner": {"state": "RUNNING", "children": {"autopilot": 0}},
+            "market_trends": {"stocks": {}, "forex": {}},
+        }
+        incidents = [
+            {
+                "ts": 1_699_999_990,
+                "severity": "warning",
+                "event": "runner_watchdog_restart",
+                "msg": "autopilot appears hung; restarting",
+                "details": {"child": "autopilot"},
+            }
+        ]
+        out = build_notification_center_payload(runtime_state, incidents_rows=incidents)
+        titles = [str((row or {}).get("title", "") or "") for row in list(out.get("items", []) or [])]
+        self.assertIn("runner_watchdog_restart", titles)
+
+    def test_notification_center_from_hub_recomputes_runtime_alerts(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            hub_dir = os.path.join(td, "hub_data")
+            self._write_json(
+                os.path.join(hub_dir, "runtime_state.json"),
+                {
+                    "ts": 1_700_000_000,
+                    "checks": {"ok": True, "warnings": [], "errors": []},
+                    "alerts": {"severity": "critical", "reasons": ["scan_reject_pressure"], "hints": ["stale"]},
+                    "scan_health": {
+                        "stocks": {
+                            "reject_rate_pct": 100.0,
+                            "leaders_total": 1,
+                            "scores_total": 2,
+                            "reject_dominant_reason": "liquidity",
+                            "reject_dominant_ratio_pct": 80.0,
+                        },
+                        "forex": {"reject_rate_pct": 0.0},
+                    },
+                    "market_trends": {"stocks": {}, "forex": {}},
+                    "incidents_last_200": {"count": 0, "by_severity": {"error": 0, "warning": 0}},
+                    "autopilot": {"api_unstable": False},
+                },
+            )
+            self._write_json(os.path.join(td, "gui_settings.json"), {"runtime_alert_scan_reject_warn_pct": 65.0})
+            self._write_jsonl(os.path.join(hub_dir, "incidents.jsonl"), [])
+            out = build_notification_center_from_hub(hub_dir)
+            titles = [str((row or {}).get("title", "") or "") for row in list(out.get("items", []) or [])]
+            self.assertNotIn("scan_reject_pressure", titles)
+
+    def test_notification_center_suppresses_liquidity_dominated_reject_warning_when_effective_pressure_is_low(self) -> None:
+        runtime_state = {
+            "ts": 1_700_000_000,
+            "checks": {"ok": True, "warnings": [], "errors": []},
+            "alerts": {"severity": "ok", "reasons": [], "hints": []},
+            "scan_cadence": {"active": []},
+            "market_trends": {
+                "stocks": {
+                    "quality_aggregates": {
+                        "reject_rate_pct": 60.0,
+                        "reject_rate_raw_pct": 100.0,
+                        "dominant_reason": "liquidity",
+                        "reject_dominant_ratio_pct": 81.67,
+                        "leaders_total": 1,
+                        "scores_total": 2,
+                    },
+                    "data_source_reliability": {"score": 88.0},
+                    "why_not_traded": {"reason": ""},
+                },
+                "forex": {},
+            },
+        }
+        out = build_notification_center_payload(runtime_state, incidents_rows=[])
+        titles = [str((row or {}).get("title", "") or "") for row in list(out.get("items", []) or [])]
+        self.assertNotIn("High scanner rejection pressure", titles)
 
 
 if __name__ == "__main__":

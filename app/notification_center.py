@@ -5,6 +5,8 @@ import os
 import time
 from typing import Any, Dict, Iterable, List
 
+from app.scanner_quality import effective_reject_pressure
+
 _TRANSIENT_INCIDENT_TTL_S: Dict[str, int] = {
     "ui_market_panel_desync": 300,
     "market_panel_refresh_failed": 300,
@@ -27,6 +29,10 @@ _TRANSIENT_INCIDENT_TTL_S: Dict[str, int] = {
     "forex_trader_error": 900,
     "forex_trader_failed": 900,
     "market_trends_update_failed": 900,
+}
+
+_STARTUP_CHECK_INFO_WARNINGS = {
+    "stale_pid_file_removed",
 }
 
 
@@ -134,6 +140,19 @@ def _active_cadence_markets(runtime_state: Dict[str, Any]) -> set[str]:
     return out
 
 
+def _active_drift_markets(runtime_state: Dict[str, Any]) -> set[str]:
+    rs = runtime_state if isinstance(runtime_state, dict) else {}
+    out: set[str] = set()
+    scan_drift = rs.get("scan_drift", {}) if isinstance(rs.get("scan_drift", {}), dict) else {}
+    for row in list(scan_drift.get("active", []) or []):
+        if not isinstance(row, dict):
+            continue
+        market = str(row.get("market", "") or "").strip().lower()
+        if market in {"stocks", "forex", "crypto"}:
+            out.add(market)
+    return out
+
+
 def _startup_checks_active(runtime_state: Dict[str, Any]) -> bool:
     rs = runtime_state if isinstance(runtime_state, dict) else {}
     checks = rs.get("checks", {}) if isinstance(rs.get("checks", {}), dict) else {}
@@ -141,6 +160,8 @@ def _startup_checks_active(runtime_state: Dict[str, Any]) -> bool:
         return True
     warnings = list(checks.get("warnings", []) or []) if isinstance(checks.get("warnings", []), list) else []
     errors = list(checks.get("errors", []) or []) if isinstance(checks.get("errors", []), list) else []
+    warnings = [str(row or "").strip().lower() for row in warnings if str(row or "").strip()]
+    warnings = [row for row in warnings if row not in _STARTUP_CHECK_INFO_WARNINGS]
     return bool(warnings or errors)
 
 
@@ -153,13 +174,64 @@ def _market_loop_issue_active(runtime_state: Dict[str, Any]) -> bool:
     return bool(metrics.get("market_loop_stale", False))
 
 
+def _runner_child_pid(runtime_state: Dict[str, Any], child: str) -> int:
+    rs = runtime_state if isinstance(runtime_state, dict) else {}
+    runner = rs.get("runner", {}) if isinstance(rs.get("runner", {}), dict) else {}
+    children = runner.get("children", {}) if isinstance(runner.get("children", {}), dict) else {}
+    try:
+        pid = int(children.get(child, 0) or 0)
+    except Exception:
+        pid = 0
+    return pid if pid > 0 else 0
+
+
+def _autopilot_issue_active(runtime_state: Dict[str, Any]) -> bool:
+    rs = runtime_state if isinstance(runtime_state, dict) else {}
+    autopilot = rs.get("autopilot", {}) if isinstance(rs.get("autopilot", {}), dict) else {}
+    if not autopilot:
+        return False
+    if bool(autopilot.get("issue_open", False)):
+        return True
+    if bool(autopilot.get("api_unstable", False)):
+        return True
+    if not bool(autopilot.get("markets_healthy", True)):
+        return True
+    try:
+        status_ts = int(autopilot.get("ts", 0) or 0)
+    except Exception:
+        status_ts = 0
+    if status_ts > 0 and (_runtime_now_ts(rs) - status_ts) > 240:
+        return True
+    return False
+
+
+def _runner_restart_incident_active(row: Dict[str, Any], runtime_state: Dict[str, Any]) -> bool:
+    details = row.get("details", {}) if isinstance(row.get("details", {}), dict) else {}
+    child = str(details.get("child", "") or "").strip().lower()
+    ttl_s = int(_TRANSIENT_INCIDENT_TTL_S.get(str(row.get("event", "") or "").strip().lower(), 0) or 0)
+    if not child:
+        return _incident_is_recent(row, runtime_state, ttl_s)
+    child_pid = _runner_child_pid(runtime_state, child)
+    if child == "autopilot":
+        return child_pid <= 0 or _autopilot_issue_active(runtime_state)
+    if child == "markets":
+        return child_pid <= 0 or _market_loop_issue_active(runtime_state)
+    if child in {"thinker", "trader"}:
+        return child_pid <= 0
+    return _incident_is_recent(row, runtime_state, ttl_s)
+
+
 def _incident_is_active(row: Dict[str, Any], runtime_state: Dict[str, Any]) -> bool:
     evt = str(row.get("event", "") or "").strip().lower()
     market = _market_from_incident(row)
     if evt == "scanner_cadence_drift":
         return market in _active_cadence_markets(runtime_state)
+    if evt == "scanner_reject_spike":
+        return market in _active_drift_markets(runtime_state)
     if evt == "runner_startup_check":
         return _startup_checks_active(runtime_state)
+    if evt in {"runner_watchdog_restart", "runner_child_exit"}:
+        return _runner_restart_incident_active(row, runtime_state)
     if evt in {"runner_market_loop_status_stale", "runner_market_loop_restart"}:
         return _market_loop_issue_active(runtime_state)
     ttl_s = int(_TRANSIENT_INCIDENT_TTL_S.get(evt, 0) or 0)
@@ -224,7 +296,14 @@ def build_notification_center_payload(
         quality = row.get("quality_aggregates", {}) if isinstance(row.get("quality_aggregates", {}), dict) else {}
         rel = row.get("data_source_reliability", {}) if isinstance(row.get("data_source_reliability", {}), dict) else {}
         why = row.get("why_not_traded", {}) if isinstance(row.get("why_not_traded", {}), dict) else {}
-        reject = float(quality.get("reject_rate_pct", 0.0) or 0.0)
+        reject_raw = float(quality.get("reject_rate_raw_pct", quality.get("reject_rate_pct", 0.0)) or 0.0)
+        reject = effective_reject_pressure(
+            reject_raw,
+            dominant_reason=quality.get("dominant_reason", ""),
+            dominant_ratio_pct=quality.get("reject_dominant_ratio_pct", 0.0),
+            leaders_total=quality.get("leaders_total", 0),
+            scores_total=quality.get("scores_total", 0),
+        )
         rel_score = float(rel.get("score", 0.0) or 0.0)
         why_reason = str(why.get("reason", "") or "").strip()
         if reject >= 90.0:
@@ -321,5 +400,15 @@ def build_notification_center_payload(
 
 def build_notification_center_from_hub(hub_dir: str, runtime_state: Dict[str, Any] | None = None) -> Dict[str, Any]:
     rs = runtime_state if isinstance(runtime_state, dict) else _safe_read_json(os.path.join(hub_dir, "runtime_state.json"))
+    if runtime_state is None:
+        try:
+            from app.health_rules import evaluate_runtime_alerts
+
+            settings = _safe_read_json(os.path.join(os.path.dirname(str(hub_dir or "")), "gui_settings.json"))
+            if isinstance(rs, dict):
+                rs = dict(rs)
+                rs["alerts"] = evaluate_runtime_alerts(rs, settings if isinstance(settings, dict) else {})
+        except Exception:
+            pass
     incidents = _safe_read_jsonl(os.path.join(hub_dir, "incidents.jsonl"), max_lines=500)
     return build_notification_center_payload(rs, incidents_rows=incidents, max_items=220)

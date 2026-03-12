@@ -146,7 +146,7 @@ class HubMarketOverviewFallbackTests(unittest.TestCase):
             hub._refresh_market_overview_fallback()
 
             panel = hub.market_panels["forex"]
-            self.assertEqual(panel["portfolio_vars"]["buying_power"].get(), "100.0000 USD")
+            self.assertEqual(panel["portfolio_vars"]["buying_power"].get(), "$100.00")
             self.assertEqual(panel["portfolio_vars"]["open_positions"].get(), "0")
             self.assertEqual(
                 panel["endpoint_var"].get(),
@@ -267,10 +267,11 @@ class HubMarketOverviewFallbackTests(unittest.TestCase):
 
             captured = {}
 
-            def _capture_render(market_key, thinker_data, status_data=None, diag_data=None):
+            def _capture_render(market_key, thinker_data, status_data=None, trader_data=None, diag_data=None):
                 captured["market_key"] = market_key
                 captured["thinker_data"] = thinker_data
                 captured["status_data"] = status_data
+                captured["trader_data"] = trader_data
                 captured["diag_data"] = diag_data
 
             hub._render_market_canvas = _capture_render

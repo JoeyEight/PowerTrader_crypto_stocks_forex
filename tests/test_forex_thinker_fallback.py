@@ -182,6 +182,61 @@ class TestForexThinkerFallback(unittest.TestCase):
             self.assertFalse(bool(top.get("eligible_for_entry", True)))
             self.assertIn("Calibration sample gate", str(top.get("entry_gate_reason", "") or ""))
 
+    def test_live_guarded_uses_market_pooled_calibration_when_pair_history_is_sparse(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            fx_dir = os.path.join(td, "forex")
+            os.makedirs(fx_dir, exist_ok=True)
+            settings = {
+                "oanda_account_id": "abc",
+                "oanda_api_token": "xyz",
+                "oanda_rest_url": "https://api-fxpractice.oanda.com",
+                "market_rollout_stage": "live_guarded",
+                "forex_min_samples_live_guarded": 4,
+                "forex_min_calib_prob_live_guarded": 0.48,
+                "forex_scan_max_pairs": 4,
+                "forex_max_stale_hours": 10000.0,
+            }
+            candles = [
+                {"complete": True, "time": f"2026-03-01T{(i % 24):02d}:00:00.000000000Z", "mid": {"o": "1.1000", "h": "1.1100", "l": "1.0900", "c": "1.1050"}, "volume": 1000}
+                for i in range(48)
+            ]
+
+            def _score(pair: str, rows: list[dict], spread_bps: float = 0.0) -> dict:
+                return {
+                    "pair": str(pair).upper(),
+                    "score": 0.62,
+                    "side": "long",
+                    "last": 1.2345,
+                    "change_6h_pct": 0.2,
+                    "change_24h_pct": 0.4,
+                    "volatility_pct": 0.05,
+                    "spread_bps": float(spread_bps),
+                    "confidence": "MED",
+                    "reason": "test",
+                }
+
+            audit_path = os.path.join(fx_dir, "execution_audit.jsonl")
+            with open(audit_path, "w", encoding="utf-8") as f:
+                for idx in range(5):
+                    f.write(json.dumps({"ts": 1_700_000_000 + idx, "event": "shadow_live_divergence", "instrument": f"PAIR_{idx}", "score": 0.62}) + "\n")
+
+            with (
+                patch.object(forex_thinker, "get_oanda_creds", return_value=("abc", "xyz")),
+                patch.object(forex_thinker, "OandaBrokerClient", _FakeOandaClient),
+                patch.object(forex_thinker, "_request_json", return_value={"candles": candles}),
+                patch.object(forex_thinker, "_score_candles", side_effect=_score),
+                patch.object(forex_thinker, "_load_forexfactory_context", return_value={"enabled": False, "events": [], "state": "disabled", "error": ""}),
+            ):
+                out = forex_thinker.run_scan(settings, td)
+
+            self.assertEqual(str(out.get("state", "")), "READY")
+            top = out.get("top_pick", {}) if isinstance(out.get("top_pick", {}), dict) else {}
+            self.assertEqual(str(top.get("side", "")).lower(), "long")
+            self.assertTrue(bool(top.get("eligible_for_entry", False)))
+            self.assertEqual(str(top.get("calibration_scope", "") or ""), "market_pooled")
+            self.assertGreaterEqual(int(top.get("samples", 0) or 0), 5)
+            self.assertEqual(str(top.get("entry_gate_reason", "") or ""), "")
+
 
 if __name__ == "__main__":
     unittest.main()

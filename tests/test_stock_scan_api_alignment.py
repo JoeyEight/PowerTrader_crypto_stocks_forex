@@ -103,6 +103,19 @@ class TestStockScanApiAlignment(unittest.TestCase):
         self.assertTrue(any("feed=sip" in call for call in calls))
         self.assertTrue(any("feed=iex" in call for call in calls))
 
+    def test_stock_snapshot_does_not_report_equity_as_realized_pnl(self) -> None:
+        client = AlpacaBrokerClient(
+            api_key_id="k",
+            secret_key="s",
+            base_url="https://paper-api.alpaca.markets",
+            data_url="https://data.alpaca.markets",
+        )
+        client.get_account_summary = lambda: {"status": "ACTIVE", "buying_power": "2000.00", "equity": "1000.00"}  # type: ignore[method-assign]
+        client.list_positions = lambda: [{"symbol": "AAPL", "qty": "1", "market_value": "182.50", "unrealized_pl": "2.10"}]  # type: ignore[method-assign]
+        payload = client.fetch_snapshot()
+        self.assertEqual(payload.get("realized_pnl"), "N/A")
+        self.assertEqual(payload.get("equity"), "1000.00")
+
 
 if __name__ == "__main__":
     unittest.main()

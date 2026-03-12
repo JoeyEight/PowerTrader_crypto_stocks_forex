@@ -71,6 +71,45 @@ def _source_breakdown(scored_rows: Iterable[Dict[str, Any]], rejected_rows: Iter
     return out
 
 
+def effective_reject_pressure(
+    reject_rate_pct: Any,
+    *,
+    dominant_reason: Any = "",
+    dominant_ratio_pct: Any = 0.0,
+    leaders_total: Any = 0,
+    scores_total: Any = 0,
+    unknown_dom_cap_pct: float = 64.0,
+    liquidity_spread_cap_pct: float = 60.0,
+) -> float:
+    try:
+        raw_rate = max(0.0, min(100.0, float(reject_rate_pct or 0.0)))
+    except Exception:
+        raw_rate = 0.0
+    dom = str(dominant_reason or "").strip().lower()
+    try:
+        dominant_ratio = max(0.0, float(dominant_ratio_pct or 0.0))
+    except Exception:
+        dominant_ratio = 0.0
+    try:
+        leaders_n = max(0, int(leaders_total or 0))
+    except Exception:
+        leaders_n = 0
+    try:
+        scores_n = max(0, int(scores_total or 0))
+    except Exception:
+        scores_n = 0
+    capped_unknown = max(0.0, min(100.0, float(unknown_dom_cap_pct or 64.0)))
+    capped_liquidity = max(0.0, min(100.0, float(liquidity_spread_cap_pct or 60.0)))
+
+    if leaders_n > 0 and dom in {"cooldown", "warmup_pending"} and dominant_ratio >= 60.0:
+        return 0.0
+    if leaders_n > 0 and scores_n > 0 and dom in {"liquidity", "spread"} and dominant_ratio >= 55.0:
+        return min(raw_rate, min(capped_unknown, capped_liquidity))
+    if leaders_n > 0 and scores_n > 0 and (not dom):
+        return min(raw_rate, capped_unknown)
+    return raw_rate
+
+
 def build_universe_quality_report(
     *,
     market: str,
@@ -92,10 +131,22 @@ def build_universe_quality_report(
     leaders_n = max(0, int(leaders_total or 0))
 
     try:
-        reject_rate_pct = float((reject_summary.get("reject_rate_pct", 0.0) if isinstance(reject_summary, dict) else 0.0) or 0.0)
+        reject_rate_raw_pct = float((reject_summary.get("reject_rate_pct", 0.0) if isinstance(reject_summary, dict) else 0.0) or 0.0)
     except Exception:
-        reject_rate_pct = 0.0
-    reject_rate_pct = max(0.0, min(100.0, reject_rate_pct))
+        reject_rate_raw_pct = 0.0
+    reject_rate_raw_pct = max(0.0, min(100.0, reject_rate_raw_pct))
+    dominant_reason = str((reject_summary.get("dominant_reason", "") if isinstance(reject_summary, dict) else "") or "").strip().lower()
+    try:
+        dominant_ratio_pct = float((reject_summary.get("dominant_ratio_pct", 0.0) if isinstance(reject_summary, dict) else 0.0) or 0.0)
+    except Exception:
+        dominant_ratio_pct = 0.0
+    reject_rate_pct = effective_reject_pressure(
+        reject_rate_raw_pct,
+        dominant_reason=dominant_reason,
+        dominant_ratio_pct=dominant_ratio_pct,
+        leaders_total=leaders_n,
+        scores_total=scores_n,
+    )
 
     acceptance_rate_pct = round((100.0 * float(candidates_n) / float(max(1, universe_n))), 3)
     score_survival_pct = round((100.0 * float(scores_n) / float(max(1, candidates_n))), 3)
@@ -104,7 +155,12 @@ def build_universe_quality_report(
     counts = (reject_summary.get("counts", {}) if isinstance(reject_summary, dict) else {})
     if not isinstance(counts, dict):
         counts = {}
-    reason_breakdown = _reason_percentages(counts, int(max(1, candidates_n if candidates_n > 0 else universe_n)))
+    rejected_total = 0
+    try:
+        rejected_total = max(0, int((reject_summary.get("total_rejected", 0) if isinstance(reject_summary, dict) else 0) or 0))
+    except Exception:
+        rejected_total = 0
+    reason_breakdown = _reason_percentages(counts, int(max(1, rejected_total if rejected_total > 0 else universe_n)))
     source_mix = _source_breakdown(scored_rows, rejected_rows)
 
     gates = {
@@ -117,7 +173,12 @@ def build_universe_quality_report(
     passed = int(sum(1 for v in gates.values() if bool(v)))
     total = max(1, int(len(gates)))
 
-    if reject_rate_pct >= 80.0:
+    if reject_rate_pct < reject_rate_raw_pct and leaders_n > 0 and scores_n > 0:
+        summary = (
+            f"Broad-universe prefilters dominated by {dominant_reason or 'marketability'}; "
+            f"{leaders_n} leaders still ranked."
+        )
+    elif reject_rate_pct >= 80.0:
         summary = f"Reject-heavy cycle ({reject_rate_pct:.1f}%)."
     elif leaders_n <= 0:
         summary = "No leaders ranked this cycle."
@@ -137,6 +198,7 @@ def build_universe_quality_report(
         "leaders_total": int(leaders_n),
         "acceptance_rate_pct": float(acceptance_rate_pct),
         "reject_rate_pct": float(round(reject_rate_pct, 3)),
+        "reject_rate_raw_pct": float(round(reject_rate_raw_pct, 3)),
         "score_survival_pct": float(score_survival_pct),
         "leader_yield_pct": float(leader_yield_pct),
         "candidate_churn_pct": float(round(float(candidate_churn_pct or 0.0), 3)),
@@ -159,6 +221,10 @@ def quality_hints(report: Dict[str, Any]) -> List[str]:
     except Exception:
         reject_rate = 0.0
     try:
+        reject_rate_raw = float(report.get("reject_rate_raw_pct", reject_rate) or reject_rate)
+    except Exception:
+        reject_rate_raw = reject_rate
+    try:
         churn = float(report.get("candidate_churn_pct", 0.0) or 0.0)
     except Exception:
         churn = 0.0
@@ -172,6 +238,8 @@ def quality_hints(report: Dict[str, Any]) -> List[str]:
     if reasons and isinstance(reasons[0], dict):
         dominant = str(reasons[0].get("reason", "") or "").strip().lower()
 
+    if reject_rate_raw > reject_rate and leaders > 0:
+        hints.append("Broad scan prefilters are heavy, but viable leaders survived.")
     if reject_rate >= 75.0:
         hints.append("Universe quality is reject-heavy; tune dominant gate before raising scan breadth.")
     if dominant:

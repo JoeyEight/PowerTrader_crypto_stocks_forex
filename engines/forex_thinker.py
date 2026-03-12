@@ -12,13 +12,14 @@ import urllib.request
 from datetime import datetime, timezone
 from typing import Any, Dict, List
 
+from app.confidence_calibration import build_market_confidence_calibration
 from app.credential_utils import get_oanda_creds
 from app.http_utils import retry_after_from_urllib_http_error
 from app.market_awareness import forex_session_bias
 from app.path_utils import resolve_runtime_paths
 from app.rejection_replay import recommend_threshold_from_scores, replay_target_entries_for_market
 from app.scan_diagnostics_schema import with_scan_schema
-from app.scanner_quality import build_universe_quality_report, quality_hints, turnover_pct
+from app.scanner_quality import build_universe_quality_report, effective_reject_pressure, quality_hints, turnover_pct
 from brokers.broker_oanda import OandaBrokerClient
 
 BASE_DIR, _SETTINGS_PATH, HUB_DATA_DIR, _BOOT_SETTINGS = resolve_runtime_paths(__file__, "forex_thinker")
@@ -109,6 +110,10 @@ def _quality_report_path(hub_dir: str) -> str:
 
 def _calendar_cache_path(hub_dir: str) -> str:
     return os.path.join(hub_dir, "forex", "forexfactory_calendar_cache.json")
+
+
+def _confidence_calibration_path(hub_dir: str) -> str:
+    return os.path.join(hub_dir, "confidence_calibration.json")
 
 
 def _norm_impact(raw: Any) -> str:
@@ -531,17 +536,59 @@ def _live_guarded_entry_gate_reason(settings: Dict[str, Any], row: Dict[str, Any
     pair = str(row.get("pair", "") or "").strip().upper()
     if not pair:
         return ""
-    sample_count = int(float(row.get("samples", 0) or 0))
+    sample_count = int(float(row.get("calibration_effective_samples", row.get("samples", 0)) or 0))
+    pair_samples = int(float(row.get("pair_samples", row.get("samples", 0)) or 0))
+    market_samples = int(float(row.get("market_calibration_samples", 0) or 0))
     min_samples_guarded = max(0, int(float(settings.get("forex_min_samples_live_guarded", 5) or 5)))
     if sample_count < min_samples_guarded:
-        return f"Calibration sample gate for {pair} ({sample_count} < {min_samples_guarded})"
-    calib_prob = float(row.get("calib_prob", 0.0) or 0.0)
+        if market_samples > pair_samples:
+            return f"Calibration sample gate for {pair} ({pair_samples} pair / {market_samples} pooled < {min_samples_guarded})"
+        return f"Calibration sample gate for {pair} ({pair_samples} < {min_samples_guarded})"
+    calib_prob = float(row.get("calibration_effective_prob", row.get("calib_prob", 0.0)) or 0.0)
     if calib_prob <= 0.0:
         calib_prob = 0.5
     min_calib_prob = max(0.0, min(1.0, float(settings.get("forex_min_calib_prob_live_guarded", 0.56) or 0.56)))
     if calib_prob < min_calib_prob:
         return f"Calibrated confidence gate for {pair} ({calib_prob:.2f} < {min_calib_prob:.2f})"
     return ""
+
+
+def _market_pooled_calibration_samples(hub_dir: str, settings: Dict[str, Any]) -> int:
+    payload = _load_json_map(_confidence_calibration_path(hub_dir))
+    row: Dict[str, Any] = {}
+    if isinstance(payload.get("forex", {}), dict):
+        row = dict(payload.get("forex", {}) or {})
+    elif str(payload.get("market", "") or "").strip().lower() == "forex":
+        row = payload
+    try:
+        samples = int(float(row.get("samples", 0) or 0))
+    except Exception:
+        samples = 0
+    if samples > 0:
+        return samples
+    try:
+        base_threshold = float(settings.get("forex_score_threshold", 0.2) or 0.2)
+    except Exception:
+        base_threshold = 0.2
+    try:
+        adaptive_min_samples = max(6, int(float(settings.get("adaptive_confidence_min_samples", 18) or 18)))
+    except Exception:
+        adaptive_min_samples = 18
+    try:
+        target_success = max(30.0, min(90.0, float(settings.get("adaptive_confidence_target_success_pct", 55.0) or 55.0)))
+    except Exception:
+        target_success = 55.0
+    built = build_market_confidence_calibration(
+        hub_dir,
+        "forex",
+        base_threshold=base_threshold,
+        min_samples=adaptive_min_samples,
+        target_success_pct=target_success,
+    )
+    try:
+        return int(float(built.get("samples", 0) or 0))
+    except Exception:
+        return 0
 
 
 def _append_jsonl(path: str, row: Dict[str, Any]) -> None:
@@ -1087,9 +1134,6 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
             _apply_pair_cooldown(cooldown_map, pair, "spread", settings, ts_now)
             continue
         candidates.append(pair)
-    if not candidates:
-        candidates = universe[: min(12, len(universe))]
-
     scored = []
     candles_by_pair: Dict[str, List[Dict[str, Any]]] = {}
     min_valid_ratio = max(0.0, min(1.0, float(settings.get("forex_min_valid_bars_ratio", 0.70) or 0.70)))
@@ -1199,6 +1243,7 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
             scored.append(row)
         scored.sort(key=lambda row: abs(float(row.get("score", 0.0))), reverse=True)
         outcome_map = _compute_outcome_map(hub_dir)
+        market_calibration_samples = _market_pooled_calibration_samples(hub_dir, settings)
         for row in scored:
             pair = str(row.get("pair", "") or "").strip().upper()
             m = outcome_map.get(pair, {})
@@ -1209,6 +1254,11 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
             row["avg_pnl_pct"] = round(ap, 4)
             row["samples"] = smp
             row["calib_prob"] = _calibrated_prob(float(row.get("score", 0.0) or 0.0), hr, ap)
+            row["pair_samples"] = int(smp)
+            row["market_calibration_samples"] = int(market_calibration_samples)
+            row["calibration_scope"] = "pair"
+            row["calibration_effective_samples"] = int(smp)
+            row["calibration_effective_prob"] = float(row.get("calib_prob", 0.0) or 0.0)
             row["quality_score"] = round(
                 (100.0 * float(row.get("valid_ratio", 0.0)))
                 - (3.0 * float(row.get("spread_bps", 0.0)))
@@ -1237,6 +1287,14 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
                     data=f"event window block | severity {str(row.get('event_risk_severity', 'none')).upper()}",
                 )
             elif str(row.get("side", "watch") or "watch").strip().lower() in {"long", "short"}:
+                min_samples_guarded = max(0, int(float(settings.get("forex_min_samples_live_guarded", 5) or 5)))
+                pair_samples = int(float(row.get("pair_samples", row.get("samples", 0)) or 0))
+                pooled_samples = int(float(row.get("market_calibration_samples", 0) or 0))
+                if pair_samples < min_samples_guarded and pooled_samples >= min_samples_guarded:
+                    row["samples"] = int(pooled_samples)
+                    row["calibration_scope"] = "market_pooled"
+                    row["calibration_effective_samples"] = int(pooled_samples)
+                    row["calibration_effective_prob"] = float(row.get("calib_prob", 0.0) or 0.0)
                 entry_gate_reason = _live_guarded_entry_gate_reason(settings, row)
                 if entry_gate_reason:
                     row["eligible_for_entry"] = False
@@ -1357,7 +1415,13 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
         reason_counts = dict(reject_summary.get("counts", {}) or {})
         dominant_reason = str(reject_summary.get("dominant_reason", "") or "")
         dominant_ratio = float(reject_summary.get("dominant_ratio_pct", 0.0) or 0.0) / 100.0
-        reject_rate_pct = float(reject_summary.get("reject_rate_pct", 0.0) or 0.0)
+        reject_rate_pct = effective_reject_pressure(
+            reject_summary.get("reject_rate_pct", 0.0),
+            dominant_reason=dominant_reason,
+            dominant_ratio_pct=float(reject_summary.get("dominant_ratio_pct", 0.0) or 0.0),
+            leaders_total=int(len(leaders)),
+            scores_total=int(len(scored)),
+        )
         reject_warn_pct = max(10.0, float(settings.get("forex_reject_drift_warn_pct", 65.0) or 65.0))
         drift_warning = bool((reject_rate_pct >= reject_warn_pct) and (dominant_ratio >= 0.60))
         _write_diag(
