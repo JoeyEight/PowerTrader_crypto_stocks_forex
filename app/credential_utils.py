@@ -163,6 +163,30 @@ def get_oanda_creds(settings: Dict[str, Any], base_dir: Optional[str] = None) ->
     return account_id, token
 
 
+def twelvedata_credential_path(base_dir: Optional[str] = None) -> str:
+    keys_dir = _ensure_keys_dir(base_dir)
+    return os.path.join(keys_dir, "twelvedata_api_key.txt")
+
+
+def get_twelvedata_api_key(settings: Dict[str, Any], base_dir: Optional[str] = None) -> str:
+    key = env_or_setting(
+        settings,
+        "twelvedata_api_key",
+        ("POWERTRADER_TWELVEDATA_API_KEY", "TWELVEDATA_API_KEY", "TWELVE_DATA_API_KEY"),
+    )
+    if key:
+        return key
+    path = twelvedata_credential_path(base_dir)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            key = _clean(f.read())
+        if key:
+            return key
+    except Exception:
+        pass
+    return ""
+
+
 def openai_credential_path(base_dir: Optional[str] = None) -> str:
     keys_dir = _ensure_keys_dir(base_dir)
     return os.path.join(keys_dir, "openai_api_key.txt")

@@ -21,6 +21,7 @@ SANITIZER_DEFAULTS: Dict[str, Any] = {
     "ui_font_scale_preset": "normal",
     "ui_layout_preset": "auto",
     "stock_universe_mode": "all_tradable_filtered",
+    "stock_data_provider": "alpaca",
     "forex_session_mode": "all",
     "ui_refresh_seconds": 1.0,
     "chart_refresh_seconds": 10.0,
@@ -197,6 +198,11 @@ SANITIZER_DEFAULTS: Dict[str, Any] = {
     "forex_pair_cooldown_minutes": 20,
     "forex_pair_cooldown_min_hits": 2,
     "forex_pair_cooldown_reject_reasons": "data_quality,insufficient_bars,spread,low_volatility",
+    "twelvedata_api_key": "",
+    "twelvedata_base_url": "https://api.twelvedata.com",
+    "twelvedata_api_credits_per_minute": 8,
+    "twelvedata_daily_credits": 800,
+    "twelvedata_scan_symbol_cap": 8,
     "script_neural_runner2": "engines/pt_thinker.py",
     "script_neural_trainer": "engines/pt_trainer.py",
     "script_trader": "engines/pt_trader.py",
@@ -418,6 +424,9 @@ _INT_BOUNDS: Dict[str, Tuple[int, int, int]] = {
     "stock_symbol_cooldown_min_hits": (3, 1, 20),
     "forex_pair_cooldown_minutes": (20, 1, 1440),
     "forex_pair_cooldown_min_hits": (2, 1, 20),
+    "twelvedata_api_credits_per_minute": (8, 1, 10000),
+    "twelvedata_daily_credits": (800, 100, 1000000),
+    "twelvedata_scan_symbol_cap": (8, 1, 2000),
 }
 
 _ENUMS: Dict[str, Iterable[str]] = {
@@ -429,6 +438,7 @@ _ENUMS: Dict[str, Iterable[str]] = {
     "ui_font_scale_preset": ("small", "normal", "large"),
     "ui_layout_preset": ("auto", "compact", "normal", "wide"),
     "stock_universe_mode": ("core", "watchlist", "all_tradable_filtered"),
+    "stock_data_provider": ("alpaca", "twelvedata"),
     "forex_session_mode": ("all", "london_ny", "london", "ny", "asia"),
 }
 
@@ -641,6 +651,10 @@ def recommend_market_profile_overrides(
         int(forex_metrics.get("open_positions", 0) or 0),
     )
     stock_scan_max = max(8, int(_as_number(cfg.get("stock_scan_max_symbols"), SANITIZER_DEFAULTS.get("stock_scan_max_symbols", 160))))
+    provider = str(cfg.get("stock_data_provider", "alpaca") or "alpaca").strip().lower()
+    if provider == "twelvedata":
+        td_cap = max(1, int(_as_number(cfg.get("twelvedata_scan_symbol_cap"), SANITIZER_DEFAULTS.get("twelvedata_scan_symbol_cap", 8))))
+        stock_scan_max = min(stock_scan_max, td_cap)
     if pkey == "guarded":
         stocks_scan_interval_s = 20.0
     elif stock_scan_max >= 200:
@@ -649,6 +663,13 @@ def recommend_market_profile_overrides(
         stocks_scan_interval_s = 15.0
     else:
         stocks_scan_interval_s = 12.0 if pkey == "performance" else 15.0
+    if provider == "twelvedata":
+        credits_per_min = max(1, int(_as_number(cfg.get("twelvedata_api_credits_per_minute"), SANITIZER_DEFAULTS.get("twelvedata_api_credits_per_minute", 8))))
+        daily_credits = max(1, int(_as_number(cfg.get("twelvedata_daily_credits"), SANITIZER_DEFAULTS.get("twelvedata_daily_credits", 800))))
+        credits_per_scan = max(1, int(stock_scan_max))
+        min_interval_min = (float(credits_per_scan) / float(credits_per_min)) * 60.0
+        min_interval_day = (float(credits_per_scan) / float(daily_credits)) * 86400.0
+        stocks_scan_interval_s = max(stocks_scan_interval_s, min_interval_min, min_interval_day, 60.0)
     forex_scan_interval_s = 12.0 if pkey == "guarded" else 10.0 if pkey == "balanced" else 8.0
     overrides: Dict[str, Any] = {
         "stock_trade_notional_usd": _recommended_stock_notional_usd(
@@ -673,6 +694,8 @@ def recommend_market_profile_overrides(
         "stock_symbol_cooldown_min_hits": 3,
         "stock_symbol_cooldown_reject_reasons": "data_quality,insufficient_bars",
     }
+    if provider == "twelvedata":
+        overrides["stock_scan_max_symbols"] = int(stock_scan_max)
     if pkey == "performance":
         overrides["market_max_total_exposure_pct"] = 0.0
     return overrides

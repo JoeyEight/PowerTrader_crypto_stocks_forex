@@ -135,6 +135,16 @@ python3 runtime/tools/run_quality_suite.py --require-artifacts --require-stabili
   - `POWERTRADER_ALPACA_API_KEY_ID`
   - `POWERTRADER_ALPACA_SECRET_KEY`
 
+### Stocks Data (Twelve Data, optional)
+- Set `stock_data_provider` to `twelvedata` in Settings.
+- Provide the API key via:
+  - `POWERTRADER_TWELVEDATA_API_KEY`, or
+  - `keys/twelvedata_api_key.txt`
+- Rate guard knobs:
+  - `twelvedata_api_credits_per_minute`
+  - `twelvedata_daily_credits`
+  - `twelvedata_scan_symbol_cap`
+
 ### Forex (OANDA)
 - Env or settings-backed values:
   - `POWERTRADER_OANDA_ACCOUNT_ID`

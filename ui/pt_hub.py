@@ -66,10 +66,12 @@ from app.credential_utils import (
     alpaca_credential_paths,
     get_alpaca_creds,
     get_oanda_creds,
+    get_twelvedata_api_key,
     get_robinhood_creds_from_env,
     normalize_start_allocation_pct,
     oanda_credential_paths,
     robinhood_credential_paths,
+    twelvedata_credential_path,
     get_robinhood_creds_from_files,
 )
 from engines.stock_thinker import run_scan as run_stock_scan
@@ -458,6 +460,12 @@ DEFAULT_SETTINGS = {
     "alpaca_secret_key": "",
     "alpaca_base_url": "https://api.alpaca.markets",
     "alpaca_data_url": "https://data.alpaca.markets",
+    "stock_data_provider": "alpaca",
+    "twelvedata_api_key": "",
+    "twelvedata_base_url": "https://api.twelvedata.com",
+    "twelvedata_api_credits_per_minute": 8,
+    "twelvedata_daily_credits": 800,
+    "twelvedata_scan_symbol_cap": 8,
     "alpaca_paper_mode": False,
     "market_rollout_stage": "live_guarded",  # internal rollout stage (locked to live)
     "settings_control_mode": "self_managed",  # preset_managed | self_managed
@@ -18879,8 +18887,8 @@ class PowerTraderHub(tk.Tk):
         def _open_alpaca_key_editor() -> None:
             dlg = tk.Toplevel(win)
             dlg.title("Update Alpaca Keys")
-            dlg.geometry("640x250")
-            dlg.minsize(560, 220)
+            dlg.geometry("680x360")
+            dlg.minsize(620, 320)
             dlg.transient(win)
             try:
                 dlg.grab_set()
@@ -18901,13 +18909,31 @@ class PowerTraderHub(tk.Tk):
             cur_key, cur_secret = get_alpaca_creds(self.settings, base_dir=self.project_dir)
             key_var = tk.StringVar(value=str(cur_key or ""))
             secret_var = tk.StringVar(value=str(cur_secret or ""))
+            cur_td_key = get_twelvedata_api_key(self.settings, base_dir=self.project_dir)
+            td_key_var = tk.StringVar(value=str(cur_td_key or ""))
+            use_td_var = tk.BooleanVar(value=str(self.settings.get("stock_data_provider", "alpaca") or "alpaca").strip().lower() == "twelvedata")
             ttk.Label(body, text="Alpaca API key ID:").grid(row=1, column=0, sticky="w", padx=(0, 10), pady=6)
             ttk.Entry(body, textvariable=key_var).grid(row=1, column=1, sticky="ew", pady=6)
             ttk.Label(body, text="Alpaca secret key:").grid(row=2, column=0, sticky="w", padx=(0, 10), pady=6)
             ttk.Entry(body, textvariable=secret_var, show="*").grid(row=2, column=1, sticky="ew", pady=6)
+            ttk.Separator(body, orient="horizontal").grid(row=3, column=0, columnspan=3, sticky="ew", pady=(10, 8))
+            ttk.Label(
+                body,
+                text="Optional: Twelve Data stock scan feed",
+                foreground=DARK_MUTED,
+                justify="left",
+                wraplength=580,
+            ).grid(row=4, column=0, columnspan=3, sticky="w", pady=(0, 6))
+            ttk.Checkbutton(
+                body,
+                text="Use Twelve Data for stock scans (auto-tunes scan interval & symbol cap)",
+                variable=use_td_var,
+            ).grid(row=5, column=0, columnspan=3, sticky="w", pady=(0, 6))
+            ttk.Label(body, text="Twelve Data API key:").grid(row=6, column=0, sticky="w", padx=(0, 10), pady=6)
+            ttk.Entry(body, textvariable=td_key_var, show="*").grid(row=6, column=1, sticky="ew", pady=6)
 
             btns = ttk.Frame(body)
-            btns.grid(row=3, column=0, columnspan=3, sticky="w", pady=(12, 0))
+            btns.grid(row=7, column=0, columnspan=3, sticky="w", pady=(12, 0))
 
             def _save_alpaca() -> None:
                 key_txt = str(key_var.get() or "").strip()
@@ -18926,6 +18952,36 @@ class PowerTraderHub(tk.Tk):
                 _set_env_cred("POWERTRADER_ALPACA_SECRET_KEY", secret_txt)
                 self.settings["alpaca_api_key_id"] = ""
                 self.settings["alpaca_secret_key"] = ""
+                use_twelvedata = bool(use_td_var.get())
+                td_key_txt = str(td_key_var.get() or "").strip()
+                if use_twelvedata and (not td_key_txt):
+                    messagebox.showerror("Missing values", "Twelve Data API key is required when enabled.")
+                    return
+                if td_key_txt:
+                    _write_secret_file(twelvedata_credential_path(self.project_dir), td_key_txt)
+                    _set_env_cred("POWERTRADER_TWELVEDATA_API_KEY", td_key_txt)
+                self.settings["twelvedata_api_key"] = ""
+                self.settings["stock_data_provider"] = "twelvedata" if use_twelvedata else "alpaca"
+                self.settings["twelvedata_base_url"] = str(self.settings.get("twelvedata_base_url", DEFAULT_SETTINGS.get("twelvedata_base_url", "https://api.twelvedata.com")) or "https://api.twelvedata.com")
+                self.settings["twelvedata_api_credits_per_minute"] = max(
+                    1,
+                    int(float(self.settings.get("twelvedata_api_credits_per_minute", DEFAULT_SETTINGS.get("twelvedata_api_credits_per_minute", 8)) or 8)),
+                )
+                self.settings["twelvedata_daily_credits"] = max(
+                    100,
+                    int(float(self.settings.get("twelvedata_daily_credits", DEFAULT_SETTINGS.get("twelvedata_daily_credits", 800)) or 800)),
+                )
+                self.settings["twelvedata_scan_symbol_cap"] = max(
+                    1,
+                    int(float(self.settings.get("twelvedata_scan_symbol_cap", DEFAULT_SETTINGS.get("twelvedata_scan_symbol_cap", 8)) or 8)),
+                )
+                if use_twelvedata:
+                    profile_key = str(self.settings.get("settings_profile", "balanced") or "balanced").strip().lower()
+                    tuned = self._resolve_account_aware_profile_overrides(profile_key, settings_source=self.settings)
+                    for key in ("market_bg_stocks_interval_s", "stock_scan_max_symbols"):
+                        if key in tuned:
+                            self.settings[key] = tuned[key]
+                self._save_settings()
                 _refresh_alpaca_status()
                 dlg.destroy()
 

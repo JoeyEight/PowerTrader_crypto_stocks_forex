@@ -12,13 +12,14 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List
 from zoneinfo import ZoneInfo
 
-from app.credential_utils import get_alpaca_creds
+from app.credential_utils import get_alpaca_creds, get_twelvedata_api_key
 from app.http_utils import retry_after_from_urllib_http_error
 from app.path_utils import resolve_runtime_paths
 from app.rejection_replay import recommend_threshold_from_scores, replay_target_entries_for_market
 from app.scan_diagnostics_schema import with_scan_schema
 from app.scanner_quality import build_universe_quality_report, effective_reject_pressure, quality_hints, turnover_pct
 from brokers.broker_alpaca import AlpacaBrokerClient
+from brokers.broker_twelvedata import TwelveDataClient
 
 BASE_DIR, _SETTINGS_PATH, HUB_DATA_DIR, _BOOT_SETTINGS = resolve_runtime_paths(__file__, "stock_thinker")
 
@@ -64,6 +65,55 @@ def _float(v: Any, default: float = 0.0) -> float:
         return float(v)
     except Exception:
         return float(default)
+
+
+def _stock_data_provider(settings: Dict[str, Any]) -> str:
+    provider = str(settings.get("stock_data_provider", "alpaca") or "alpaca").strip().lower()
+    return provider if provider in {"alpaca", "twelvedata"} else "alpaca"
+
+
+def _twelvedata_scan_limits(settings: Dict[str, Any], symbol_count: int) -> Dict[str, float]:
+    credits_per_min = max(1.0, float(settings.get("twelvedata_api_credits_per_minute", 8) or 8))
+    daily_credits = max(1.0, float(settings.get("twelvedata_daily_credits", 800) or 800))
+    credits_per_scan = max(1.0, float(symbol_count or 1))
+    min_interval_min = (credits_per_scan / credits_per_min) * 60.0
+    min_interval_day = (credits_per_scan / daily_credits) * 86400.0
+    min_interval = max(60.0, min_interval_min, min_interval_day)
+    return {
+        "credits_per_min": credits_per_min,
+        "daily_credits": daily_credits,
+        "credits_per_scan": credits_per_scan,
+        "min_interval_s": float(min_interval),
+    }
+
+
+def _twelvedata_snap_from_bars(bars_by_symbol: Dict[str, List[Dict[str, Any]]]) -> Dict[str, Dict[str, float]]:
+    snap: Dict[str, Dict[str, float]] = {}
+    for sym, bars in (bars_by_symbol or {}).items():
+        rows = list(bars or [])
+        if not rows:
+            continue
+        last_row = rows[-1]
+        last_px = _float(last_row.get("c", last_row.get("close", 0.0)), 0.0)
+        vol_sum = 0.0
+        dollar_vol = 0.0
+        for row in rows[-24:]:
+            close_px = _float(row.get("c", row.get("close", 0.0)), 0.0)
+            vol = _float(row.get("v", row.get("volume", 0.0)), 0.0)
+            if vol > 0.0:
+                vol_sum += vol
+                if close_px > 0.0:
+                    dollar_vol += close_px * vol
+        snap[str(sym).strip().upper()] = {
+            "bid": 0.0,
+            "ask": 0.0,
+            "mid": last_px,
+            "last": last_px,
+            "spread_bps": 0.0,
+            "volume": vol_sum,
+            "dollar_vol": dollar_vol,
+        }
+    return snap
 
 
 def _request_json(url: str, headers: Dict[str, str], timeout: float = 10.0) -> Any:
@@ -143,6 +193,10 @@ def _scan_diag_path(hub_dir: str) -> str:
 
 def _scan_pause_path(hub_dir: str) -> str:
     return os.path.join(hub_dir, "stocks", "scan_pause.json")
+
+
+def _scan_rotation_path(hub_dir: str) -> str:
+    return os.path.join(hub_dir, "stocks", "scan_rotation.json")
 
 
 def _feed_health_path(hub_dir: str) -> str:
@@ -1119,6 +1173,135 @@ def _prioritize_universe_symbols(symbols: List[str], watch: List[str], hub_dir: 
     return out
 
 
+def _load_open_position_symbols(hub_dir: str) -> List[str]:
+    out: List[str] = []
+    try:
+        status = _load_json_map(os.path.join(hub_dir, "stocks", "alpaca_status.json"))
+        for row in list(status.get("raw_positions", []) or []):
+            if not isinstance(row, dict):
+                continue
+            sym = str(row.get("symbol", "") or "").strip().upper()
+            if _symbol_is_scannable(sym) and (sym not in out):
+                out.append(sym)
+    except Exception:
+        pass
+    return out
+
+
+def _select_twelvedata_scan_slice(
+    settings: Dict[str, Any],
+    hub_dir: str,
+    symbols: List[str],
+    max_scan: int,
+    prev_candidates: List[str],
+    prev_leaders: List[str],
+    prev_top_symbol: str,
+) -> tuple[List[str], Dict[str, Any]]:
+    ordered: List[str] = []
+    seen: set[str] = set()
+    for raw in list(symbols or []):
+        sym = str(raw or "").strip().upper()
+        if (not _symbol_is_scannable(sym)) or (sym in seen):
+            continue
+        seen.add(sym)
+        ordered.append(sym)
+    cap = max(1, int(max_scan or 1))
+    if len(ordered) <= cap:
+        return ordered, {
+            "active": False,
+            "core_size": len(ordered),
+            "tail_size": 0,
+            "offset": 0,
+            "next_offset": 0,
+            "min_rotate_slots": 0,
+        }
+
+    seed: List[str] = []
+    seed.extend(_load_open_position_symbols(hub_dir))
+    seed.extend(_parse_watchlist(settings))
+    if str(prev_top_symbol or "").strip():
+        seed.append(str(prev_top_symbol).strip().upper())
+    seed.extend([str(s or "").strip().upper() for s in list(prev_leaders or [])[:12]])
+    seed.extend([str(s or "").strip().upper() for s in list(prev_candidates or [])[:6]])
+
+    pool = set(ordered)
+    core: List[str] = []
+    core_seen: set[str] = set()
+    for raw in seed:
+        sym = str(raw or "").strip().upper()
+        if (not sym) or (sym in core_seen) or (sym not in pool):
+            continue
+        core_seen.add(sym)
+        core.append(sym)
+
+    if (not core) and ordered:
+        core = [ordered[0]]
+        core_seen = {ordered[0]}
+
+    min_rotate_slots = 0
+    if cap >= 6:
+        min_rotate_slots = 2
+    elif cap >= 3:
+        min_rotate_slots = 1
+    core_limit = max(0, cap - min_rotate_slots)
+    if len(core) > core_limit:
+        core = core[:core_limit]
+        core_seen = set(core)
+
+    tail = [sym for sym in ordered if sym not in core_seen]
+    rotate_slots = max(0, cap - len(core))
+    if (not tail) or rotate_slots <= 0:
+        selected = (core if core else ordered)[:cap]
+        return selected, {
+            "active": False,
+            "core_size": len(selected),
+            "tail_size": 0,
+            "offset": 0,
+            "next_offset": 0,
+            "min_rotate_slots": int(min_rotate_slots),
+        }
+
+    rotation_state = _load_json_map(_scan_rotation_path(hub_dir))
+    try:
+        offset = int(rotation_state.get("offset", 0) or 0)
+    except Exception:
+        offset = 0
+    offset = offset % len(tail)
+    tail_len = len(tail)
+
+    selected_tail: List[str] = []
+    idx = int(offset)
+    for _ in range(min(rotate_slots, tail_len)):
+        selected_tail.append(tail[idx])
+        idx = (idx + 1) % tail_len
+    next_offset = int(idx)
+    selected = (core + selected_tail)[:cap]
+
+    _save_json_map(
+        _scan_rotation_path(hub_dir),
+        {
+            "ts": int(time.time()),
+            "provider": "twelvedata",
+            "offset": int(next_offset),
+            "last_offset": int(offset),
+            "core_size": int(len(core)),
+            "tail_size": int(len(tail)),
+            "scan_size": int(len(selected)),
+            "min_rotate_slots": int(min_rotate_slots),
+            "core_symbols": list(core),
+            "selected_symbols": list(selected),
+        },
+    )
+    return selected, {
+        "active": True,
+        "core_size": int(len(core)),
+        "tail_size": int(len(tail)),
+        "offset": int(offset),
+        "next_offset": int(next_offset),
+        "min_rotate_slots": int(min_rotate_slots),
+    }
+
+
 def _select_universe(settings: Dict[str, Any], hub_dir: str, api_key: str, secret: str) -> List[str]:
     mode = str(settings.get("stock_universe_mode", "all_tradable_filtered") or "all_tradable_filtered").strip().lower()
     watch = _parse_watchlist(settings)
@@ -1194,6 +1377,7 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
         prev_status = _load_json_map(_thinker_status_path(hub_dir))
         prev_top = prev_status.get("top_pick", {}) if isinstance(prev_status.get("top_pick", {}), dict) else {}
         prev_top_symbol = str(prev_top.get("symbol", "") or "").strip().upper()
+    provider = _stock_data_provider(settings)
     api_key, secret = get_alpaca_creds(settings, base_dir=BASE_DIR)
     base_url = str(settings.get("alpaca_data_url", settings.get("alpaca_base_url", "https://data.alpaca.markets")) or "").strip().rstrip("/")
     ts_now = int(time.time())
@@ -1210,86 +1394,37 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
             "updated_at": ts_now,
             "market_open": _market_open_now(),
         }
+    td_api_key = ""
+    if provider == "twelvedata":
+        td_api_key = get_twelvedata_api_key(settings, base_dir=BASE_DIR)
+        if not td_api_key:
+            return {
+                "state": "NOT CONFIGURED",
+                "ai_state": "Credentials missing",
+                "msg": "Add Twelve Data API key in Settings",
+                "universe": list(DEFAULT_STOCK_UNIVERSE),
+                "leaders": [],
+                "all_scores": [],
+                "top_chart": [],
+                "top_chart_map": {},
+                "updated_at": ts_now,
+                "market_open": _market_open_now(),
+            }
 
     market_open = _market_open_now()
-    pause_setting = settings.get("stock_scan_closed_pause_hours", 2.0)
-    try:
-        pause_hours = max(0.0, float(pause_setting))
-    except Exception:
-        pause_hours = 2.0
+    # Keep scanner active outside market hours so watchlist/history are ready at open.
+    # Trade-entry gating remains enforced in stock_trader (market-hours + near-close checks).
     pause_state = _load_json_map(_scan_pause_path(hub_dir))
-    pause_until = int(pause_state.get("pause_until_ts", 0) or 0)
-    if market_open and pause_until > 0:
+    if int(pause_state.get("pause_until_ts", 0) or 0) > 0:
         _save_json_map(
             _scan_pause_path(hub_dir),
-            {"ts": ts_now, "pause_until_ts": 0, "reason": "market_open"},
-        )
-        pause_until = 0
-    if (not market_open) and pause_hours > 0:
-        if pause_until <= ts_now:
-            pause_until = ts_now + int(pause_hours * 3600)
-            _save_json_map(
-                _scan_pause_path(hub_dir),
-                {
-                    "ts": ts_now,
-                    "pause_until_ts": int(pause_until),
-                    "pause_hours": float(pause_hours),
-                    "reason": "market_closed",
-                    "market_open": False,
-                },
-            )
-        remaining_s = max(0, int(pause_until - ts_now))
-        msg = f"Market closed; scan paused ({max(0, int(remaining_s / 60))}m remaining)"
-        paused_payload = {
-            "state": "PAUSED",
-            "ai_state": "Scan paused",
-            "msg": msg,
-            "universe": list(prev_candidates or DEFAULT_STOCK_UNIVERSE),
-            "leaders": [],
-            "all_scores": [],
-            "top_pick": None,
-            "top_chart": [],
-            "top_chart_map": {},
-            "updated_at": ts_now,
-            "market_open": False,
-            "pause_until_ts": int(pause_until),
-            "pause_remaining_s": int(remaining_s),
-            "reject_summary": {
-                "total_rejected": 0,
-                "total_rejected_events": 0,
-                "reject_rate_pct": 0.0,
-                "dominant_reason": "market_closed",
-                "dominant_ratio_pct": 0.0,
-                "counts": {},
-            },
-            "health": {"data_ok": False, "broker_ok": True, "orders_ok": True, "drift_warning": False},
-        }
-        _save_scan_diagnostics(
-            hub_dir,
             {
                 "ts": ts_now,
-                "state": "PAUSED",
-                "mode": "closed_pause",
-                "market_open": False,
-                "universe_total": int(len(list(prev_candidates or DEFAULT_STOCK_UNIVERSE))),
-                "candidates_total": 0,
-                "scores_total": 0,
-                "leaders_total": 0,
-                "top_symbol": "",
-                "top_score": 0.0,
-                "msg": msg,
-                "reject_summary": dict(paused_payload["reject_summary"]),
-                "candidate_symbols": [],
-                "leader_symbols": [],
-                "leader_mode": "none",
-                "leader_stability_applied": False,
-                "leader_stability_prev_symbol": str(prev_top_symbol),
-                "candidate_churn_pct": 0.0,
-                "leader_churn_pct": 0.0,
-                "quality_summary": "Market closed; scan paused.",
+                "pause_until_ts": 0,
+                "reason": "scan_pause_disabled",
+                "market_open": bool(market_open),
             },
         )
-        return paused_payload
     headers = {"APCA-API-KEY-ID": api_key, "APCA-API-SECRET-KEY": secret}
     now_utc = datetime.now(timezone.utc)
     start_utc = now_utc - timedelta(days=10)
@@ -1323,39 +1458,128 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
             "market_open": market_open,
         }
     max_scan = max(8, int(float(settings.get("stock_scan_max_symbols", 120) or 120)))
-    universe = universe[:max_scan]
+    rotation_info: Dict[str, Any] = {
+        "active": False,
+        "core_size": 0,
+        "tail_size": 0,
+        "offset": 0,
+        "next_offset": 0,
+        "min_rotate_slots": 0,
+    }
+    if provider == "twelvedata":
+        td_cap = max(1, int(float(settings.get("twelvedata_scan_symbol_cap", 8) or 8)))
+        max_scan = min(max_scan, td_cap)
+        universe, rotation_info = _select_twelvedata_scan_slice(
+            settings=settings,
+            hub_dir=hub_dir,
+            symbols=list(universe or []),
+            max_scan=max_scan,
+            prev_candidates=list(prev_candidates or []),
+            prev_leaders=list(prev_leaders or []),
+            prev_top_symbol=str(prev_top_symbol or ""),
+        )
+    else:
+        universe = universe[:max_scan]
+
+    if provider == "twelvedata":
+        prev_updated = int(float(prev_diag.get("updated_at", prev_diag.get("ts", 0)) or 0))
+        limits = _twelvedata_scan_limits(settings, len(universe))
+        if prev_updated > 0:
+            age_s = max(0, int(ts_now - prev_updated))
+            if age_s < int(limits.get("min_interval_s", 60.0)):
+                wait_s = max(1, int(float(limits.get("min_interval_s", 60.0)) - age_s))
+                msg = f"Twelve Data rate guard: next scan in {wait_s}s"
+                fallback = _cached_scan_fallback(
+                    hub_dir,
+                    ts_now,
+                    msg,
+                    universe=list(universe),
+                    market_open=bool(market_open),
+                )
+                if fallback:
+                    return fallback
+                return {
+                    "state": "READY",
+                    "ai_state": "Scan throttled",
+                    "msg": msg,
+                    "universe": list(universe),
+                    "leaders": [],
+                    "all_scores": [],
+                    "top_chart": [],
+                    "top_chart_map": {},
+                    "updated_at": ts_now,
+                    "market_open": bool(market_open),
+                    "rejected": [],
+                    "reject_summary": {"total_rejected": 0, "reject_rate_pct": 0.0, "dominant_reason": "rate_guard"},
+                    "hints": ["Scanner throttled to respect Twelve Data rate limits."],
+                    "candidate_churn_pct": 0.0,
+                    "leader_churn_pct": 0.0,
+                    "leader_mode": "none",
+                    "leader_stability_applied": False,
+                    "leader_stability_prev_symbol": str(prev_top_symbol),
+                    "scan_rotation": dict(rotation_info),
+                    "universe_quality": {},
+                    "health": {"data_ok": False, "broker_ok": True, "orders_ok": True, "drift_warning": True},
+                    "pdt_note": "Paper mode can still simulate PDT protections; live day-trading may be limited under $25k.",
+                }
 
     data_url = str(settings.get("alpaca_data_url", "https://data.alpaca.markets") or "").strip().rstrip("/")
     if (not data_url) or ("paper-api.alpaca.markets" in data_url):
         data_url = "https://data.alpaca.markets"
     base_url = data_url
 
-    client = AlpacaBrokerClient(
-        api_key_id=api_key,
-        secret_key=secret,
-        base_url=str(settings.get("alpaca_base_url", "https://paper-api.alpaca.markets") or ""),
-        data_url=data_url,
-    )
-    feed_order_cfg = _parse_feed_order(settings)
     feed_health = _load_json_map(_feed_health_path(hub_dir))
-    feed_order = _adaptive_feed_order(feed_order_cfg, feed_health)
     feed_errors: Dict[str, str] = {}
     snap: Dict[str, Dict[str, float]] = {}
     snap_last_exc: Exception | None = None
-    for feed in feed_order:
+    feed_order: List[str] = []
+    td_bars_by_symbol: Dict[str, List[Dict[str, Any]]] = {}
+    client: AlpacaBrokerClient | None = None
+
+    if provider == "twelvedata":
+        feed_order = ["twelvedata"]
+        td_client = TwelveDataClient(
+            api_key=td_api_key,
+            base_url=str(settings.get("twelvedata_base_url", "https://api.twelvedata.com") or "https://api.twelvedata.com"),
+        )
+        td_outputsize = max(96, int(float(settings.get("stock_min_bars_required", 24) or 24) * 2))
         try:
-            snap = client.get_snapshot_details(universe, feed=feed)
-            feed_health = _update_feed_health(feed_health, feed, ok=bool(snap), bars_total=len(snap))
-            if snap:
-                break
+            td_bars_by_symbol = td_client.get_time_series_batch(
+                universe,
+                interval="1h",
+                outputsize=td_outputsize,
+            )
+            snap = _twelvedata_snap_from_bars(td_bars_by_symbol)
+            feed_health = _update_feed_health(feed_health, "twelvedata", ok=bool(snap), bars_total=len(td_bars_by_symbol))
+            if not snap:
+                feed_errors["twelvedata"] = "empty response"
         except Exception as exc:
             snap_last_exc = exc
+            feed_errors["twelvedata"] = f"{type(exc).__name__}: {exc}"
+            feed_health = _update_feed_health(feed_health, "twelvedata", ok=False, bars_total=0)
+    else:
+        client = AlpacaBrokerClient(
+            api_key_id=api_key,
+            secret_key=secret,
+            base_url=str(settings.get("alpaca_base_url", "https://paper-api.alpaca.markets") or ""),
+            data_url=data_url,
+        )
+        feed_order_cfg = _parse_feed_order(settings)
+        feed_order = _adaptive_feed_order(feed_order_cfg, feed_health)
+        for feed in feed_order:
             try:
-                feed_errors[str(feed or "").strip().lower()] = f"{type(exc).__name__}: {exc}"
-            except Exception:
-                pass
-            feed_health = _update_feed_health(feed_health, feed, ok=False, bars_total=0)
-            continue
+                snap = client.get_snapshot_details(universe, feed=feed)
+                feed_health = _update_feed_health(feed_health, feed, ok=bool(snap), bars_total=len(snap))
+                if snap:
+                    break
+            except Exception as exc:
+                snap_last_exc = exc
+                try:
+                    feed_errors[str(feed or "").strip().lower()] = f"{type(exc).__name__}: {exc}"
+                except Exception:
+                    pass
+                feed_health = _update_feed_health(feed_health, feed, ok=False, bars_total=0)
+                continue
     if (not snap) and (snap_last_exc is not None):
         _append_jsonl(
             _rankings_path(hub_dir),
@@ -1413,7 +1637,7 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
     cooldown_map = _prune_cooldown_map(cooldown_map, now_ts, settings=settings)
 
     # Warmup prefetch queue: pull extra daily history for recently short symbols.
-    if warm_queue:
+    if warm_queue and provider != "twelvedata" and client is not None:
         for sym in list(warm_queue.keys())[:50]:
             best_count = 0
             best_source = str((warm_queue.get(sym, {}) or {}).get("source", "") or "")
@@ -1506,7 +1730,9 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
         max_stale_hours_effective = max(max_stale_hours, closed_max_stale_hours)
     for feed in feed_order:
         try:
-            if market_open or (not use_daily_when_closed):
+            if provider == "twelvedata":
+                bars_by_symbol = dict(td_bars_by_symbol or {})
+            elif market_open or (not use_daily_when_closed):
                 bars_by_symbol = _fetch_bars_for_symbols(base_url, headers, candidates, start_iso, end_iso, feed)
             else:
                 bars_by_symbol = {}
@@ -1515,57 +1741,12 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
                 symbol_bars: List[Dict[str, Any]] = []
                 data_source = ""
                 open_daily_fallback = False
-                if market_open or (not use_daily_when_closed):
+                if market_open or (not use_daily_when_closed) or provider == "twelvedata":
                     symbol_bars = list(bars_by_symbol.get(symbol, []) or [])
-                    data_source = "batch_1h"
+                    data_source = "batch_1h" if provider != "twelvedata" else "twelvedata_1h"
                 else:
-                    try:
-                        symbol_bars = client.get_stock_bars(
-                            symbol,
-                            timeframe="1Day",
-                            limit=120,
-                            feed=feed,
-                            start_iso=daily_start_iso,
-                            end_iso=daily_end_iso,
-                        )
-                        data_source = "symbol_1d"
-                    except Exception:
-                        symbol_bars = []
-                        data_source = "symbol_1d"
-                # Fallback path: if batch bars are sparse/missing, try symbol endpoint directly.
-                if len(symbol_bars) < min_bars_required:
-                    try:
-                        if market_open:
-                            symbol_bars = client.get_stock_bars(symbol, timeframe="1Hour", limit=160, feed=feed)
-                            data_source = "symbol_1h"
-                        else:
-                            # Closed-session fallback: prefer richer intraday window if daily bars are sparse.
-                            symbol_bars = client.get_stock_bars(
-                                symbol,
-                                timeframe="1Hour",
-                                limit=240,
-                                feed=feed,
-                                start_iso=start_iso,
-                                end_iso=end_iso,
-                            )
-                            data_source = "symbol_1h"
-                    except Exception:
-                        symbol_bars = list(symbol_bars or [])
-                if len(symbol_bars) < min_bars_required:
-                    # Last resort for thin symbols / feed limitations: daily bars.
-                    try:
-                        if market_open:
-                            symbol_bars = client.get_stock_bars(
-                                symbol,
-                                timeframe="1Day",
-                                limit=120,
-                                feed=feed,
-                                start_iso=daily_start_iso,
-                                end_iso=daily_end_iso,
-                            )
-                            data_source = "symbol_1d_open"
-                            open_daily_fallback = True
-                        elif data_source != "symbol_1d":
+                    if client is not None:
+                        try:
                             symbol_bars = client.get_stock_bars(
                                 symbol,
                                 timeframe="1Day",
@@ -1575,8 +1756,56 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
                                 end_iso=daily_end_iso,
                             )
                             data_source = "symbol_1d"
-                    except Exception:
-                        symbol_bars = list(symbol_bars or [])
+                        except Exception:
+                            symbol_bars = []
+                            data_source = "symbol_1d"
+                # Fallback path: if batch bars are sparse/missing, try symbol endpoint directly.
+                if len(symbol_bars) < min_bars_required:
+                    if provider != "twelvedata" and client is not None:
+                        try:
+                            if market_open:
+                                symbol_bars = client.get_stock_bars(symbol, timeframe="1Hour", limit=160, feed=feed)
+                                data_source = "symbol_1h"
+                            else:
+                                # Closed-session fallback: prefer richer intraday window if daily bars are sparse.
+                                symbol_bars = client.get_stock_bars(
+                                    symbol,
+                                    timeframe="1Hour",
+                                    limit=240,
+                                    feed=feed,
+                                    start_iso=start_iso,
+                                    end_iso=end_iso,
+                                )
+                                data_source = "symbol_1h"
+                        except Exception:
+                            symbol_bars = list(symbol_bars or [])
+                if len(symbol_bars) < min_bars_required:
+                    # Last resort for thin symbols / feed limitations: daily bars.
+                    if provider != "twelvedata" and client is not None:
+                        try:
+                            if market_open:
+                                symbol_bars = client.get_stock_bars(
+                                    symbol,
+                                    timeframe="1Day",
+                                    limit=120,
+                                    feed=feed,
+                                    start_iso=daily_start_iso,
+                                    end_iso=daily_end_iso,
+                                )
+                                data_source = "symbol_1d_open"
+                                open_daily_fallback = True
+                            elif data_source != "symbol_1d":
+                                symbol_bars = client.get_stock_bars(
+                                    symbol,
+                                    timeframe="1Day",
+                                    limit=120,
+                                    feed=feed,
+                                    start_iso=daily_start_iso,
+                                    end_iso=daily_end_iso,
+                                )
+                                data_source = "symbol_1d"
+                        except Exception:
+                            symbol_bars = list(symbol_bars or [])
                 bars_count = int(len(symbol_bars or []))
                 if bars_count < min_bars_required:
                     retry_s = min(900, max(60, int((warm_queue.get(symbol, {}) or {}).get("retry_s", 60) or 60) * 2))
@@ -1681,8 +1910,13 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
             if (not err_txt) and (last_exc is not None):
                 err_txt = f"{type(last_exc).__name__}: {last_exc}"
             low = err_txt.lower()
-            if ("http error 403" in low) or ("forbidden" in low):
-                err_txt = "403 Forbidden (feed entitlement)"
+            if "error code: 1010" in low:
+                err_txt = "403 Forbidden (Cloudflare 1010: request blocked)"
+            elif ("http error 403" in low) or ("forbidden" in low):
+                if str(feed_name or "").strip().lower() == "twelvedata":
+                    err_txt = "403 Forbidden (provider access denied)"
+                else:
+                    err_txt = "403 Forbidden (feed entitlement)"
             elif len(err_txt) > 92:
                 err_txt = err_txt[:89] + "..."
             feed_issue_parts.append(f"{feed_name}:{err_txt}")
@@ -1766,6 +2000,7 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
                 "leader_mode": "none",
                 "leader_stability_applied": False,
                 "leader_stability_prev_symbol": str(prev_top_symbol),
+                "scan_rotation": dict(rotation_info),
                 "candidate_churn_pct": float(candidate_churn_pct),
                 "leader_churn_pct": float(leader_churn_pct),
                 "quality_summary": str(quality_report.get("summary", "") or ""),
@@ -1785,6 +2020,12 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
         for h in quality_hints(quality_report):
             if h not in hints:
                 hints.append(h)
+        if bool(rotation_info.get("active", False)):
+            hints.append(
+                "Stock universe rotation active: "
+                f"sticky core {int(rotation_info.get('core_size', 0))}, "
+                f"rotating tail {int(rotation_info.get('tail_size', 0))}."
+            )
         fallback_allowed = bool(feed_issue_parts or (last_exc is not None))
         fallback = None
         if fallback_allowed:
@@ -1821,6 +2062,7 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
                     "leader_mode": str(fallback.get("leader_mode", "cached") or "cached"),
                     "leader_stability_applied": bool(fallback.get("leader_stability_applied", False)),
                     "leader_stability_prev_symbol": str(fallback.get("leader_stability_prev_symbol", prev_top_symbol) or prev_top_symbol),
+                    "scan_rotation": dict(rotation_info),
                     "candidate_churn_pct": float(fallback.get("candidate_churn_pct", candidate_churn_pct) or candidate_churn_pct),
                     "leader_churn_pct": float(fallback.get("leader_churn_pct", leader_churn_pct) or leader_churn_pct),
                     "quality_summary": str((dict(fallback.get("universe_quality", {})).get("summary", "") if isinstance(fallback.get("universe_quality", {}), dict) else "") or ""),
@@ -1849,6 +2091,7 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
             "leader_mode": "none",
             "leader_stability_applied": False,
             "leader_stability_prev_symbol": str(prev_top_symbol),
+            "scan_rotation": dict(rotation_info),
             "universe_quality": quality_report,
             "health": {"data_ok": False, "broker_ok": True, "orders_ok": True, "drift_warning": drift_warning},
             "pdt_note": "Paper mode can still simulate PDT protections; live day-trading may be limited under $25k.",
@@ -2072,6 +2315,7 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
             "leader_mode": str(leader_mode),
             "leader_stability_applied": bool(stability_applied),
             "leader_stability_prev_symbol": str(prev_top_symbol),
+            "scan_rotation": dict(rotation_info),
             "candidate_churn_pct": float(candidate_churn_pct),
             "leader_churn_pct": float(leader_churn_pct),
             "quality_summary": str(quality_report.get("summary", "") or ""),
@@ -2097,6 +2341,12 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
     for h in quality_hints(quality_report):
         if h not in hints:
             hints.append(h)
+    if bool(rotation_info.get("active", False)):
+        hints.append(
+            "Stock universe rotation active: "
+            f"sticky core {int(rotation_info.get('core_size', 0))}, "
+            f"rotating tail {int(rotation_info.get('tail_size', 0))}."
+        )
     if replay_enabled:
         hints.append(
             f"Adaptive threshold {volatility_threshold:.3f} -> {adaptive_threshold:.3f} "
@@ -2134,6 +2384,7 @@ def run_scan(settings: Dict[str, Any], hub_dir: str) -> Dict[str, Any]:
         "leader_mode": str(leader_mode),
         "leader_stability_applied": bool(stability_applied),
         "leader_stability_prev_symbol": str(prev_top_symbol),
+        "scan_rotation": dict(rotation_info),
         "window_policy": dict(window_policy),
         "window_policy_hits": int(window_policy_hits),
         "universe_quality": quality_report,
