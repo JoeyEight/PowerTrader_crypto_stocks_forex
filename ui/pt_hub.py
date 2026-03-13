@@ -18,6 +18,7 @@ import zipfile
 import re
 import hashlib
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
 
 if __package__ in (None, ""):
@@ -1192,6 +1193,9 @@ class CandleChart(ttk.Frame):
 
 
         self._last_refresh = 0.0
+        self._legend_hover_motion_handler = None
+        self._legend_hover_last_canvas_xy: Optional[Tuple[float, float]] = None
+        self._legend_hover_restore_after_id = None
 
 
     def _apply_dark_chart_style(self) -> None:
@@ -1203,6 +1207,50 @@ class CandleChart(ttk.Frame):
             for spine in self.ax.spines.values():
                 spine.set_color(DARK_BORDER)
             self.ax.grid(True, color=DARK_BORDER, linewidth=0.6, alpha=0.35)
+        except Exception:
+            pass
+
+    def _schedule_restore_legend_hover(self) -> None:
+        try:
+            if self._legend_hover_restore_after_id:
+                self.after_cancel(self._legend_hover_restore_after_id)
+        except Exception:
+            pass
+
+        try:
+            self._legend_hover_restore_after_id = self.after_idle(self._restore_legend_hover)
+        except Exception:
+            self._legend_hover_restore_after_id = None
+
+    def _restore_legend_hover(self) -> None:
+        self._legend_hover_restore_after_id = None
+        handler = getattr(self, "_legend_hover_motion_handler", None)
+        if not callable(handler):
+            return
+        try:
+            canvas_w = self.canvas.get_tk_widget()
+        except Exception:
+            return
+        try:
+            width = int(canvas_w.winfo_width() or 0)
+            height = int(canvas_w.winfo_height() or 0)
+            root_x = int(canvas_w.winfo_rootx() or 0)
+            root_y = int(canvas_w.winfo_rooty() or 0)
+            pointer_x = int(canvas_w.winfo_pointerx() or 0)
+            pointer_y = int(canvas_w.winfo_pointery() or 0)
+            local_x = float(pointer_x - root_x)
+            local_y = float(pointer_y - root_y)
+            if not (0.0 <= local_x <= float(width) and 0.0 <= local_y <= float(height)):
+                return
+            self._legend_hover_last_canvas_xy = (local_x, local_y)
+            handler(
+                SimpleNamespace(
+                    x=local_x,
+                    y=max(0.0, float(height) - local_y),
+                    inaxes=self.ax,
+                    guiEvent=SimpleNamespace(x_root=pointer_x, y_root=pointer_y),
+                )
+            )
         except Exception:
             pass
 
@@ -1294,7 +1342,7 @@ class CandleChart(ttk.Frame):
                     except Exception:
                         self._active_hover_line = None
 
-                def _hide_legend_tooltip(_e=None):
+                def _hide_legend_tooltip(_e=None, preserve_pointer: bool = False):
                     _reset_hover_lines()
                     try:
                         tw = getattr(self, "_legend_tooltip_win", None)
@@ -1304,6 +1352,8 @@ class CandleChart(ttk.Frame):
                         pass
                     self._legend_tooltip_win = None
                     self._legend_tooltip_label = None
+                    if not preserve_pointer:
+                        self._legend_hover_last_canvas_xy = None
 
                 def _show_legend_tooltip(x_root: int, y_root: int, text: str):
                     try:
@@ -1394,12 +1444,17 @@ class CandleChart(ttk.Frame):
                         else:
                             x_root = int(canvas_w.winfo_rootx() + x_disp)
                             y_root = int(canvas_w.winfo_rooty() + (canvas_w.winfo_height() - y_disp))
+                        self._legend_hover_last_canvas_xy = (
+                            float(x_disp),
+                            max(0.0, float(canvas_w.winfo_height()) - float(y_disp)),
+                        )
                         _show_legend_tooltip(x_root, y_root, tip_txt)
                     except Exception:
                         _hide_legend_tooltip()
 
                 self._legend_hover_cid = self.canvas.mpl_connect("motion_notify_event", _on_legend_motion)
                 self._legend_hover_leave_cid = self.canvas.mpl_connect("figure_leave_event", _hide_legend_tooltip)
+                self._legend_hover_motion_handler = _on_legend_motion
                 self._legend_hover_bound = True
             except Exception:
                 self._legend_hover_bound = False
@@ -1515,25 +1570,25 @@ class CandleChart(ttk.Frame):
                 err = str(self.fetcher.get_last_error(self.coin, tf, limit=limit) or "").strip()
             except Exception:
                 err = ""
+            spinner_char = ["|", "/", "-", "\\"][int(time.time() * 6.0) % 4]
             if err:
-                err_short = (err[:90] + "...") if len(err) > 90 else err
-                self.ax.set_title(f"{self.coin} ({tf}) - no candles ({err_short})", color=DARK_FG)
+                self.ax.set_title(f"{self.coin} ({tf}) - feed retry {spinner_char}", color=DARK_FG)
                 try:
-                    self.neural_status_label.config(text=f"Neural: N/A | feed error")
+                    self.neural_status_label.config(text=f"Neural: N/A | retrying feed")
                 except Exception:
                     pass
             else:
-                self.ax.set_title(f"{self.coin} ({tf}) - no candles", color=DARK_FG)
+                self.ax.set_title(f"{self.coin} ({tf}) - loading {spinner_char}", color=DARK_FG)
             try:
                 self.ax.text(
                     0.5,
                     0.5,
-                    "No candle data available yet\nCheck feed health, timeframe, or retry in a few seconds.",
+                    f"{spinner_char}\nLoading candle data...",
                     transform=self.ax.transAxes,
                     ha="center",
                     va="center",
-                    color=DARK_MUTED,
-                    fontsize=10,
+                    color=DARK_ACCENT2,
+                    fontsize=12,
                     bbox={"facecolor": DARK_PANEL, "edgecolor": DARK_BORDER, "pad": 8},
                 )
             except Exception:
@@ -2066,6 +2121,7 @@ class CandleChart(ttk.Frame):
                     tw.destroy()
                     self._legend_tooltip_win = None
                     self._legend_tooltip_label = None
+            self._schedule_restore_legend_hover()
         except Exception:
             pass
 
@@ -2308,18 +2364,19 @@ class AccountValueChart(ttk.Frame):
 
 
         if not points:
-            self.ax.set_title("Account Value - no data", color=DARK_FG)
+            spinner_char = ["|", "/", "-", "\\"][int(time.time() * 6.0) % 4]
+            self.ax.set_title(f"Account Value - loading {spinner_char}", color=DARK_FG)
             self.last_update_label.config(text="Last: N/A")
             try:
                 self.ax.text(
                     0.5,
                     0.5,
-                    "Waiting for account history...\nStart trading or keep runner active to populate this chart.",
+                    f"{spinner_char}\nLoading account history...",
                     transform=self.ax.transAxes,
                     ha="center",
                     va="center",
-                    color=DARK_MUTED,
-                    fontsize=10,
+                    color=DARK_ACCENT2,
+                    fontsize=12,
                     bbox={"facecolor": DARK_PANEL, "edgecolor": DARK_BORDER, "pad": 8},
                 )
             except Exception:
@@ -4412,25 +4469,6 @@ class PowerTraderHub(tk.Tk):
             style="Compact.TButton",
             command=self._open_onboarding_wizard,
         ).pack(side="right", padx=(8, 0))
-        ttk.Button(
-            right,
-            text="Crypto",
-            style="Compact.TButton",
-            command=lambda: self._select_market_tab("crypto"),
-        ).pack(side="right", padx=(8, 0))
-        ttk.Button(
-            right,
-            text="Stocks",
-            style="Compact.TButton",
-            command=lambda: self._select_market_tab("stocks"),
-        ).pack(side="right", padx=(8, 0))
-        ttk.Button(
-            right,
-            text="Forex",
-            style="Compact.TButton",
-            command=lambda: self._select_market_tab("forex"),
-        ).pack(side="right", padx=(8, 0))
-
         self._set_badge_style(self.lbl_toolbar_state_badge, "RUNTIME: STOPPED", tone="muted")
         self._set_badge_style(self.lbl_toolbar_api_badge, "BROKERS: N/A", tone="muted")
         self._set_badge_style(self.lbl_toolbar_checks_badge, "CHECKS: N/A", tone="muted")
@@ -5454,50 +5492,13 @@ class PowerTraderHub(tk.Tk):
             )
             thinker_data = bundle.get("thinker", {}) if isinstance(bundle.get("thinker", {}), dict) else {}
             focus = self._selected_market_focus_symbol(market_key, thinker_data) or "AUTO"
-            chart_map_raw = thinker_data.get("top_chart_map", {}) if isinstance(thinker_data, dict) else {}
-            chart_map = chart_map_raw if isinstance(chart_map_raw, dict) else {}
-            top_pick = thinker_data.get("top_pick", {}) if isinstance(thinker_data.get("top_pick", {}), dict) else {}
-            top_ident = str(top_pick.get("pair") or top_pick.get("symbol") or "").strip().upper()
-            top_chart: List[Dict[str, Any]] = []
-            chart_source = "top"
-            if focus != "AUTO" and isinstance(chart_map.get(focus, None), list):
-                top_chart = list(chart_map.get(focus, []) or [])
-                chart_source = "focus"
-            elif top_ident and isinstance(chart_map.get(top_ident, None), list):
-                top_chart = list(chart_map.get(top_ident, []) or [])
-                chart_source = "top-map"
-            if not top_chart:
-                top_chart = list(thinker_data.get("top_chart", []) or [])
-                chart_source = "top"
-            if (not top_chart) and chart_map:
-                for bars in chart_map.values():
-                    if isinstance(bars, list) and len(bars) >= 2:
-                        top_chart = list(bars)
-                        chart_source = "fallback-map"
-                        break
-            parsed: List[Dict[str, Any]] = []
-            for p in top_chart[-180:]:
-                if not isinstance(p, dict):
-                    continue
-                try:
-                    c = float(p.get("c", 0.0) or 0.0)
-                except Exception:
-                    c = 0.0
-                if c <= 0.0:
-                    continue
-                try:
-                    o = float(p.get("o", c) or c)
-                except Exception:
-                    o = c
-                try:
-                    h = float(p.get("h", max(o, c)) or max(o, c))
-                except Exception:
-                    h = max(o, c)
-                try:
-                    l = float(p.get("l", min(o, c)) or min(o, c))
-                except Exception:
-                    l = min(o, c)
-                parsed.append({"t": str(p.get("t", "") or ""), "o": o, "h": max(h, o, c), "l": min(l, o, c), "c": c})
+            chart_payload = self._resolve_market_focus_chart_rows(
+                market_key,
+                thinker_data=thinker_data,
+                limit=180,
+            )
+            parsed = list(chart_payload.get("rows", []) or [])
+            chart_source = str(chart_payload.get("source", "") or "live")
             if len(parsed) < 2:
                 messagebox.showinfo("Export", f"No {market_key} chart bars are available to export yet.")
                 return
@@ -6776,7 +6777,8 @@ class PowerTraderHub(tk.Tk):
         for col in watch_cols:
             anchor = "center" if col in {"coin", "status"} else ("e" if col in {"score", "entry", "exit", "gain"} else "w")
             watch_tree.heading(col, text=watch_headings.get(col, col.title()))
-            watch_tree.column(col, anchor=anchor, width=watch_widths.get(col, 120), stretch=True)
+            col_width = int(watch_widths.get(col, 120))
+            watch_tree.column(col, anchor=anchor, width=col_width, minwidth=col_width, stretch=False)
         watch_scroll_y = ttk.Scrollbar(watch_table_wrap, orient="vertical", command=watch_tree.yview)
         watch_scroll_x = ttk.Scrollbar(watch_table_wrap, orient="horizontal", command=watch_tree.xview)
         watch_tree.configure(yscrollcommand=watch_scroll_y.set, xscrollcommand=watch_scroll_x.set)
@@ -7629,15 +7631,10 @@ class PowerTraderHub(tk.Tk):
         charts_top = ttk.Frame(charts_frame)
         charts_top.pack(fill="x", padx=6, pady=(6, 0))
         charts_top_row1 = ttk.Frame(charts_top)
-        charts_top_row1.pack(fill="x")
         charts_top_row2 = ttk.Frame(charts_top)
-        charts_top_row2.pack(fill="x", pady=(6, 0))
-
-        ttk.Label(charts_top_row1, text=f"{market_name} View:").pack(side="left")
-        view_options = ("Overview", "Scanner", "Leaders")
+        view_options = self._market_view_options(market_key)
         market_view_var = tk.StringVar(value="Overview")
         view_tabs = ttk.Frame(charts_top_row1)
-        view_tabs.pack(side="left", padx=(6, 12))
         view_buttons: Dict[str, ttk.Button] = {}
 
         def _set_market_view(view_name: str) -> None:
@@ -7649,16 +7646,23 @@ class PowerTraderHub(tk.Tk):
                     pass
             self._refresh_parallel_market_panels()
 
-        for v in view_options:
-            btn = ttk.Button(
-                view_tabs,
-                text=v,
-                style=("ChartTabSelected.TButton" if v == "Overview" else "ChartTab.TButton"),
-                command=lambda name=v: _set_market_view(name),
-                width=10,
-            )
-            btn.pack(side="left", padx=(0, 4))
-            view_buttons[v] = btn
+        if len(view_options) > 1:
+            charts_top_row1.pack(fill="x")
+            charts_top_row2.pack(fill="x", pady=(6, 0))
+            ttk.Label(charts_top_row1, text=f"{market_name} View:").pack(side="left")
+            view_tabs.pack(side="left", padx=(6, 12))
+            for v in view_options:
+                btn = ttk.Button(
+                    view_tabs,
+                    text=v,
+                    style=("ChartTabSelected.TButton" if v == "Overview" else "ChartTab.TButton"),
+                    command=lambda name=v: _set_market_view(name),
+                    width=10,
+                )
+                btn.pack(side="left", padx=(0, 4))
+                view_buttons[v] = btn
+        else:
+            charts_top_row2.pack(fill="x")
 
         ttk.Label(charts_top_row2, text=subtitle, foreground=DARK_MUTED).pack(side="left")
         top_pick_var = tk.StringVar(value="")
@@ -7701,17 +7705,11 @@ class PowerTraderHub(tk.Tk):
         ).pack(side="left")
         ttk.Button(
             charts_top_row3,
-            text="Open TradingView",
-            style="Accent.TButton",
-            command=lambda mk=market_key: self._open_market_tradingview(mk),
-        ).pack(side="right")
-        ttk.Button(
-            charts_top_row3,
             text="Export PNG",
             style="Compact.TButton",
             command=lambda mk=market_key: self._export_market_chart_png(mk),
         ).pack(side="right", padx=(0, 6))
-        instrument_combo.bind("<<ComboboxSelected>>", lambda _e: self._refresh_parallel_market_panels())
+        instrument_combo.bind("<<ComboboxSelected>>", lambda _e, mk=market_key: self._on_market_focus_changed(mk))
 
         center = ttk.Frame(charts_frame)
         center.pack(fill="both", expand=True, padx=6, pady=6)
@@ -7735,13 +7733,13 @@ class PowerTraderHub(tk.Tk):
             anchor="nw",
             text=(
                 f"{market_name} market overview\n\n"
-                "Scanner and trader run in background loops.\n"
-                "Use tabs to inspect:\n"
-                "• status + account summary\n"
-                "• symbol/pair charts\n"
-                "• ranked scanner output\n"
-                "• leader setups\n"
-                "• current trades + trade history"
+                + "Scanner and trader run in background loops.\n"
+                + ("Use tabs to inspect:\n" if len(view_options) > 1 else "Use the overview to inspect:\n")
+                + "• status + account summary\n"
+                + "• symbol/pair charts\n"
+                + ("• ranked scanner output\n" if "Scanner" in view_options else "")
+                + "• watchlist leaders on account view\n"
+                + "• current trades + trade history"
             ),
             fill=DARK_FG,
             font=(self._live_log_font.cget("family"), max(9, int(self._live_log_font.cget("size")) + 1)),
@@ -7762,6 +7760,59 @@ class PowerTraderHub(tk.Tk):
         chart_table.bind("<Leave>", lambda _e, mk=market_key: self._hide_market_table_tooltip(mk), add="+")
         chart_table.bind("<ButtonRelease-1>", lambda e, mk=market_key: self._on_market_table_column_resize(mk, e), add="+")
         chart_table_wrap.grid_remove()
+
+        watch_box = ttk.LabelFrame(charts_frame, text="Watchlist (On Deck)")
+        watch_header = ttk.Frame(watch_box)
+        watch_header.pack(fill="x", padx=6, pady=(4, 2))
+        watch_meta_var = tk.StringVar(value="No watchlist candidates yet.")
+        ttk.Label(watch_header, textvariable=watch_meta_var, foreground=DARK_MUTED).pack(side="left", fill="x", expand=True)
+        watch_wrap = ttk.Frame(watch_box)
+        watch_wrap.pack(fill="both", expand=True, padx=6, pady=(0, 6))
+        watch_wrap.columnconfigure(0, weight=1)
+        watch_wrap.rowconfigure(0, weight=1)
+        watch_cols = ("rank", "symbol", "side", "score", "status", "why", "logic", "trigger")
+        watch_tree = ttk.Treeview(
+            watch_wrap,
+            columns=watch_cols,
+            show="headings",
+            height=(4 if compact_mode else 5),
+            selectmode="browse",
+        )
+        watch_headings = {
+            "rank": "#",
+            "symbol": ("Pair" if market_key == "forex" else "Symbol"),
+            "side": "Side",
+            "score": "Score",
+            "status": "Status",
+            "why": "Why Not Traded",
+            "logic": "Logic",
+            "trigger": "Trade Trigger",
+        }
+        watch_widths = {"rank": 48, "symbol": 110, "side": 86, "score": 96, "status": 106, "why": 280, "logic": 320, "trigger": 360}
+        for col in watch_cols:
+            anchor = "center" if col in {"rank", "symbol", "side", "status"} else ("e" if col == "score" else "w")
+            watch_tree.heading(col, text=watch_headings.get(col, col.title()))
+            col_width = int(watch_widths.get(col, 120))
+            watch_tree.column(col, anchor=anchor, width=col_width, minwidth=col_width, stretch=False)
+        watch_scroll_y = ttk.Scrollbar(watch_wrap, orient="vertical", command=watch_tree.yview)
+        watch_scroll_x = ttk.Scrollbar(watch_wrap, orient="horizontal", command=watch_tree.xview)
+        watch_tree.configure(yscrollcommand=watch_scroll_y.set, xscrollcommand=watch_scroll_x.set)
+        watch_tree.grid(row=0, column=0, sticky="nsew")
+        watch_scroll_y.grid(row=0, column=1, sticky="ns")
+        watch_scroll_x.grid(row=1, column=0, sticky="ew")
+        try:
+            watch_tree.tag_configure("wl_ready", foreground=DARK_ACCENT)
+            watch_tree.tag_configure("wl_wait", foreground="#FFCC66")
+            watch_tree.tag_configure("wl_even", background=DARK_PANEL)
+            watch_tree.tag_configure("wl_odd", background="#0C1827")
+            watch_tree.tag_configure("wl_placeholder", foreground=DARK_MUTED)
+        except Exception:
+            pass
+        watch_tree.bind("<Double-1>", lambda _e, mk=market_key: self._activate_market_watchlist_selection(mk), add="+")
+        watch_tree.bind("<Return>", lambda _e, mk=market_key: self._activate_market_watchlist_selection(mk), add="+")
+        watch_box.pack(fill="x", padx=6, pady=(0, 6))
+        watch_box.pack_forget()
+
         lower = ttk.Panedwindow(right_split, orient="vertical")
         positions_box = ttk.LabelFrame(lower, text=f"{market_name} Current Trades")
         pos_header = ttk.Frame(positions_box)
@@ -7930,6 +7981,7 @@ class PowerTraderHub(tk.Tk):
             "charts_age_var": charts_age_var,
             "chart_hover_data": {},
             "chart_hover_idx": -1,
+            "chart_hover_refresh_after_id": None,
             "chart_table_tooltips": {},
             "chart_table_note_col_id": "",
             "chart_table_tooltip_key": None,
@@ -7940,6 +7992,10 @@ class PowerTraderHub(tk.Tk):
             "chart_table_headings": {},
             "chart_table_layout_key": "",
             "chart_table_widths": {},
+            "watch_box": watch_box,
+            "watch_tree": watch_tree,
+            "watch_meta_var": watch_meta_var,
+            "watch_rows": [],
             "last_log_sig": None,
             "last_history_sig": None,
             "chip_data": chip_data,
@@ -8824,10 +8880,14 @@ class PowerTraderHub(tk.Tk):
         return os.path.join(base_dir, "account_value_history.jsonl")
 
     def _market_focus_selection(self, market_key: str) -> str:
-        panel = self.market_panels.get(market_key, {})
+        panels = self.__dict__.get("market_panels", {}) or {}
+        panel = panels.get(market_key, {}) if isinstance(panels, dict) else {}
         focus_var = panel.get("instrument_var")
         selected = str((focus_var.get() if focus_var else "ACCOUNT") or "ACCOUNT").strip().upper()
         return selected or "ACCOUNT"
+
+    def _market_view_options(self, market_key: str) -> Tuple[str, ...]:
+        return ("Overview",)
 
     def _market_chart_focus_options(
         self,
@@ -8847,6 +8907,9 @@ class PowerTraderHub(tk.Tk):
             seen.add(key)
             opts.append(key)
 
+        current_focus = self._market_focus_selection(market_key)
+        if current_focus not in {"", "ACCOUNT"}:
+            _add(current_focus)
         for row in list(status.get("raw_positions", []) or []):
             if not isinstance(row, dict):
                 continue
@@ -8860,6 +8923,73 @@ class PowerTraderHub(tk.Tk):
                 continue
             _add(row.get("pair") or row.get("symbol"))
         return opts
+
+    def _market_watchlist_rows(
+        self,
+        market_key: str,
+        thinker_data: Optional[Dict[str, Any]] = None,
+        limit: int = 20,
+    ) -> List[Dict[str, str]]:
+        mk = str(market_key or "").strip().lower()
+        thinker = thinker_data if isinstance(thinker_data, dict) else {}
+        rows: List[Dict[str, str]] = []
+        for idx, row in enumerate(list(thinker.get("leaders", []) or [])[: max(1, int(limit or 20))], start=1):
+            if not isinstance(row, dict):
+                continue
+            ident = str(row.get("pair") or row.get("symbol") or "").strip().upper()
+            if not ident:
+                continue
+            side = str(row.get("side", "watch") or "watch").strip().upper()
+            try:
+                score_txt = f"{float(row.get('score', 0.0)):+.4f}"
+            except Exception:
+                score_txt = str(row.get("score", "N/A") or "N/A")
+            eligible = bool(row.get("eligible_for_entry", False)) and side in {"LONG", "SHORT"}
+            gate_reason = str(row.get("entry_gate_reason", "") or "").strip()
+            note_logic, note_data = self._market_reason_parts(mk, row)
+            why_txt = gate_reason or str(note_data or "").strip()
+            if not why_txt:
+                why_txt = ("Eligible now; waiting for next trader cycle." if eligible else "Waiting for the next qualified setup.")
+            logic_txt = str(note_logic or row.get("reason", "") or "").strip()
+            status_txt = "READY" if eligible else ("ENTRY WAIT" if side in {"LONG", "SHORT"} else side)
+            try:
+                last_price = float(row.get("last", 0.0) or 0.0)
+            except Exception:
+                last_price = 0.0
+            try:
+                calib_prob = float(row.get("calibration_effective_prob", row.get("calib_prob", 0.0)) or 0.0)
+            except Exception:
+                calib_prob = 0.0
+            trigger_bits: List[str] = []
+            if calib_prob > 0.0:
+                trigger_bits.append(f"calib {calib_prob:.2f}")
+            if last_price > 0.0:
+                trigger_bits.append(f"last {_fmt_price(last_price)}")
+            trigger_suffix = f" ({' | '.join(trigger_bits)})" if trigger_bits else ""
+            if eligible:
+                if mk == "stocks":
+                    trigger_txt = f"Trader step can open {side} on the next cycle if {ident} keeps this setup and capacity is available{trigger_suffix}."
+                else:
+                    trigger_txt = f"Trader step can open {side} on the next cycle if {ident} keeps this setup and risk size still fits{trigger_suffix}."
+            elif gate_reason:
+                trigger_txt = gate_reason
+            elif side in {"LONG", "SHORT"}:
+                trigger_txt = f"Needs {side} setup to stay qualified through the next trader cycle{trigger_suffix}."
+            else:
+                trigger_txt = f"Needs scanner promotion from WATCH to a tradable side before entry can start{trigger_suffix}."
+            rows.append(
+                {
+                    "rank": str(idx),
+                    "symbol": ident,
+                    "side": side,
+                    "score": score_txt,
+                    "status": status_txt,
+                    "why": why_txt,
+                    "logic": logic_txt,
+                    "trigger": trigger_txt,
+                }
+            )
+        return rows
 
     def _market_account_value_from_snapshot(
         self,
@@ -9560,6 +9690,60 @@ class PowerTraderHub(tk.Tk):
         except Exception:
             pass
 
+    def _schedule_market_chart_hover_refresh(self, market_key: str) -> None:
+        panel = self.market_panels.get(market_key, {})
+        if not isinstance(panel, dict) or (not panel):
+            return
+        try:
+            after_id = panel.get("chart_hover_refresh_after_id")
+            if after_id:
+                self.after_cancel(after_id)
+        except Exception:
+            pass
+
+        def _run() -> None:
+            try:
+                panel["chart_hover_refresh_after_id"] = None
+            except Exception:
+                pass
+            self._refresh_market_chart_hover(market_key)
+
+        try:
+            panel["chart_hover_refresh_after_id"] = self.after_idle(_run)
+        except Exception:
+            panel["chart_hover_refresh_after_id"] = None
+
+    def _refresh_market_chart_hover(self, market_key: str) -> None:
+        panel = self.market_panels.get(market_key, {})
+        canvas = panel.get("chart_canvas")
+        hover_data = panel.get("chart_hover_data", {})
+        if (not canvas) or (not isinstance(hover_data, dict)) or (not hover_data):
+            self._clear_market_chart_hover(market_key)
+            return
+        try:
+            root_x = int(canvas.winfo_rootx() or 0)
+            root_y = int(canvas.winfo_rooty() or 0)
+            pointer_x = int(canvas.winfo_pointerx() or 0)
+            pointer_y = int(canvas.winfo_pointery() or 0)
+            local_x = int(pointer_x - root_x)
+            local_y = int(pointer_y - root_y)
+            width = int(canvas.winfo_width() or 0)
+            height = int(canvas.winfo_height() or 0)
+            if local_x < 0 or local_y < 0 or local_x > width or local_y > height:
+                self._clear_market_chart_hover(market_key)
+                return
+            self._on_market_chart_hover(
+                market_key,
+                SimpleNamespace(
+                    x=local_x,
+                    y=local_y,
+                    x_root=pointer_x,
+                    y_root=pointer_y,
+                ),
+            )
+        except Exception:
+            self._clear_market_chart_hover(market_key)
+
     def _on_market_chart_hover(self, market_key: str, event: tk.Event) -> None:
         panel = self.market_panels.get(market_key, {})
         canvas = panel.get("chart_canvas")
@@ -10138,6 +10322,127 @@ class PowerTraderHub(tk.Tk):
                 pass
         self._refresh_parallel_market_panels()
 
+    def _on_market_focus_changed(self, market_key: str) -> None:
+        mk = str(market_key or "").strip().lower()
+        panel = self.market_panels.get(mk, {})
+        try:
+            focus_var = panel.get("instrument_var")
+            pending_symbol = str((focus_var.get() if focus_var else "") or "").strip().upper()
+            if pending_symbol and pending_symbol != "ACCOUNT":
+                panel["focus_loading_symbol"] = pending_symbol
+                panel["focus_loading_until"] = float(time.time()) + 30.0
+            else:
+                panel["focus_loading_symbol"] = ""
+                panel["focus_loading_until"] = 0.0
+        except Exception:
+            pass
+        self._refresh_parallel_market_panels()
+
+    def _refresh_market_watchlist_overview(
+        self,
+        market_key: str,
+        thinker_data: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        panel = self.market_panels.get(market_key, {})
+        tree = panel.get("watch_tree")
+        meta_var = panel.get("watch_meta_var")
+        if tree is None or meta_var is None:
+            return
+        rows = self._market_watchlist_rows(market_key, thinker_data=thinker_data, limit=20)
+        panel["watch_rows"] = list(rows)
+        thinker = thinker_data if isinstance(thinker_data, dict) else {}
+        updated_at = thinker.get("updated_at")
+        updated_txt = ""
+        try:
+            if updated_at:
+                updated_txt = time.strftime("%H:%M:%S", time.localtime(float(updated_at)))
+        except Exception:
+            updated_txt = ""
+        try:
+            meta_var.set(
+                (
+                    f"Leaders {len(rows)}"
+                    + (f" | updated {updated_txt}" if updated_txt else "")
+                    + (" | double-click a row to focus the chart" if rows else "")
+                )
+                if rows
+                else "No watchlist candidates yet."
+            )
+        except Exception:
+            pass
+        try:
+            for iid in tree.get_children():
+                tree.delete(iid)
+            if not rows:
+                tree.insert(
+                    "",
+                    "end",
+                    values=("--", "--", "--", "--", "WAIT", "No leaders ranked yet.", "Waiting for the next ranked setup.", "Trader step will react once a setup becomes tradable."),
+                    tags=("wl_placeholder", "wl_even"),
+                )
+                return
+            for idx, row in enumerate(rows):
+                tags = ["wl_even" if (idx % 2) == 0 else "wl_odd"]
+                status_txt = str(row.get("status", "WAIT") or "WAIT").strip().upper()
+                tags.append("wl_ready" if status_txt == "READY" else "wl_wait")
+                tree.insert(
+                    "",
+                    "end",
+                    values=(
+                        row.get("rank", ""),
+                        row.get("symbol", ""),
+                        row.get("side", ""),
+                        row.get("score", ""),
+                        row.get("status", ""),
+                        row.get("why", ""),
+                        row.get("logic", ""),
+                        row.get("trigger", ""),
+                    ),
+                    tags=tuple(tags),
+                )
+        except Exception:
+            pass
+
+    def _refresh_market_watchlist_visibility(self, market_key: str) -> None:
+        panel = self.market_panels.get(market_key, {})
+        box = panel.get("watch_box")
+        if box is None:
+            return
+        focus_selection = self._market_focus_selection(market_key)
+        view_var = panel.get("market_view_var")
+        view_name = str((view_var.get() if view_var else "Overview") or "Overview").strip() or "Overview"
+        should_show = (view_name == "Overview") and (focus_selection == "ACCOUNT")
+        try:
+            is_visible = bool(box.winfo_manager())
+        except Exception:
+            is_visible = True
+        try:
+            if should_show and (not is_visible):
+                box.pack(fill="x", padx=6, pady=(0, 6))
+            elif (not should_show) and is_visible:
+                box.pack_forget()
+        except Exception:
+            pass
+
+    def _activate_market_watchlist_selection(self, market_key: str) -> None:
+        panel = self.market_panels.get(market_key, {})
+        tree = panel.get("watch_tree")
+        focus_var = panel.get("instrument_var")
+        if tree is None or focus_var is None:
+            return
+        try:
+            selection = tree.selection()
+            if not selection:
+                return
+            values = tree.item(selection[0], "values") or ()
+            ident = str(values[1] if len(values) > 1 else "").strip().upper()
+            if not ident or ident == "--":
+                return
+            focus_var.set(ident)
+        except Exception:
+            return
+        self._on_market_focus_changed(market_key)
+
     def _set_market_positions(
         self,
         market_key: str,
@@ -10494,7 +10799,8 @@ class PowerTraderHub(tk.Tk):
             pass
 
     def _selected_market_focus_symbol(self, market_key: str, thinker_data: Optional[Dict[str, Any]] = None) -> str:
-        panel = self.market_panels.get(market_key, {})
+        panels = self.__dict__.get("market_panels", {}) or {}
+        panel = panels.get(market_key, {}) if isinstance(panels, dict) else {}
         focus_var = panel.get("instrument_var")
         selected = str((focus_var.get() if focus_var else "ACCOUNT") or "ACCOUNT").strip().upper()
         if selected in {"ACCOUNT", ""}:
@@ -10514,6 +10820,167 @@ class PowerTraderHub(tk.Tk):
                 if ident:
                     return ident
         return ""
+
+    def _parse_market_chart_rows(self, bars: Any, *, limit: int = 140) -> List[Dict[str, Any]]:
+        parsed: List[Dict[str, Any]] = []
+        try:
+            rows = list(bars or [])
+        except Exception:
+            rows = []
+        for row in rows[-max(2, int(limit or 140)):]:
+            if not isinstance(row, dict):
+                continue
+            try:
+                close_v = float(row.get("c", 0.0) or 0.0)
+            except Exception:
+                close_v = 0.0
+            if close_v <= 0.0 or (not math.isfinite(close_v)):
+                continue
+            try:
+                open_v = float(row.get("o", close_v) or close_v)
+            except Exception:
+                open_v = close_v
+            try:
+                high_v = float(row.get("h", max(open_v, close_v)) or max(open_v, close_v))
+            except Exception:
+                high_v = max(open_v, close_v)
+            try:
+                low_v = float(row.get("l", min(open_v, close_v)) or min(open_v, close_v))
+            except Exception:
+                low_v = min(open_v, close_v)
+            if (not math.isfinite(open_v)) or (not math.isfinite(high_v)) or (not math.isfinite(low_v)):
+                continue
+            parsed.append(
+                {
+                    "t": str(row.get("t", "") or ""),
+                    "o": open_v,
+                    "h": max(high_v, open_v, close_v),
+                    "l": min(low_v, open_v, close_v),
+                    "c": close_v,
+                }
+            )
+        return parsed
+
+    def _cache_market_chart_rows(
+        self,
+        market_key: str,
+        focus_symbol: str,
+        parsed_rows: List[Dict[str, Any]],
+        *,
+        source: str = "",
+    ) -> None:
+        mk = str(market_key or "").strip().lower()
+        ident = str(focus_symbol or "").strip().upper()
+        rows = list(parsed_rows or [])
+        if (not mk) or (not ident) or len(rows) < 2:
+            return
+        bucket = self._market_line_caches.get(mk, {})
+        if not isinstance(bucket, dict):
+            bucket = {}
+        bucket[ident] = {
+            "rows": [dict(row) for row in rows],
+            "source": str(source or "").strip(),
+            "cached_at": float(time.time()),
+        }
+        self._market_line_caches[mk] = bucket
+
+    def _cached_market_chart_rows(self, market_key: str, focus_symbol: str) -> Tuple[List[Dict[str, Any]], str]:
+        mk = str(market_key or "").strip().lower()
+        ident = str(focus_symbol or "").strip().upper()
+        if (not mk) or (not ident):
+            return [], ""
+        bucket = self._market_line_caches.get(mk, {})
+        if not isinstance(bucket, dict):
+            return [], ""
+        entry = bucket.get(ident, {})
+        if not isinstance(entry, dict):
+            return [], ""
+        rows = list(entry.get("rows", []) or [])
+        if len(rows) < 2:
+            return [], ""
+        return [dict(row) for row in rows], str(entry.get("source", "") or "").strip()
+
+    def _resolve_market_focus_chart_rows(
+        self,
+        market_key: str,
+        *,
+        thinker_data: Optional[Dict[str, Any]] = None,
+        limit: int = 140,
+    ) -> Dict[str, Any]:
+        mk = str(market_key or "").strip().lower()
+        thinker = thinker_data if isinstance(thinker_data, dict) else {}
+        chart_map_raw = thinker.get("top_chart_map", {}) if isinstance(thinker.get("top_chart_map", {}), dict) else {}
+        chart_map = chart_map_raw if isinstance(chart_map_raw, dict) else {}
+        top_pick = thinker.get("top_pick", {}) if isinstance(thinker.get("top_pick", {}), dict) else {}
+        top_ident = str(top_pick.get("pair") or top_pick.get("symbol") or "").strip().upper()
+        focus_ident = self._selected_market_focus_symbol(mk, thinker)
+        raw_bars: List[Dict[str, Any]] = []
+        chart_source = ""
+
+        if focus_ident:
+            focus_rows = chart_map.get(focus_ident, None)
+            if isinstance(focus_rows, list) and focus_rows:
+                raw_bars = list(focus_rows)
+                chart_source = "focus"
+            elif top_ident and focus_ident == top_ident:
+                top_rows = thinker.get("top_chart", [])
+                if isinstance(top_rows, list) and top_rows:
+                    raw_bars = list(top_rows)
+                    chart_source = "top"
+        else:
+            if top_ident:
+                top_rows = chart_map.get(top_ident, None)
+                if isinstance(top_rows, list) and top_rows:
+                    raw_bars = list(top_rows)
+                    chart_source = "top-map"
+            if (not raw_bars) and isinstance(thinker.get("top_chart", []), list):
+                top_rows = list(thinker.get("top_chart", []) or [])
+                if top_rows:
+                    raw_bars = top_rows
+                    chart_source = "top"
+            if (not raw_bars) and chart_map:
+                for ident, bars in chart_map.items():
+                    if not isinstance(bars, list) or len(bars) < 2:
+                        continue
+                    raw_bars = list(bars)
+                    chart_source = f"map:{str(ident or '').strip().upper() or 'unknown'}"
+                    break
+
+        parsed = self._parse_market_chart_rows(raw_bars, limit=limit)
+        selected_ident = focus_ident or top_ident
+        if len(parsed) >= 2 and selected_ident:
+            self._cache_market_chart_rows(mk, selected_ident, parsed, source=chart_source)
+        if len(parsed) >= 2:
+            return {
+                "rows": parsed,
+                "source": chart_source or "live",
+                "focus_symbol": selected_ident,
+                "from_cache": False,
+                "chart_map": chart_map,
+                "top_ident": top_ident,
+            }
+
+        cached_rows: List[Dict[str, Any]] = []
+        cached_source = ""
+        if selected_ident:
+            cached_rows, cached_source = self._cached_market_chart_rows(mk, selected_ident)
+        if len(cached_rows) >= 2:
+            return {
+                "rows": cached_rows,
+                "source": (f"{cached_source}:cache" if cached_source else "cache"),
+                "focus_symbol": selected_ident,
+                "from_cache": True,
+                "chart_map": chart_map,
+                "top_ident": top_ident,
+            }
+        return {
+            "rows": [],
+            "source": chart_source,
+            "focus_symbol": selected_ident,
+            "from_cache": False,
+            "chart_map": chart_map,
+            "top_ident": top_ident,
+        }
 
     def _reset_market_chart_focus(self, market_key: str) -> None:
         panel = self.market_panels.get(market_key, {})
@@ -10537,21 +11004,6 @@ class PowerTraderHub(tk.Tk):
                     pass
         try:
             self._refresh_parallel_market_panels()
-        except Exception:
-            pass
-
-    def _open_market_tradingview(self, market_key: str) -> None:
-        try:
-            import webbrowser
-
-            sym = self._selected_market_focus_symbol(market_key)
-            if not sym:
-                return
-            if market_key == "forex":
-                tv_sym = f"OANDA:{sym.replace('_', '')}"
-            else:
-                tv_sym = sym
-            webbrowser.open(f"https://www.tradingview.com/chart/?symbol={tv_sym}")
         except Exception:
             pass
 
@@ -10633,11 +11085,43 @@ class PowerTraderHub(tk.Tk):
             font=(self._live_log_font.cget("family"), max(8, int(self._live_log_font.cget("size")))),
         )
         if not points:
+            spin_cx = width / 2.0
+            spin_cy = max(104.0, height / 2.0)
+            spin_r = 18
+            spin_phase = int(time.time() * 5.0) % 360
+            canvas.create_oval(
+                spin_cx - spin_r,
+                spin_cy - spin_r,
+                spin_cx + spin_r,
+                spin_cy + spin_r,
+                outline=DARK_BORDER,
+                width=2,
+            )
+            canvas.create_arc(
+                spin_cx - spin_r,
+                spin_cy - spin_r,
+                spin_cx + spin_r,
+                spin_cy + spin_r,
+                start=spin_phase,
+                extent=110,
+                style="arc",
+                outline=DARK_ACCENT2,
+                width=3,
+            )
+            spinner_char = ["|", "/", "-", "\\"][int(time.time() * 6.0) % 4]
+            canvas.create_text(
+                spin_cx,
+                spin_cy,
+                anchor="center",
+                text=spinner_char,
+                fill=DARK_ACCENT2,
+                font=(self._live_log_font.cget("family"), max(10, int(self._live_log_font.cget("size")) + 1), "bold"),
+            )
             canvas.create_text(
                 width / 2.0,
-                max(84, height / 2.0),
+                spin_cy + 34,
                 anchor="center",
-                text="Waiting for market account history...\nKeep the market runtime running to populate the ACCOUNT chart.",
+                text="Loading account history...",
                 fill=DARK_MUTED,
                 font=(self._live_log_font.cget("family"), max(9, int(self._live_log_font.cget("size")))),
             )
@@ -11196,6 +11680,7 @@ class PowerTraderHub(tk.Tk):
                     status_data=status_data,
                     trader_data=trader_data,
                 )
+                self._schedule_market_chart_hover_refresh(market_key)
                 return
             title = f"{panel.get('market_name', market_key.title())} Trade View"
             overview_payload = self._market_chart_overview_payload(
@@ -11221,64 +11706,16 @@ class PowerTraderHub(tk.Tk):
                 body_lines.append(f"Current strongest candidate: {ident}")
 
         try:
-            chart_map_raw = thinker_data.get("top_chart_map", {}) if isinstance(thinker_data, dict) else {}
-            chart_map = chart_map_raw if isinstance(chart_map_raw, dict) else {}
-            top_chart = []
-            chart_source = "top"
-            top_ident = ""
-            if isinstance(top_pick, dict):
-                top_ident = str(top_pick.get("pair") or top_pick.get("symbol") or "").strip().upper()
-            focus_ident = self._selected_market_focus_symbol(market_key, thinker_data)
-            if focus_ident and isinstance(chart_map.get(focus_ident, None), list):
-                top_chart = list(chart_map.get(focus_ident, []) or [])
-                chart_source = "focus"
-            elif top_ident and isinstance(chart_map.get(top_ident, None), list):
-                top_chart = list(chart_map.get(top_ident, []) or [])
-                chart_source = "top-map"
-            if not top_chart:
-                top_chart = list(thinker_data.get("top_chart", []) or [])
-                chart_source = "top"
-            if (not top_chart) and chart_map:
-                for v in chart_map.values():
-                    if isinstance(v, list) and len(v) >= 2:
-                        top_chart = list(v)
-                        chart_source = "fallback-map"
-                        break
-            parsed: List[Dict[str, Any]] = []
-            for p in top_chart[-140:]:
-                if not isinstance(p, dict):
-                    continue
-                try:
-                    c = float(p.get("c", 0.0) or 0.0)
-                except Exception:
-                    c = 0.0
-                if c <= 0.0:
-                    continue
-                try:
-                    o = float(p.get("o", c) or c)
-                except Exception:
-                    o = c
-                try:
-                    h = float(p.get("h", max(o, c)) or max(o, c))
-                except Exception:
-                    h = max(o, c)
-                try:
-                    l = float(p.get("l", min(o, c)) or min(o, c))
-                except Exception:
-                    l = min(o, c)
-                if h <= 0.0:
-                    h = max(o, c)
-                if l <= 0.0:
-                    l = min(o, c)
-                parsed.append(
-                    {
-                        "t": str(p.get("t", "") or ""),
-                        "o": o,
-                        "h": max(h, o, c),
-                        "l": min(l, o, c),
-                        "c": c,
-                    }
-                )
+            chart_payload = self._resolve_market_focus_chart_rows(
+                market_key,
+                thinker_data=thinker_data,
+                limit=140,
+            )
+            chart_map = chart_payload.get("chart_map", {}) if isinstance(chart_payload.get("chart_map", {}), dict) else {}
+            top_ident = str(chart_payload.get("top_ident", "") or "").strip().upper()
+            parsed = list(chart_payload.get("rows", []) or [])
+            chart_source = str(chart_payload.get("source", "") or "live")
+            used_cached_chart = bool(chart_payload.get("from_cache", False))
 
             def _fmt_px(v: float) -> str:
                 av = abs(float(v))
@@ -11545,6 +11982,9 @@ class PowerTraderHub(tk.Tk):
                     }
                     trend_color = DARK_ACCENT if delta_pct >= 0 else "#FF6B57"
                     focus_display = self._selected_market_focus_symbol(market_key, thinker_data) or "AUTO"
+                    if focus_display and (focus_display != "AUTO"):
+                        panel["focus_loading_symbol"] = ""
+                        panel["focus_loading_until"] = 0.0
                     canvas.create_text(
                         plot_left,
                         plot_top - 2,
@@ -11581,6 +12021,23 @@ class PowerTraderHub(tk.Tk):
                 msg_lower = str(thinker_data.get("msg", "") or "").strip().lower()
                 thinker_state = str(thinker_data.get("state", "") or "").strip().lower()
                 has_cached_chart = bool(isinstance(chart_map, dict) and chart_map)
+                pending_symbol = str(panel.get("focus_loading_symbol", "") or "").strip().upper()
+                try:
+                    pending_until = float(panel.get("focus_loading_until", 0.0) or 0.0)
+                except Exception:
+                    pending_until = 0.0
+                explicit_focus_pending = bool(
+                    focus_symbol
+                    and focus_symbol not in {"AUTO", "ACCOUNT"}
+                    and pending_symbol == focus_symbol
+                    and pending_until > float(time.time())
+                )
+                selected_chart_missing = bool(
+                    focus_symbol
+                    and focus_symbol not in {"AUTO", "ACCOUNT"}
+                    and focus_symbol != top_ident
+                    and (not isinstance(chart_map.get(focus_symbol, None), list))
+                )
                 likely_loading = bool(
                     busy_scan
                     or ("starting scan" in msg_lower)
@@ -11588,6 +12045,7 @@ class PowerTraderHub(tk.Tk):
                     or (warmup_pending > 0 and updated_age_s <= 240)
                     or (thinker_state in {"starting", "running", "scanning", "hydrating"})
                     or ((not has_cached_chart) and updated_age_s <= 35)
+                    or (selected_chart_missing and (explicit_focus_pending or updated_age_s <= 45))
                 )
 
                 if likely_loading:
@@ -11640,6 +12098,7 @@ class PowerTraderHub(tk.Tk):
                             f"Hydrating bars for {focus_symbol}.\n"
                             f"Scanner status: {'running' if busy_scan else 'waiting for bars'}."
                             + (f"\nWarmup queue: {warmup_pending} symbols." if warmup_pending > 0 else "")
+                            + ("\nKeeping the selected symbol pinned until its bars arrive." if explicit_focus_pending else "")
                             + (f"\nCached chart symbols: {len(chart_map)}." if isinstance(chart_map, dict) and chart_map else "")
                         ),
                         fill=DARK_MUTED,
@@ -11658,6 +12117,11 @@ class PowerTraderHub(tk.Tk):
                         f"No hydrated candles for {focus_symbol}.\n"
                         "Run scan/hydrate to download chart data, then review Scanner for eligibility reasons."
                     )
+                    if used_cached_chart:
+                        no_data_msg = (
+                            f"Showing the last cached bars for {focus_symbol} while fresh bars hydrate.\n"
+                            "Run scan/hydrate if you want to force an immediate refresh."
+                        )
                     extra_msg = str(thinker_data.get("msg", "") or "").strip()
                     if extra_msg:
                         no_data_msg += f"\nStatus: {extra_msg}"
@@ -11693,23 +12157,27 @@ class PowerTraderHub(tk.Tk):
                     canvas.create_text((scan_x1 + scan_x2) / 2.0, btn_y + 15, text="Run Scan", fill=DARK_ACCENT, tags=(scan_tag,))
                     canvas.create_rectangle(hyd_x1, btn_y, hyd_x2, btn_y + btn_h, fill=DARK_BG2, outline=DARK_ACCENT2, tags=(hydrate_tag,))
                     canvas.create_text((hyd_x1 + hyd_x2) / 2.0, btn_y + 15, text="Download/Hydrate", fill=DARK_ACCENT2, tags=(hydrate_tag,))
+                    show_scanner_button = ("Scanner" in self._market_view_options(market_key))
                     sc_y1 = btn_y + btn_h + 8
                     sc_y2 = sc_y1 + btn_h
                     sc_x1 = btn_x
                     sc_x2 = min(panel_right - 10, sc_x1 + 156)
-                    canvas.create_rectangle(sc_x1, sc_y1, sc_x2, sc_y2, fill=DARK_BG2, outline="#7EC8FF", tags=(scanner_tag,))
-                    canvas.create_text((sc_x1 + sc_x2) / 2.0, sc_y1 + 15, text="Open Scanner", fill="#7EC8FF", tags=(scanner_tag,))
+                    if show_scanner_button:
+                        canvas.create_rectangle(sc_x1, sc_y1, sc_x2, sc_y2, fill=DARK_BG2, outline="#7EC8FF", tags=(scanner_tag,))
+                        canvas.create_text((sc_x1 + sc_x2) / 2.0, sc_y1 + 15, text="Open Scanner", fill="#7EC8FF", tags=(scanner_tag,))
                     canvas.tag_bind(scan_tag, "<Button-1>", lambda _e, mk=market_key: self._run_market_thinker_scan(mk, force=True, min_interval_s=0.0))
                     canvas.tag_bind(hydrate_tag, "<Button-1>", lambda _e, mk=market_key: self._request_market_chart_hydrate(mk))
-                    canvas.tag_bind(scanner_tag, "<Button-1>", lambda _e, mk=market_key: self._switch_market_view(mk, "Scanner"))
                     canvas.tag_bind(scan_tag, "<Enter>", lambda _e, cv=canvas: cv.configure(cursor="hand2"))
                     canvas.tag_bind(scan_tag, "<Leave>", lambda _e, cv=canvas: cv.configure(cursor=""))
                     canvas.tag_bind(hydrate_tag, "<Enter>", lambda _e, cv=canvas: cv.configure(cursor="hand2"))
                     canvas.tag_bind(hydrate_tag, "<Leave>", lambda _e, cv=canvas: cv.configure(cursor=""))
-                    canvas.tag_bind(scanner_tag, "<Enter>", lambda _e, cv=canvas: cv.configure(cursor="hand2"))
-                    canvas.tag_bind(scanner_tag, "<Leave>", lambda _e, cv=canvas: cv.configure(cursor=""))
+                    if show_scanner_button:
+                        canvas.tag_bind(scanner_tag, "<Button-1>", lambda _e, mk=market_key: self._switch_market_view(mk, "Scanner"))
+                        canvas.tag_bind(scanner_tag, "<Enter>", lambda _e, cv=canvas: cv.configure(cursor="hand2"))
+                        canvas.tag_bind(scanner_tag, "<Leave>", lambda _e, cv=canvas: cv.configure(cursor=""))
         except Exception:
             pass
+        self._schedule_market_chart_hover_refresh(market_key)
 
     def _market_settings_snapshot(self, market_key: str) -> Dict[str, Any]:
         alpaca_key, alpaca_secret = get_alpaca_creds(self.settings, base_dir=self.project_dir)
@@ -12039,18 +12507,26 @@ class PowerTraderHub(tk.Tk):
             except Exception:
                 pass
             try:
+                allowed_views = self._market_view_options(market_key)
                 view_name = str((panel.get("market_view_var").get() if panel.get("market_view_var") else "Overview") or "Overview")
+                if view_name not in allowed_views:
+                    view_name = "Overview"
+                    if panel.get("market_view_var") is not None:
+                        panel["market_view_var"].set(view_name)
                 view_hints = {
                     "Overview": "Overview: account/trade focus chart with benchmarks and current-trade context.",
                     "Scanner": "Scanner: full ranked universe with eligibility gates and reject context. Click a column title to sort.",
-                    "Leaders": "Leaders: top-ranked symbols/pairs with logic-first reasons. Hover Reason to view raw metrics.",
                 }
                 vh = panel.get("market_view_hint_var")
                 if isinstance(vh, tk.StringVar):
                     vh.set(view_hints.get(view_name, "Use tabs to inspect scanner output, leaders, and the focus chart."))
             except Exception:
                 pass
-
+            try:
+                self._refresh_market_watchlist_overview(market_key, thinker_data=thinker_data)
+                self._refresh_market_watchlist_visibility(market_key)
+            except Exception:
+                pass
             action_hint = ""
             auto_scan_on = bool((panel.get("auto_scan_var").get() if panel.get("auto_scan_var") else True))
             auto_step_on = bool((panel.get("auto_step_var").get() if panel.get("auto_step_var") else True))
@@ -12612,7 +13088,11 @@ class PowerTraderHub(tk.Tk):
                             focus_var.set("ACCOUNT")
                 except Exception:
                     pass
-
+                try:
+                    self._refresh_market_watchlist_overview(market_key, thinker_data=thinker_data)
+                    self._refresh_market_watchlist_visibility(market_key)
+                except Exception:
+                    pass
                 pvars = panel.get("portfolio_vars", {})
                 if isinstance(pvars, dict):
                     portfolio_snapshot = self._market_portfolio_snapshot(
