@@ -12,6 +12,7 @@ SANITIZER_DEFAULTS: Dict[str, Any] = {
     "market_rollout_stage": "live_guarded",
     "alpaca_paper_mode": False,
     "oanda_practice_mode": False,
+    "profile_manual_overrides": [],
     "settings_control_mode": "self_managed",
     "settings_profile": "balanced",
     "ui_role_mode": "basic",
@@ -777,6 +778,15 @@ def sanitize_settings(raw: Dict[str, Any] | None, defaults: Dict[str, Any] | Non
 
     out["coins"] = _sanitize_coins(out.get("coins"), base.get("coins", []))
     out["dca_levels"] = _sanitize_dca_levels(out.get("dca_levels"), base.get("dca_levels", [-2.5, -5.0, -10.0, -20.0]))
+    raw_overrides = out.get("profile_manual_overrides", base.get("profile_manual_overrides", []))
+    if isinstance(raw_overrides, str):
+        overrides_seq = [p.strip() for p in raw_overrides.split(",") if p.strip()]
+    elif isinstance(raw_overrides, (list, tuple, set)):
+        overrides_seq = [str(p).strip() for p in raw_overrides if str(p).strip()]
+    else:
+        overrides_seq = []
+    allowed_overrides = {"stock_max_open_positions", "forex_max_open_positions"}
+    out["profile_manual_overrides"] = sorted({k for k in overrides_seq if k in allowed_overrides})
 
     for key in _BOOL_KEYS:
         out[key] = _as_bool(out.get(key), bool(base.get(key, False)))
