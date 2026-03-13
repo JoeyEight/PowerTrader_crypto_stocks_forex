@@ -6069,7 +6069,11 @@ class PowerTraderHub(tk.Tk):
         self.crypto_watchlist_box = None
         self.lbl_crypto_watchlist_meta = None
         self.crypto_watchlist_tree = None
+        self.crypto_watchlist_canvas = None
         self.crypto_watchlist_cols: Tuple[str, ...] = ()
+        self._crypto_watchlist_rows: List[Dict[str, Any]] = []
+        self._crypto_watchlist_selected_idx: int = -1
+        self._crypto_watchlist_row_regions: List[Dict[str, Any]] = []
 
         chart_legend_header = ttk.Frame(controls_left)
         chart_legend_header.pack(fill="x", padx=6, pady=(0, 0))
@@ -6767,34 +6771,26 @@ class PowerTraderHub(tk.Tk):
             "logic": 320,
             "trigger": 320,
         }
-        watch_tree = ttk.Treeview(
+        watch_canvas = tk.Canvas(
             watch_table_wrap,
-            columns=watch_cols,
-            show="headings",
-            selectmode="browse",
-            height=7,
+            background=DARK_PANEL2,
+            highlightthickness=0,
+            bd=0,
         )
-        for col in watch_cols:
-            anchor = "center" if col in {"coin", "status"} else ("e" if col in {"score", "entry", "exit", "gain"} else "w")
-            watch_tree.heading(col, text=watch_headings.get(col, col.title()))
-            col_width = int(watch_widths.get(col, 120))
-            watch_tree.column(col, anchor=anchor, width=col_width, minwidth=col_width, stretch=False)
-        watch_scroll_y = ttk.Scrollbar(watch_table_wrap, orient="vertical", command=watch_tree.yview)
-        watch_scroll_x = ttk.Scrollbar(watch_table_wrap, orient="horizontal", command=watch_tree.xview)
-        watch_tree.configure(yscrollcommand=watch_scroll_y.set, xscrollcommand=watch_scroll_x.set)
-        watch_tree.grid(row=0, column=0, sticky="nsew")
+        watch_scroll_y = ttk.Scrollbar(watch_table_wrap, orient="vertical", command=watch_canvas.yview)
+        watch_scroll_x = ttk.Scrollbar(watch_table_wrap, orient="horizontal", command=watch_canvas.xview)
+        watch_canvas.configure(yscrollcommand=watch_scroll_y.set, xscrollcommand=watch_scroll_x.set)
+        watch_canvas.grid(row=0, column=0, sticky="nsew")
         watch_scroll_y.grid(row=0, column=1, sticky="ns")
         watch_scroll_x.grid(row=1, column=0, sticky="ew")
-        try:
-            watch_tree.tag_configure("wl_ready", foreground=DARK_ACCENT)
-            watch_tree.tag_configure("wl_wait", foreground="#FFCC66")
-            watch_tree.tag_configure("wl_even", background=DARK_PANEL)
-            watch_tree.tag_configure("wl_odd", background="#0C1827")
-            watch_tree.tag_configure("wl_placeholder", foreground=DARK_MUTED)
-        except Exception:
-            pass
-        self.crypto_watchlist_tree = watch_tree
+        watch_canvas.bind("<Configure>", lambda _e: self.after_idle(self._draw_crypto_watchlist_table), add="+")
+        watch_canvas.bind("<Button-1>", self._on_crypto_watchlist_click, add="+")
+        watch_canvas.bind("<Double-Button-1>", self._activate_crypto_watchlist_selection, add="+")
+        self.crypto_watchlist_tree = None
+        self.crypto_watchlist_canvas = watch_canvas
         self.crypto_watchlist_cols = watch_cols
+        self._crypto_watchlist_headings = watch_headings
+        self._crypto_watchlist_widths = watch_widths
 
         chart_watch_split.add(watch_box, weight=2)
         try:
@@ -7771,13 +7767,6 @@ class PowerTraderHub(tk.Tk):
         watch_wrap.columnconfigure(0, weight=1)
         watch_wrap.rowconfigure(0, weight=1)
         watch_cols = ("rank", "symbol", "side", "score", "status", "why", "logic", "trigger")
-        watch_tree = ttk.Treeview(
-            watch_wrap,
-            columns=watch_cols,
-            show="headings",
-            height=(4 if compact_mode else 5),
-            selectmode="browse",
-        )
         watch_headings = {
             "rank": "#",
             "symbol": ("Pair" if market_key == "forex" else "Symbol"),
@@ -7789,27 +7778,21 @@ class PowerTraderHub(tk.Tk):
             "trigger": "Trade Trigger",
         }
         watch_widths = {"rank": 48, "symbol": 110, "side": 86, "score": 96, "status": 106, "why": 280, "logic": 320, "trigger": 360}
-        for col in watch_cols:
-            anchor = "center" if col in {"rank", "symbol", "side", "status"} else ("e" if col == "score" else "w")
-            watch_tree.heading(col, text=watch_headings.get(col, col.title()))
-            col_width = int(watch_widths.get(col, 120))
-            watch_tree.column(col, anchor=anchor, width=col_width, minwidth=col_width, stretch=False)
-        watch_scroll_y = ttk.Scrollbar(watch_wrap, orient="vertical", command=watch_tree.yview)
-        watch_scroll_x = ttk.Scrollbar(watch_wrap, orient="horizontal", command=watch_tree.xview)
-        watch_tree.configure(yscrollcommand=watch_scroll_y.set, xscrollcommand=watch_scroll_x.set)
-        watch_tree.grid(row=0, column=0, sticky="nsew")
+        watch_canvas = tk.Canvas(
+            watch_wrap,
+            background=DARK_PANEL2,
+            highlightthickness=0,
+            bd=0,
+        )
+        watch_scroll_y = ttk.Scrollbar(watch_wrap, orient="vertical", command=watch_canvas.yview)
+        watch_scroll_x = ttk.Scrollbar(watch_wrap, orient="horizontal", command=watch_canvas.xview)
+        watch_canvas.configure(yscrollcommand=watch_scroll_y.set, xscrollcommand=watch_scroll_x.set)
+        watch_canvas.grid(row=0, column=0, sticky="nsew")
         watch_scroll_y.grid(row=0, column=1, sticky="ns")
         watch_scroll_x.grid(row=1, column=0, sticky="ew")
-        try:
-            watch_tree.tag_configure("wl_ready", foreground=DARK_ACCENT)
-            watch_tree.tag_configure("wl_wait", foreground="#FFCC66")
-            watch_tree.tag_configure("wl_even", background=DARK_PANEL)
-            watch_tree.tag_configure("wl_odd", background="#0C1827")
-            watch_tree.tag_configure("wl_placeholder", foreground=DARK_MUTED)
-        except Exception:
-            pass
-        watch_tree.bind("<Double-1>", lambda _e, mk=market_key: self._activate_market_watchlist_selection(mk), add="+")
-        watch_tree.bind("<Return>", lambda _e, mk=market_key: self._activate_market_watchlist_selection(mk), add="+")
+        watch_canvas.bind("<Configure>", lambda _e, mk=market_key: self._draw_market_watchlist_table(mk), add="+")
+        watch_canvas.bind("<Button-1>", lambda e, mk=market_key: self._on_market_watchlist_click(mk, e), add="+")
+        watch_canvas.bind("<Double-Button-1>", lambda e, mk=market_key: self._activate_market_watchlist_selection(mk, event=e), add="+")
         watch_box.pack(fill="x", padx=6, pady=(0, 6))
         watch_box.pack_forget()
 
@@ -7993,9 +7976,15 @@ class PowerTraderHub(tk.Tk):
             "chart_table_layout_key": "",
             "chart_table_widths": {},
             "watch_box": watch_box,
-            "watch_tree": watch_tree,
+            "watch_tree": None,
+            "watch_canvas": watch_canvas,
             "watch_meta_var": watch_meta_var,
             "watch_rows": [],
+            "watch_columns": watch_cols,
+            "watch_headings": watch_headings,
+            "watch_widths": watch_widths,
+            "watch_selected_idx": -1,
+            "watch_row_regions": [],
             "last_log_sig": None,
             "last_history_sig": None,
             "chip_data": chip_data,
@@ -8731,6 +8720,254 @@ class PowerTraderHub(tk.Tk):
             "financing",
         } else "normal"
         return ("TkDefaultFont", 10, weight)
+
+    def _measure_table_text_px(self, text: Any, font_spec: Tuple[str, int, str]) -> int:
+        txt = " ".join(str(text or "").split())
+        if not txt:
+            return 0
+        try:
+            return int(tkfont.Font(font=font_spec).measure(txt))
+        except Exception:
+            return max(0, len(txt) * 7)
+
+    def _wrap_table_text(self, text: Any, max_width_px: int, font_spec: Tuple[str, int, str]) -> str:
+        raw = str(text or "").strip()
+        if (not raw) or max_width_px <= 24:
+            return raw
+        out_lines: List[str] = []
+        for source_line in raw.splitlines() or [""]:
+            line = str(source_line or "").strip()
+            if not line:
+                out_lines.append("")
+                continue
+            words = line.split()
+            current = ""
+            for word in words:
+                probe = word if not current else f"{current} {word}"
+                if (not current) or self._measure_table_text_px(probe, font_spec) <= max_width_px:
+                    current = probe
+                    continue
+                out_lines.append(current)
+                current = word
+                while current and self._measure_table_text_px(current, font_spec) > max_width_px:
+                    cut = max(1, int(max_width_px // 7))
+                    out_lines.append(current[:cut])
+                    current = current[cut:]
+            if current:
+                out_lines.append(current)
+        return "\n".join(out_lines)
+
+    @staticmethod
+    def _watchlist_width_bounds(col: str) -> Tuple[int, int]:
+        key = str(col or "").strip().lower()
+        if key == "rank":
+            return (42, 72)
+        if key in {"coin", "symbol"}:
+            return (72, 140)
+        if key in {"side", "status"}:
+            return (88, 140)
+        if key in {"score", "entry", "exit", "gain"}:
+            return (88, 128)
+        if key in {"why", "logic", "trigger"}:
+            return (220, 520)
+        return (88, 220)
+
+    def _watchlist_autofit_widths(
+        self,
+        columns: Tuple[str, ...],
+        headings: Dict[str, str],
+        rows: List[Dict[str, Any]],
+        base_widths: Dict[str, int],
+        view_width: int,
+    ) -> Dict[str, int]:
+        widths: Dict[str, int] = {}
+        body_font = ("TkDefaultFont", 10, "normal")
+        header_font = ("TkDefaultFont", 10, "bold")
+        sample_rows = list(rows[:40])
+        for col in columns:
+            lo, hi = self._watchlist_width_bounds(col)
+            px = max(lo, int(base_widths.get(col, lo) or lo))
+            px = max(px, self._measure_table_text_px(headings.get(col, col.title()), header_font) + 20)
+            for row in sample_rows:
+                raw_txt = " ".join(str(row.get(col, "") or "").splitlines())
+                if col in {"why", "logic", "trigger"} and len(raw_txt) > 88:
+                    raw_txt = raw_txt[:85] + "..."
+                px = max(px, self._measure_table_text_px(raw_txt, body_font) + 18)
+            widths[col] = max(lo, min(hi, px))
+
+        total_w = sum(widths.values())
+        flex_cols = [col for col in columns if col in {"why", "logic", "trigger"}]
+        extra = max(0, int(view_width) - total_w - 4)
+        if flex_cols and extra > 0:
+            share = max(0, extra // len(flex_cols))
+            for col in flex_cols:
+                lo, hi = self._watchlist_width_bounds(col)
+                widths[col] = max(lo, min(hi, int(widths[col]) + share))
+        return widths
+
+    def _watchlist_cell_fg(self, kind: str, col: str, value: str) -> str:
+        txt = str(value or "").strip()
+        col_key = str(col or "").strip().lower()
+        if col_key in {"coin", "symbol"}:
+            return DARK_ACCENT2
+        if col_key == "side":
+            up = txt.upper()
+            if "LONG" in up:
+                return DARK_ACCENT
+            if "SHORT" in up:
+                return "#FF6B57"
+            if "WATCH" in up:
+                return "#FFD27A"
+            return DARK_MUTED
+        if col_key == "status":
+            up = txt.upper()
+            if up == "READY":
+                return DARK_ACCENT
+            if up in {"TRAINING", "TRAIN FIRST", "ENTRY WAIT", "SHORT BLOCK", "EDGE LOW", "ON DECK", "NO PRICE", "WATCH"}:
+                return "#FFD27A"
+            return DARK_MUTED if up in {"WAIT", "--"} else DARK_FG
+        if col_key in {"score", "gain"}:
+            num = self._coerce_float_value(txt.replace("%", ""))
+            if num is not None:
+                if float(num) > 0.0:
+                    return DARK_ACCENT
+                if float(num) < 0.0:
+                    return "#FF6B57"
+            return DARK_FG
+        if col_key == "why":
+            return "#FFD27A" if txt and txt != "--" else DARK_MUTED
+        if col_key == "logic":
+            return DARK_FG if txt and txt != "--" else DARK_MUTED
+        if col_key == "trigger":
+            if "can open" in txt.lower():
+                return DARK_ACCENT
+            return DARK_ACCENT2 if txt and txt != "--" else DARK_MUTED
+        return DARK_FG if txt and txt != "--" else DARK_MUTED
+
+    def _draw_watchlist_canvas_table(
+        self,
+        canvas: tk.Canvas,
+        *,
+        columns: Tuple[str, ...],
+        headings: Dict[str, str],
+        rows: List[Dict[str, Any]],
+        base_widths: Dict[str, int],
+        kind: str,
+        selected_idx: int = -1,
+    ) -> List[Dict[str, Any]]:
+        try:
+            view_w = max(220, int(canvas.winfo_width() or 0))
+            view_h = max(90, int(canvas.winfo_height() or 0))
+        except Exception:
+            return []
+        widths = self._watchlist_autofit_widths(columns, headings, rows, base_widths, view_w)
+        total_w = sum(int(widths.get(col, 100) or 100) for col in columns) or view_w
+        header_h = 30
+        pad_x = 8
+        pad_y = 6
+        text_cols = {"why", "logic", "trigger"}
+        body_font = ("TkDefaultFont", 10, "normal")
+        body_bold_font = ("TkDefaultFont", 10, "bold")
+        line_h = 16
+        row_regions: List[Dict[str, Any]] = []
+
+        try:
+            canvas.delete("all")
+            canvas.configure(scrollregion=(0, 0, total_w, view_h))
+        except Exception:
+            return []
+
+        x = 0
+        for col in columns:
+            w = int(widths.get(col, 100) or 100)
+            canvas.create_rectangle(x, 0, x + w, header_h, fill=DARK_BG2, outline=DARK_BORDER, width=1)
+            anchor = "center"
+            tx = x + (w / 2)
+            if col in {"score", "entry", "exit", "gain"}:
+                anchor = "e"
+                tx = x + w - pad_x
+            elif col in text_cols:
+                anchor = "w"
+                tx = x + pad_x
+            canvas.create_text(
+                tx,
+                header_h / 2,
+                text=str(headings.get(col, col.title()) or col.title()),
+                fill=DARK_ACCENT,
+                font=("TkDefaultFont", 10, "bold"),
+                anchor=anchor,
+            )
+            x += w
+
+        y = header_h
+        draw_rows = list(rows or [])
+        if not draw_rows:
+            placeholder: Dict[str, Any] = {col: "--" for col in columns}
+            first_col = columns[0] if columns else "symbol"
+            placeholder[first_col] = "--"
+            if "status" in columns:
+                placeholder["status"] = "WAIT"
+            if "why" in columns:
+                placeholder["why"] = "No watchlist candidates yet."
+            if "logic" in columns:
+                placeholder["logic"] = "Waiting for the next ranked setup."
+            if "trigger" in columns:
+                placeholder["trigger"] = "The trader will react once a setup becomes tradable."
+            draw_rows = [placeholder]
+
+        for row_idx, row in enumerate(draw_rows):
+            wrapped: Dict[str, str] = {}
+            max_lines = 1
+            for col in columns:
+                raw_val = str(row.get(col, "") or "")
+                font_spec = body_bold_font if col in {"coin", "symbol", "side", "status", "score", "gain"} else body_font
+                if col in text_cols:
+                    txt = self._wrap_table_text(raw_val, max(80, int(widths.get(col, 100) or 100) - (pad_x * 2)), font_spec)
+                else:
+                    txt = raw_val
+                wrapped[col] = txt
+                max_lines = max(max_lines, max(1, len([ln for ln in txt.splitlines() if ln.strip()]) or 1))
+            row_h = max(28, (max_lines * line_h) + (pad_y * 2))
+            row_bg = "#13304A" if row_idx == int(selected_idx) else (DARK_PANEL if (row_idx % 2) == 0 else "#0C1827")
+            x = 0
+            for col in columns:
+                w = int(widths.get(col, 100) or 100)
+                cell_txt = wrapped.get(col, "")
+                canvas.create_rectangle(x, y, x + w, y + row_h, fill=row_bg, outline=DARK_BORDER, width=1)
+                if col in text_cols:
+                    anchor = "nw"
+                    tx = x + pad_x
+                    ty = y + pad_y
+                elif col in {"score", "entry", "exit", "gain"}:
+                    anchor = "e"
+                    tx = x + w - pad_x
+                    ty = y + (row_h / 2)
+                elif col in {"rank", "coin", "symbol", "side", "status"}:
+                    anchor = "center"
+                    tx = x + (w / 2)
+                    ty = y + (row_h / 2)
+                else:
+                    anchor = "w"
+                    tx = x + pad_x
+                    ty = y + pad_y
+                canvas.create_text(
+                    tx,
+                    ty,
+                    text=cell_txt,
+                    fill=self._watchlist_cell_fg(kind, col, str(row.get(col, "") or "")),
+                    font=(body_bold_font if col in {"coin", "symbol", "side", "status", "score", "gain"} else body_font),
+                    anchor=anchor,
+                    width=(max(40, w - (pad_x * 2)) if col in text_cols else 0),
+                )
+                x += w
+            row_regions.append({"index": row_idx, "y0": y, "y1": y + row_h, "row": row})
+            y += row_h
+
+        try:
+            canvas.configure(scrollregion=(0, 0, total_w, max(y, view_h)))
+        except Exception:
+            pass
+        return row_regions
 
     def _draw_market_positions_table(self, market_key: str) -> None:
         panel = self.market_panels.get(market_key, {})
@@ -10344,9 +10581,9 @@ class PowerTraderHub(tk.Tk):
         thinker_data: Optional[Dict[str, Any]] = None,
     ) -> None:
         panel = self.market_panels.get(market_key, {})
-        tree = panel.get("watch_tree")
+        canvas = panel.get("watch_canvas")
         meta_var = panel.get("watch_meta_var")
-        if tree is None or meta_var is None:
+        if canvas is None or meta_var is None:
             return
         rows = self._market_watchlist_rows(market_key, thinker_data=thinker_data, limit=20)
         panel["watch_rows"] = list(rows)
@@ -10370,38 +10607,49 @@ class PowerTraderHub(tk.Tk):
             )
         except Exception:
             pass
+        self._draw_market_watchlist_table(market_key)
+
+    def _draw_market_watchlist_table(self, market_key: str) -> None:
+        panel = self.market_panels.get(market_key, {})
+        canvas = panel.get("watch_canvas")
+        cols = tuple(panel.get("watch_columns", ()) or ())
+        headings = dict(panel.get("watch_headings", {}) or {})
+        base_widths = dict(panel.get("watch_widths", {}) or {})
+        if canvas is None or not cols:
+            return
+        regions = self._draw_watchlist_canvas_table(
+            canvas,
+            columns=cols,
+            headings=headings,
+            rows=list(panel.get("watch_rows", []) or []),
+            base_widths=base_widths,
+            kind=str(market_key or "").strip().lower(),
+            selected_idx=int(panel.get("watch_selected_idx", -1) or -1),
+        )
+        panel["watch_row_regions"] = list(regions or [])
+
+    def _on_market_watchlist_click(self, market_key: str, event: tk.Event) -> None:
+        panel = self.market_panels.get(market_key, {})
+        canvas = panel.get("watch_canvas")
         try:
-            for iid in tree.get_children():
-                tree.delete(iid)
-            if not rows:
-                tree.insert(
-                    "",
-                    "end",
-                    values=("--", "--", "--", "--", "WAIT", "No leaders ranked yet.", "Waiting for the next ranked setup.", "Trader step will react once a setup becomes tradable."),
-                    tags=("wl_placeholder", "wl_even"),
-                )
-                return
-            for idx, row in enumerate(rows):
-                tags = ["wl_even" if (idx % 2) == 0 else "wl_odd"]
-                status_txt = str(row.get("status", "WAIT") or "WAIT").strip().upper()
-                tags.append("wl_ready" if status_txt == "READY" else "wl_wait")
-                tree.insert(
-                    "",
-                    "end",
-                    values=(
-                        row.get("rank", ""),
-                        row.get("symbol", ""),
-                        row.get("side", ""),
-                        row.get("score", ""),
-                        row.get("status", ""),
-                        row.get("why", ""),
-                        row.get("logic", ""),
-                        row.get("trigger", ""),
-                    ),
-                    tags=tuple(tags),
-                )
+            raw_y = float(getattr(event, "y", -1) or -1)
         except Exception:
-            pass
+            raw_y = -1.0
+        try:
+            y = float(canvas.canvasy(raw_y)) if canvas is not None else raw_y
+        except Exception:
+            y = raw_y
+        selected_idx = -1
+        for region in list(panel.get("watch_row_regions", []) or []):
+            try:
+                if float(region.get("y0", 0.0) or 0.0) <= y <= float(region.get("y1", 0.0) or 0.0):
+                    selected_idx = int(region.get("index", -1) or -1)
+                    break
+            except Exception:
+                continue
+        if selected_idx != int(panel.get("watch_selected_idx", -1) or -1):
+            panel["watch_selected_idx"] = selected_idx
+            self._draw_market_watchlist_table(market_key)
 
     def _refresh_market_watchlist_visibility(self, market_key: str) -> None:
         panel = self.market_panels.get(market_key, {})
@@ -10424,18 +10672,19 @@ class PowerTraderHub(tk.Tk):
         except Exception:
             pass
 
-    def _activate_market_watchlist_selection(self, market_key: str) -> None:
+    def _activate_market_watchlist_selection(self, market_key: str, event: Optional[tk.Event] = None) -> None:
         panel = self.market_panels.get(market_key, {})
-        tree = panel.get("watch_tree")
         focus_var = panel.get("instrument_var")
-        if tree is None or focus_var is None:
+        if focus_var is None:
             return
+        if event is not None:
+            self._on_market_watchlist_click(market_key, event)
         try:
-            selection = tree.selection()
-            if not selection:
+            idx = int(panel.get("watch_selected_idx", -1) or -1)
+            rows = list(panel.get("watch_rows", []) or [])
+            if idx < 0 or idx >= len(rows):
                 return
-            values = tree.item(selection[0], "values") or ()
-            ident = str(values[1] if len(values) > 1 else "").strip().upper()
+            ident = str((rows[idx] or {}).get("symbol", "") or "").strip().upper()
             if not ident or ident == "--":
                 return
             focus_var.set(ident)
@@ -16034,9 +16283,9 @@ class PowerTraderHub(tk.Tk):
         return os.path.join(base, str(coin or "").strip().upper())
 
     def _refresh_crypto_watchlist_overview(self) -> None:
-        tree = getattr(self, "crypto_watchlist_tree", None)
+        canvas = getattr(self, "crypto_watchlist_canvas", None)
         meta_lbl = getattr(self, "lbl_crypto_watchlist_meta", None)
-        if tree is None or meta_lbl is None:
+        if canvas is None or meta_lbl is None:
             return
 
         now_ts = float(time.time())
@@ -16219,53 +16468,95 @@ class PowerTraderHub(tk.Tk):
         except Exception:
             pass
 
-        try:
-            for iid in tree.get_children():
-                tree.delete(iid)
-            if not rows:
-                tree.insert(
-                    "",
-                    "end",
-                    values=(
-                        "--",
-                        "--",
-                        "--",
-                        "--",
-                        "--",
-                        "WAIT",
-                        "No watchlist candidates yet.",
-                        "Run scans and background training to populate on-deck coins.",
-                        buy_trigger_txt,
-                    ),
-                    tags=("wl_placeholder", "wl_even"),
-                )
-            for idx, row in enumerate(rows):
-                coin = str(row.get("coin", "") or "")
+        display_rows: List[Dict[str, Any]] = []
+        for row in rows:
+            try:
                 score = float(row.get("score", 0.0) or 0.0)
+            except Exception:
+                score = 0.0
+            try:
                 entry_val = float(row.get("entry", 0.0) or 0.0)
+            except Exception:
+                entry_val = 0.0
+            try:
                 exit_val = float(row.get("exit", 0.0) or 0.0)
-                status = str(row.get("status", "WAIT") or "WAIT").strip().upper()
-                entry_txt = _fmt_price(entry_val) if entry_val > 0.0 else "N/A"
-                exit_txt = _fmt_price(exit_val) if exit_val > 0.0 else "N/A"
-                gain_pct = ((exit_val / entry_val) - 1.0) * 100.0 if (entry_val > 0.0 and exit_val > 0.0) else 0.0
-                tags = ["wl_even" if (idx % 2) == 0 else "wl_odd"]
-                tags.append("wl_ready" if status == "READY" else "wl_wait")
-                tree.insert(
-                    "",
-                    "end",
-                    values=(
-                        coin,
-                        f"{score:+.3f}%",
-                        entry_txt,
-                        exit_txt,
-                        f"{gain_pct:+.2f}%",
-                        status,
-                        str(row.get("blocker", "") or "").strip(),
-                        str(row.get("logic", "") or "").strip(),
-                        str(row.get("trigger", buy_trigger_txt) or buy_trigger_txt).strip(),
-                    ),
-                    tags=tuple(tags),
-                )
+            except Exception:
+                exit_val = 0.0
+            gain_pct = ((exit_val / entry_val) - 1.0) * 100.0 if (entry_val > 0.0 and exit_val > 0.0) else 0.0
+            display_rows.append(
+                {
+                    "coin": str(row.get("coin", "") or "").strip().upper(),
+                    "score": f"{score:+.3f}%",
+                    "entry": _fmt_price(entry_val) if entry_val > 0.0 else "N/A",
+                    "exit": _fmt_price(exit_val) if exit_val > 0.0 else "N/A",
+                    "gain": f"{gain_pct:+.2f}%",
+                    "status": str(row.get("status", "WAIT") or "WAIT").strip().upper(),
+                    "why": str(row.get("blocker", "") or "").strip(),
+                    "logic": str(row.get("logic", "") or "").strip(),
+                    "trigger": str(row.get("trigger", buy_trigger_txt) or buy_trigger_txt).strip(),
+                }
+            )
+        self._crypto_watchlist_rows = display_rows
+        self._draw_crypto_watchlist_table()
+
+    def _draw_crypto_watchlist_table(self) -> None:
+        canvas = getattr(self, "crypto_watchlist_canvas", None)
+        cols = tuple(getattr(self, "crypto_watchlist_cols", ()) or ())
+        headings = dict(getattr(self, "_crypto_watchlist_headings", {}) or {})
+        base_widths = dict(getattr(self, "_crypto_watchlist_widths", {}) or {})
+        if canvas is None or not cols:
+            return
+        regions = self._draw_watchlist_canvas_table(
+            canvas,
+            columns=cols,
+            headings=headings,
+            rows=list(getattr(self, "_crypto_watchlist_rows", []) or []),
+            base_widths=base_widths,
+            kind="crypto",
+            selected_idx=int(getattr(self, "_crypto_watchlist_selected_idx", -1) or -1),
+        )
+        self._crypto_watchlist_row_regions = list(regions or [])
+
+    def _on_crypto_watchlist_click(self, event: tk.Event) -> None:
+        canvas = getattr(self, "crypto_watchlist_canvas", None)
+        try:
+            raw_y = float(getattr(event, "y", -1) or -1)
+        except Exception:
+            raw_y = -1.0
+        try:
+            y = float(canvas.canvasy(raw_y)) if canvas is not None else raw_y
+        except Exception:
+            y = raw_y
+        selected_idx = -1
+        for region in list(getattr(self, "_crypto_watchlist_row_regions", []) or []):
+            try:
+                if float(region.get("y0", 0.0) or 0.0) <= y <= float(region.get("y1", 0.0) or 0.0):
+                    selected_idx = int(region.get("index", -1) or -1)
+                    break
+            except Exception:
+                continue
+        if selected_idx != int(getattr(self, "_crypto_watchlist_selected_idx", -1) or -1):
+            self._crypto_watchlist_selected_idx = selected_idx
+            self._draw_crypto_watchlist_table()
+
+    def _activate_crypto_watchlist_selection(self, event: Optional[tk.Event] = None) -> None:
+        if event is not None:
+            self._on_crypto_watchlist_click(event)
+        idx = int(getattr(self, "_crypto_watchlist_selected_idx", -1) or -1)
+        rows = list(getattr(self, "_crypto_watchlist_rows", []) or [])
+        if idx < 0 or idx >= len(rows):
+            return
+        coin = str((rows[idx] or {}).get("coin", "") or "").strip().upper()
+        if (not coin) or coin == "--":
+            return
+        try:
+            self.chart_search_var.set(coin)
+        except Exception:
+            pass
+        try:
+            fn = getattr(self, "_show_chart_page", None)
+            if callable(fn):
+                fn(coin)
         except Exception:
             pass
 

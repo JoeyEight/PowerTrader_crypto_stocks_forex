@@ -116,11 +116,26 @@ class _Canvas:
     def winfo_pointery(self) -> int:
         return self.pointer_y
 
+    def canvasx(self, value) -> float:
+        return float(value)
+
+    def canvasy(self, value) -> float:
+        return float(value)
+
     def delete(self, *_args) -> None:
         self.items = []
 
     def configure(self, **kwargs) -> None:
         self.config.update(kwargs)
+
+    def bind(self, *_args, **_kwargs) -> None:
+        return None
+
+    def xview(self, *_args, **_kwargs) -> None:
+        return None
+
+    def yview(self, *_args, **_kwargs) -> None:
+        return None
 
     def create_rectangle(self, *args, **kwargs):
         self.items.append(("rectangle", args, kwargs))
@@ -967,6 +982,64 @@ class MarketPositionsTableTests(unittest.TestCase):
         self.assertEqual(captured[0].y, 160.0)
         self.assertEqual(captured[0].guiEvent.x_root, 210)
         self.assertEqual(captured[0].guiEvent.y_root, 240)
+
+    def test_draw_watchlist_canvas_table_wraps_text_and_sets_scrollregion(self) -> None:
+        hub = self._hub()
+        hub._coerce_float_value = PowerTraderHub._coerce_float_value.__get__(hub, PowerTraderHub)
+        canvas = _Canvas(width=560, height=140)
+
+        regions = PowerTraderHub._draw_watchlist_canvas_table(
+            hub,
+            canvas,
+            columns=("symbol", "status", "why", "logic", "trigger"),
+            headings={
+                "symbol": "Symbol",
+                "status": "Status",
+                "why": "Why Not Traded",
+                "logic": "Logic",
+                "trigger": "Trade Trigger",
+            },
+            rows=[
+                {
+                    "symbol": "AUD_HKD",
+                    "status": "READY",
+                    "why": "Waiting for the next qualified setup to remain valid through the next cycle.",
+                    "logic": "Strong momentum plus volatility edge from the recent trend scan with additional confirmation still intact.",
+                    "trigger": "Trader step can open SHORT on the next cycle if AUD_HKD keeps this setup and risk size still fits.",
+                }
+            ],
+            base_widths={"symbol": 110, "status": 100, "why": 280, "logic": 320, "trigger": 360},
+            kind="forex",
+            selected_idx=0,
+        )
+
+        self.assertEqual(len(regions), 1)
+        self.assertIn("scrollregion", canvas.config)
+        self.assertGreater(canvas.config["scrollregion"][2], 0)
+        self.assertTrue(any(item[0] == "rectangle" for item in canvas.items))
+        self.assertTrue(any(item[0] == "text" for item in canvas.items))
+
+    def test_activate_market_watchlist_selection_uses_canvas_selected_row(self) -> None:
+        hub = self._hub()
+        focus_var = _Var()
+        focus_var.set("ACCOUNT")
+        triggered = []
+        hub.market_panels = {
+            "forex": {
+                "instrument_var": focus_var,
+                "watch_selected_idx": 1,
+                "watch_rows": [
+                    {"symbol": "AUD_HKD"},
+                    {"symbol": "GBP_USD"},
+                ],
+            }
+        }
+        hub._on_market_focus_changed = lambda market_key: triggered.append(market_key)
+
+        PowerTraderHub._activate_market_watchlist_selection(hub, "forex")
+
+        self.assertEqual(focus_var.get(), "GBP_USD")
+        self.assertEqual(triggered, ["forex"])
 
 
 if __name__ == "__main__":
