@@ -57,7 +57,7 @@ def _install_matplotlib_stubs() -> None:
 
 _install_matplotlib_stubs()
 
-from ui.pt_hub import PowerTraderHub
+from ui.pt_hub import CandleChart, PowerTraderHub
 
 
 class _Var:
@@ -93,12 +93,28 @@ class _Canvas:
         self.height = height
         self.items = []
         self.config = {}
+        self.root_x = 0
+        self.root_y = 0
+        self.pointer_x = 0
+        self.pointer_y = 0
 
     def winfo_width(self) -> int:
         return self.width
 
     def winfo_height(self) -> int:
         return self.height
+
+    def winfo_rootx(self) -> int:
+        return self.root_x
+
+    def winfo_rooty(self) -> int:
+        return self.root_y
+
+    def winfo_pointerx(self) -> int:
+        return self.pointer_x
+
+    def winfo_pointery(self) -> int:
+        return self.pointer_y
 
     def delete(self, *_args) -> None:
         self.items = []
@@ -117,6 +133,31 @@ class _Canvas:
     def create_line(self, *args, **kwargs):
         self.items.append(("line", args, kwargs))
         return len(self.items)
+
+    def create_oval(self, *args, **kwargs):
+        self.items.append(("oval", args, kwargs))
+        return len(self.items)
+
+    def create_arc(self, *args, **kwargs):
+        self.items.append(("arc", args, kwargs))
+        return len(self.items)
+
+
+class _Font:
+    def cget(self, key: str):
+        if key == "family":
+            return "TkDefaultFont"
+        if key == "size":
+            return 9
+        return ""
+
+
+class _FigureCanvas:
+    def __init__(self, widget) -> None:
+        self.widget = widget
+
+    def get_tk_widget(self):
+        return self.widget
 
 
 class _Listbox:
@@ -554,6 +595,142 @@ class MarketPositionsTableTests(unittest.TestCase):
 
         self.assertEqual(options, ["ACCOUNT", "AAPL", "TSLA", "MSFT", "NVDA"])
 
+    def test_market_chart_focus_options_keep_manual_selection_pinned(self) -> None:
+        hub = self._hub()
+        hub.market_panels = {"stocks": {"instrument_var": _Var()}}
+        hub.market_panels["stocks"]["instrument_var"].set("AMZN")
+
+        options = PowerTraderHub._market_chart_focus_options(
+            hub,
+            "stocks",
+            thinker_data={"leaders": [{"symbol": "MSFT"}]},
+            status_data={"raw_positions": [{"symbol": "AAPL"}]},
+        )
+
+        self.assertEqual(options, ["ACCOUNT", "AMZN", "AAPL", "MSFT"])
+
+    def test_market_view_options_hide_market_tabs_for_stocks_and_forex(self) -> None:
+        hub = self._hub()
+
+        self.assertEqual(PowerTraderHub._market_view_options(hub, "stocks"), ("Overview",))
+        self.assertEqual(PowerTraderHub._market_view_options(hub, "forex"), ("Overview",))
+
+    def test_market_watchlist_rows_use_leaders(self) -> None:
+        hub = self._hub()
+        rows = PowerTraderHub._market_watchlist_rows(
+            hub,
+            "forex",
+            thinker_data={
+                "leaders": [
+                    {
+                        "pair": "AUD_USD",
+                        "side": "short",
+                        "score": -0.6607,
+                        "confidence": "HIGH",
+                        "reason": "Trend continuation",
+                    }
+                ]
+            },
+        )
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["symbol"], "AUD_USD")
+        self.assertEqual(rows[0]["side"], "SHORT")
+        self.assertEqual(rows[0]["status"], "ENTRY WAIT")
+        self.assertIn("-0.6607", rows[0]["score"])
+        self.assertIn("Waiting for the next qualified setup", rows[0]["why"])
+        self.assertIn("Needs SHORT setup", rows[0]["trigger"])
+
+    def test_market_watchlist_rows_mark_ready_entries_with_trigger(self) -> None:
+        hub = self._hub()
+
+        rows = PowerTraderHub._market_watchlist_rows(
+            hub,
+            "stocks",
+            thinker_data={
+                "leaders": [
+                    {
+                        "symbol": "ACDC",
+                        "side": "long",
+                        "score": 6.388364,
+                        "confidence": "HIGH",
+                        "reason": "Uptrend pressure from positive 6h/24h momentum",
+                        "eligible_for_entry": True,
+                        "last": 6.96,
+                        "calib_prob": 0.725,
+                    }
+                ]
+            },
+        )
+
+        self.assertEqual(rows[0]["status"], "READY")
+        self.assertIn("Trader step can open LONG", rows[0]["trigger"])
+        self.assertIn("last $6.96", rows[0]["trigger"])
+
+    def test_resolve_market_focus_chart_rows_keeps_selected_symbol_pinned_to_cache(self) -> None:
+        hub = self._hub()
+        hub.market_panels = {"stocks": {"instrument_var": _Var()}}
+        hub.market_panels["stocks"]["instrument_var"].set("AMZN")
+        hub._market_line_caches = {
+            "stocks": {
+                "AMZN": {
+                    "rows": [
+                        {"t": "2026-03-12T10:00:00", "o": 209.0, "h": 210.0, "l": 208.5, "c": 209.5},
+                        {"t": "2026-03-12T11:00:00", "o": 209.5, "h": 210.5, "l": 209.1, "c": 210.25},
+                    ],
+                    "source": "focus",
+                }
+            }
+        }
+
+        payload = PowerTraderHub._resolve_market_focus_chart_rows(
+            hub,
+            "stocks",
+            thinker_data={
+                "top_pick": {"symbol": "MSFT"},
+                "top_chart_map": {
+                    "MSFT": [
+                        {"t": "2026-03-12T10:00:00", "o": 390.0, "h": 392.0, "l": 389.5, "c": 391.5},
+                        {"t": "2026-03-12T11:00:00", "o": 391.5, "h": 393.0, "l": 391.0, "c": 392.75},
+                    ]
+                },
+            },
+        )
+
+        self.assertEqual(payload["focus_symbol"], "AMZN")
+        self.assertTrue(payload["from_cache"])
+        self.assertTrue(str(payload["source"]).endswith(":cache"))
+        self.assertEqual([row["c"] for row in payload["rows"]], [209.5, 210.25])
+
+    def test_resolve_market_focus_chart_rows_uses_live_focus_bars_when_available(self) -> None:
+        hub = self._hub()
+        hub.market_panels = {"forex": {"instrument_var": _Var()}}
+        hub.market_panels["forex"]["instrument_var"].set("AUD_USD")
+        hub._market_line_caches = {}
+
+        payload = PowerTraderHub._resolve_market_focus_chart_rows(
+            hub,
+            "forex",
+            thinker_data={
+                "top_pick": {"pair": "AUD_HKD"},
+                "top_chart_map": {
+                    "AUD_USD": [
+                        {"t": "2026-03-12T10:00:00", "o": 0.6510, "h": 0.6520, "l": 0.6505, "c": 0.6515},
+                        {"t": "2026-03-12T11:00:00", "o": 0.6515, "h": 0.6530, "l": 0.6510, "c": 0.6528},
+                    ],
+                    "AUD_HKD": [
+                        {"t": "2026-03-12T10:00:00", "o": 5.55, "h": 5.56, "l": 5.54, "c": 5.545},
+                        {"t": "2026-03-12T11:00:00", "o": 5.545, "h": 5.55, "l": 5.53, "c": 5.535},
+                    ],
+                },
+            },
+        )
+
+        self.assertEqual(payload["focus_symbol"], "AUD_USD")
+        self.assertFalse(payload["from_cache"])
+        self.assertEqual(payload["source"], "focus")
+        self.assertEqual([row["c"] for row in payload["rows"]], [0.6515, 0.6528])
+
     def test_market_chart_benchmark_overlays_include_position_tooltips(self) -> None:
         hub = self._hub()
 
@@ -731,6 +908,65 @@ class MarketPositionsTableTests(unittest.TestCase):
         self.assertEqual(hub.btn_quick_diag.config["text"], "Quick Diagnostics")
         self.assertEqual(hub.btn_toolbar_diag.config["state"], "normal")
         self.assertEqual(hub.btn_toolbar_diag.config["text"], "Diagnostics")
+
+    def test_refresh_market_chart_hover_restores_tooltip_after_render(self) -> None:
+        hub = self._hub()
+        hub._live_log_font = _Font()
+        canvas = _Canvas(width=420, height=220)
+        canvas.root_x = 100
+        canvas.root_y = 200
+        canvas.pointer_x = 220
+        canvas.pointer_y = 278
+        hub.market_panels = {
+            "forex": {
+                "chart_canvas": canvas,
+                "chart_hover_data": {
+                    "mode": "candles",
+                    "plot_left": 40.0,
+                    "plot_right": 380.0,
+                    "plot_top": 30.0,
+                    "plot_bot": 180.0,
+                    "x_points": [80.0, 120.0, 160.0],
+                    "rows": [
+                        {"t": "bar 1", "o": 1.0, "h": 1.1, "l": 0.9, "c": 1.05},
+                        {"t": "bar 2", "o": 1.05, "h": 1.15, "l": 1.0, "c": 1.12},
+                        {"t": "bar 3", "o": 1.12, "h": 1.18, "l": 1.1, "c": 1.14},
+                    ],
+                    "line_targets": [
+                        {"y": 78.0, "color": "#00E676", "dash": (6, 3), "tooltip": "Target\nImpact if hit: trims position."}
+                    ],
+                },
+                "chart_hover_idx": -1,
+            }
+        }
+
+        PowerTraderHub._refresh_market_chart_hover(hub, "forex")
+
+        self.assertEqual(hub.market_panels["forex"]["chart_hover_idx"], -2)
+        self.assertTrue(any(item[0] == "text" for item in canvas.items))
+        self.assertTrue(any("Impact if hit" in str(kwargs.get("text", "")) for _kind, _args, kwargs in canvas.items if isinstance(kwargs, dict)))
+
+    def test_restore_legend_hover_replays_tooltip_for_stationary_pointer(self) -> None:
+        widget = _Canvas(width=640, height=320)
+        widget.root_x = 50
+        widget.root_y = 80
+        widget.pointer_x = 210
+        widget.pointer_y = 240
+
+        captured = []
+        chart = CandleChart.__new__(CandleChart)
+        chart.canvas = _FigureCanvas(widget)
+        chart.ax = object()
+        chart._legend_hover_motion_handler = lambda event: captured.append(event)
+        chart._legend_hover_restore_after_id = None
+
+        CandleChart._restore_legend_hover(chart)
+
+        self.assertEqual(len(captured), 1)
+        self.assertEqual(captured[0].x, 160.0)
+        self.assertEqual(captured[0].y, 160.0)
+        self.assertEqual(captured[0].guiEvent.x_root, 210)
+        self.assertEqual(captured[0].guiEvent.y_root, 240)
 
 
 if __name__ == "__main__":

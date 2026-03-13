@@ -30,6 +30,8 @@ python3 -m pip install -r requirements.txt
 python3 -m pip install -r requirements-dev.txt
 ```
 
+If you use the launcher, it will create `venv/` automatically and install missing core dependencies before opening the hub.
+
 ## Run
 ### Hub UI
 ```bash
@@ -40,6 +42,12 @@ Alternative:
 ```bash
 ./venv/bin/python -m ui.pt_hub
 ```
+
+Important runtime behavior:
+- `Start Trades` launches the runtime supervisor as a detached background process.
+- Closing the hub window does not stop trading by itself.
+- Use `Stop Trades` first if you want crypto, stocks, and forex runtime activity to stop cleanly.
+- If the computer goes to sleep, the Python processes pause and do not keep trading until the machine wakes again.
 
 ### Runner (all background services)
 ```bash
@@ -90,6 +98,8 @@ python3 runtime/tools/run_quality_suite.py --require-artifacts --require-stabili
 6. `live_guarded`
 
 Set this in Hub Settings -> Advanced.
+
+When a live Alpaca or live OANDA broker mode is saved in Settings, the hub will auto-promote non-executable rollout stages to `live_guarded`.
 
 ## Recommended Validation Path
 ### 1) Shadow validation
@@ -143,6 +153,11 @@ Set this in Hub Settings -> Advanced.
 - `hub_data/logs/autopilot.log`
 - `hub_data/logs/thinker.log`
 - `hub_data/logs/trader.log`
+
+### UI behavior to expect
+- Stocks and forex run from the same detached runtime supervisor used by crypto.
+- Stocks and forex use the native in-app charts and watchlists; the old TradingView launch path is not part of the active UI flow.
+- Notification Center reflects live runtime state plus recent unresolved incidents; stale resolved incidents are filtered out by the current app code.
 
 ## Credentials
 ### Crypto (Robinhood)
