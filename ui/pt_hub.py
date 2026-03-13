@@ -19,7 +19,7 @@ import re
 import hashlib
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 if __package__ in (None, ""):
     _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -3203,6 +3203,7 @@ class PowerTraderHub(tk.Tk):
         tuned = self._resolve_account_aware_profile_overrides(profile_key, settings_source=self.settings)
         if not isinstance(tuned, dict) or not tuned:
             return
+        manual_overrides = self._profile_manual_override_keys()
 
         def _equivalent(left: Any, right: Any) -> bool:
             if isinstance(left, bool) or isinstance(right, bool):
@@ -3214,6 +3215,8 @@ class PowerTraderHub(tk.Tk):
 
         changes: Dict[str, Any] = {}
         for key, value in tuned.items():
+            if key in manual_overrides:
+                continue
             if _equivalent(self.settings.get(key), value):
                 continue
             changes[key] = value
@@ -3234,6 +3237,12 @@ class PowerTraderHub(tk.Tk):
             return False, "Enter a whole number of 1 or higher."
         self.settings[cfg_key] = new_val
         try:
+            overrides = self._profile_manual_override_keys()
+            overrides.add(cfg_key)
+            self.settings["profile_manual_overrides"] = sorted(overrides)
+        except Exception:
+            self.settings["profile_manual_overrides"] = [cfg_key]
+        try:
             self._save_settings()
         except Exception as exc:
             return False, f"Save failed: {type(exc).__name__}: {exc}"
@@ -3246,6 +3255,16 @@ class PowerTraderHub(tk.Tk):
             return max(1, int(float(self.settings.get(cfg_key, 1) or 1)))
         except Exception:
             return 1
+
+    def _profile_manual_override_keys(self) -> Set[str]:
+        raw = self.settings.get("profile_manual_overrides", [])
+        if isinstance(raw, str):
+            seq = [p.strip() for p in raw.split(",") if p.strip()]
+        elif isinstance(raw, (list, tuple, set)):
+            seq = [str(p).strip() for p in raw if str(p).strip()]
+        else:
+            seq = []
+        return {k for k in seq if k in {"stock_max_open_positions", "forex_max_open_positions"}}
 
     def _sync_market_max_open_positions_editor(
         self,
